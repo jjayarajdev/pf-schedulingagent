@@ -1,0 +1,1802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>ProjectsForce 360 - AI Helper</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #e8eef3;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* ── Chat Widget Container ─────────────────────────────── */
+        .chat-widget {
+            width: 460px;
+            height: 92vh;
+            max-height: 780px;
+            background: #f0f4f8;
+            border-radius: 16px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.18);
+        }
+
+        /* ── Header ────────────────────────────────────────────── */
+        .chat-header {
+            background: linear-gradient(135deg, #1565c0, #1e88e5, #42a5f5);
+            padding: 16px 18px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            position: relative;
+            flex-shrink: 0;
+        }
+        .header-avatar {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            overflow: hidden;
+        }
+        .header-avatar svg { width: 30px; height: 30px; }
+        .header-info { flex: 1; }
+        .header-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: white;
+            line-height: 1.2;
+        }
+        .header-subtitle {
+            font-size: 11px;
+            color: rgba(255,255,255,0.8);
+            margin-top: 2px;
+        }
+        .header-actions { display: flex; gap: 8px; align-items: center; }
+        .header-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .header-btn:hover { background: rgba(255,255,255,0.35); }
+        .header-icon-btn {
+            background: none;
+            border: none;
+            color: white;
+            cursor: pointer;
+            padding: 4px;
+            font-size: 18px;
+            opacity: 0.9;
+            transition: opacity 0.2s;
+        }
+        .header-icon-btn:hover { opacity: 1; }
+
+        /* ── Messages Area ─────────────────────────────────────── */
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            scroll-behavior: smooth;
+        }
+        .chat-messages::-webkit-scrollbar { width: 5px; }
+        .chat-messages::-webkit-scrollbar-track { background: transparent; }
+        .chat-messages::-webkit-scrollbar-thumb { background: #c0c8d0; border-radius: 3px; }
+
+        /* ── Message Rows ──────────────────────────────────────── */
+        .msg-row {
+            display: flex;
+            gap: 8px;
+            animation: msgIn 0.3s ease;
+            max-width: 100%;
+        }
+        .msg-row.user { flex-direction: row-reverse; }
+        @keyframes msgIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .msg-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            align-self: flex-end;
+            font-size: 14px;
+        }
+        .msg-avatar.bot {
+            background: #1e88e5;
+            box-shadow: 0 1px 4px rgba(30,136,229,0.3);
+            overflow: hidden;
+        }
+        .msg-avatar.bot svg { width: 22px; height: 22px; }
+        .msg-avatar.user-avatar {
+            background: #e0e0e0;
+            font-size: 18px;
+        }
+
+        .msg-content { max-width: 85%; min-width: 0; }
+
+        .msg-bubble {
+            padding: 10px 14px;
+            border-radius: 14px;
+            font-size: 14px;
+            line-height: 1.55;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        .msg-row.bot .msg-bubble {
+            background: white;
+            color: #1a1a2e;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        }
+        .msg-row.user .msg-bubble {
+            background: #1a1a2e;
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .msg-time {
+            font-size: 10px;
+            color: #8e99a4;
+            margin-top: 4px;
+            padding: 0 4px;
+        }
+        .msg-row.user .msg-time { text-align: right; }
+
+        /* ── Rich Components ───────────────────────────────────── */
+        .rich-component { margin: 8px 0; }
+
+        /* Blue gradient headers for rich components */
+        .rich-header {
+            background: linear-gradient(135deg, #1565c0, #1e88e5);
+            color: white;
+            padding: 14px 18px;
+            border-radius: 12px 12px 0 0;
+            font-weight: 600;
+            font-size: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .rich-header-icon { font-size: 20px; }
+
+        /* Projects Table */
+        .projects-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 0 0 12px 12px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .projects-table th {
+            background: #f5f7fa;
+            font-size: 10px;
+            font-weight: 700;
+            color: #5a6577;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 2px solid #e8ecf0;
+        }
+        .projects-table td {
+            padding: 12px 12px;
+            font-size: 13px;
+            color: #333;
+            border-bottom: 1px solid #f0f2f5;
+        }
+        .projects-table tr { cursor: pointer; transition: background 0.15s; }
+        .projects-table tr:hover { background: #f0f7ff; }
+        .projects-table tr:last-child td { border-bottom: none; }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .status-scheduled { background: #e0f2f1; color: #00897b; }
+        .status-ready { background: #eceff1; color: #546e7a; }
+        .status-new { background: #e8f5e9; color: #2e7d32; }
+        .status-completed { background: #efebe9; color: #6d4c41; }
+        .status-inprogress { background: #fff8e1; color: #f57f17; }
+        .status-pending { background: #fff3e0; color: #e65100; }
+        .status-cancelled { background: #ffebee; color: #c62828; }
+        .status-onhold { background: #eceff1; color: #546e7a; }
+        .status-customer-scheduled { background: #ede7f6; color: #5e35b1; }
+
+        /* Date Cards Grid */
+        .dates-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            padding: 12px;
+            background: white;
+            border-radius: 0 0 12px 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .date-card {
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 10px 8px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: white;
+        }
+        .date-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
+        .date-card.weather-good { border-color: #42a5f5; }
+        .date-card.weather-warn { border-color: #ff9800; }
+        .date-card.weather-bad { border-color: #ef5350; background: #fafafa; }
+        .date-card.weather-bad.severe { background: #42a5f5; color: white; border-color: #1e88e5; }
+        .date-card .day-name { font-size: 11px; font-weight: 600; color: #5a6577; text-transform: uppercase; }
+        .date-card .day-date { font-size: 14px; font-weight: 700; color: #1a1a2e; margin: 4px 0; }
+        .date-card .day-temp { font-size: 13px; font-weight: 600; color: #333; }
+        .date-card .day-condition { font-size: 10px; color: #777; margin-top: 2px; }
+        .date-card.weather-bad.severe .day-name,
+        .date-card.weather-bad.severe .day-date,
+        .date-card.weather-bad.severe .day-temp,
+        .date-card.weather-bad.severe .day-condition { color: white; }
+
+        /* Time Slots */
+        .timeslots-container {
+            background: white;
+            border-radius: 0 0 12px 12px;
+            padding: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .timeslot-group { margin-bottom: 14px; }
+        .timeslot-group:last-child { margin-bottom: 0; }
+        .timeslot-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: #5a6577;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .timeslot-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+        .timeslot-btn {
+            border: 2px solid #ff9800;
+            background: white;
+            color: #333;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .timeslot-btn:hover { background: #ff9800; color: white; transform: translateY(-1px); }
+
+        /* Appointment Preview */
+        .appt-preview {
+            background: white;
+            border-radius: 0 0 12px 12px;
+            padding: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .appt-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 14px;
+            border-bottom: 1px solid #f0f2f5;
+        }
+        .appt-row:last-of-type { border-bottom: none; }
+        .appt-label { color: #5a6577; font-weight: 500; }
+        .appt-value { color: #1a1a2e; font-weight: 600; }
+        .appt-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+        }
+        .appt-btn {
+            flex: 1;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+        .appt-confirm { background: #1e88e5; color: white; }
+        .appt-confirm:hover { background: #1565c0; }
+        .appt-decline { background: white; color: #333; border: 2px solid #e0e0e0; }
+        .appt-decline:hover { background: #f5f5f5; border-color: #bbb; }
+
+        /* Success confirmation */
+        .success-card {
+            background: linear-gradient(135deg, #43a047, #66bb6a);
+            color: white;
+            padding: 18px 20px;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 15px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 4px 12px rgba(67,160,71,0.3);
+        }
+        .success-icon { font-size: 28px; }
+
+        /* Project Detail Card */
+        .project-detail {
+            background: white;
+            border-radius: 0 0 12px 12px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .project-detail-body { padding: 18px; }
+        .project-detail-name { font-size: 16px; font-weight: 700; color: #1a1a2e; margin-bottom: 4px; }
+        .project-detail-type { font-size: 13px; color: #5a6577; }
+        .project-detail-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 0;
+            font-size: 13px;
+            color: #333;
+        }
+        .project-detail-row .icon { font-size: 16px; }
+
+        .tech-card {
+            background: linear-gradient(135deg, #7b1fa2, #9c27b0);
+            color: white;
+            padding: 14px 18px;
+            border-radius: 10px;
+            margin: 10px 0;
+        }
+        .tech-card-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; margin-bottom: 6px; }
+        .tech-card-name { font-size: 15px; font-weight: 700; }
+
+        .address-section { margin-top: 12px; }
+        .address-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #5a6577;
+            margin-bottom: 8px;
+            font-weight: 700;
+        }
+        .address-content {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            font-size: 13px;
+            color: #333;
+        }
+        .address-pin { color: #ef5350; font-size: 18px; }
+
+        /* Weather Cards */
+        .weather-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            padding: 14px;
+            background: white;
+            border-radius: 0 0 12px 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .weather-card {
+            border: 1px solid #e8ecf0;
+            border-radius: 10px;
+            padding: 14px;
+            text-align: center;
+        }
+        .weather-card-title { font-size: 11px; font-weight: 600; color: #5a6577; text-transform: uppercase; margin-bottom: 8px; }
+        .weather-temp { font-size: 28px; font-weight: 700; color: #1a1a2e; }
+        .weather-condition { font-size: 12px; color: #666; margin-top: 4px; }
+        .weather-detail {
+            font-size: 11px;
+            margin-top: 6px;
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+        }
+        .weather-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 8px;
+            font-size: 10px;
+            font-weight: 600;
+        }
+        .weather-badge.high { background: #ffebee; color: #c62828; }
+        .weather-badge.low { background: #e3f2fd; color: #1565c0; }
+        .weather-badge.precip { background: #e0f2f1; color: #00695c; }
+
+        /* Quick Action Buttons (in welcome) */
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .quick-btn {
+            background: white;
+            border: 1.5px solid #1e88e5;
+            color: #1e88e5;
+            padding: 8px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .quick-btn:hover {
+            background: #1e88e5;
+            color: white;
+        }
+
+        /* ── Input Area ────────────────────────────────────────── */
+        .chat-input-area {
+            padding: 12px 14px;
+            background: white;
+            border-top: 1px solid #e8ecf0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .chat-input {
+            flex: 1;
+            border: 1.5px solid #e0e0e0;
+            border-radius: 24px;
+            padding: 10px 18px;
+            font-size: 14px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .chat-input:focus { border-color: #1e88e5; }
+        .chat-input:disabled { background: #f5f5f5; }
+        .send-btn {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #1e88e5;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+        .send-btn:hover { background: #1565c0; }
+        .send-btn:disabled { background: #bbb; cursor: not-allowed; }
+        .send-btn svg { width: 18px; height: 18px; fill: white; }
+
+        /* ── Streaming cursor ──────────────────────────────────── */
+        .msg-text.streaming::after {
+            content: '\25CF';
+            animation: blink 1s infinite;
+            margin-left: 3px;
+            color: #1e88e5;
+        }
+        @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+        /* ── Typing indicator ──────────────────────────────────── */
+        .typing-indicator {
+            display: none;
+            padding: 0 14px;
+        }
+        .typing-indicator.active { display: flex; }
+        .typing-dots {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 10px 16px;
+            background: white;
+            border-radius: 14px;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        }
+        .typing-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #b0bec5;
+            animation: typingBounce 1.4s ease-in-out infinite;
+        }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes typingBounce {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-6px); }
+        }
+
+        /* ── Login Modal ───────────────────────────────────────── */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.visible { display: flex; }
+        .modal {
+            background: white;
+            border-radius: 16px;
+            padding: 32px;
+            max-width: 440px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.25);
+        }
+        .modal-header-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        .modal-logo {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #1565c0, #42a5f5);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-logo svg { width: 26px; height: 26px; }
+        .modal-title { font-size: 20px; font-weight: 700; color: #1a1a2e; }
+        .modal-subtitle { font-size: 13px; color: #666; margin-bottom: 24px; }
+        .login-tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #e8ecf0;
+        }
+        .login-tab {
+            flex: 1;
+            background: none;
+            border: none;
+            border-bottom: 3px solid transparent;
+            color: #666;
+            padding: 10px;
+            font-size: 13px;
+            cursor: pointer;
+            margin-bottom: -2px;
+            transition: all 0.2s;
+        }
+        .login-tab.active { border-bottom-color: #1e88e5; color: #1e88e5; font-weight: 600; }
+        .login-tab:hover { color: #333; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1.5px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus { outline: none; border-color: #1e88e5; }
+        .login-btn {
+            width: 100%;
+            background: linear-gradient(135deg, #1565c0, #1e88e5);
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: opacity 0.2s;
+        }
+        .login-btn:hover { opacity: 0.92; }
+        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .login-error {
+            color: #c62828;
+            font-size: 13px;
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            background: #ffebee;
+            border-radius: 8px;
+            display: none;
+        }
+        .login-error.visible { display: block; }
+        .login-hint { font-size: 11px; color: #999; margin-top: 14px; line-height: 1.5; }
+        .login-hint code { background: #f5f5f5; padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+
+        /* ── Settings Panel ────────────────────────────────────── */
+        .settings-panel {
+            display: none;
+            position: absolute;
+            right: 14px;
+            top: 70px;
+            background: white;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            z-index: 100;
+            width: 260px;
+        }
+        .settings-panel.visible { display: block; }
+        .settings-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: #1a1a2e;
+            margin-bottom: 14px;
+        }
+        .setting-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            font-size: 13px;
+            color: #333;
+        }
+        .setting-toggle {
+            position: relative;
+            width: 40px;
+            height: 22px;
+        }
+        .setting-toggle input { opacity: 0; width: 0; height: 0; }
+        .setting-toggle .slider {
+            position: absolute;
+            inset: 0;
+            background: #ccc;
+            border-radius: 22px;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+        .setting-toggle .slider::before {
+            content: '';
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            left: 2px;
+            bottom: 2px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+        .setting-toggle input:checked + .slider { background: #1e88e5; }
+        .setting-toggle input:checked + .slider::before { transform: translateX(18px); }
+        .setting-info {
+            font-size: 11px;
+            color: #888;
+            padding: 8px 0;
+            border-top: 1px solid #f0f0f0;
+            margin-top: 4px;
+        }
+        .setting-info div { padding: 3px 0; }
+
+        /* ── Debug Panel ───────────────────────────────────────── */
+        .debug-toggle-btn {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            background: #1a1a2e;
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            z-index: 999;
+            transition: all 0.2s;
+        }
+        .debug-toggle-btn:hover { background: #333; transform: translateY(-2px); }
+        .debug-panel {
+            position: fixed;
+            right: -420px;
+            top: 0;
+            width: 420px;
+            height: 100vh;
+            background: #1a1a2e;
+            color: #d4d4d4;
+            padding: 20px;
+            overflow-y: auto;
+            box-shadow: -4px 0 20px rgba(0,0,0,0.3);
+            transition: right 0.3s ease;
+            z-index: 1000;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 12px;
+        }
+        .debug-panel.visible { right: 0; }
+        .debug-panel-header {
+            font-size: 15px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .debug-close {
+            background: #333;
+            border: none;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .debug-section {
+            margin-bottom: 14px;
+            padding: 12px;
+            background: #252536;
+            border-radius: 8px;
+        }
+        .debug-label { color: #4ec9b0; font-weight: 700; margin-bottom: 6px; font-size: 11px; text-transform: uppercase; }
+        .debug-value { color: #ce9178; word-break: break-all; white-space: pre-wrap; line-height: 1.6; }
+
+        /* ── Markdown in bubbles ───────────────────────────────── */
+        .msg-text h1, .msg-text h2, .msg-text h3 { margin: 8px 0 4px; color: #1a1a2e; }
+        .msg-text h1 { font-size: 16px; }
+        .msg-text h2 { font-size: 15px; }
+        .msg-text h3 { font-size: 14px; }
+        .msg-text p { margin: 4px 0; }
+        .msg-text ol, .msg-text ul { margin: 4px 0 4px 18px; }
+        .msg-text li { margin: 2px 0; }
+        .msg-text code {
+            background: #f0f4f8;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-family: 'SF Mono', monospace;
+            font-size: 12px;
+        }
+        .msg-text pre {
+            background: #f0f4f8;
+            padding: 10px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 6px 0;
+        }
+        .msg-text pre code { padding: 0; background: none; }
+        .msg-text strong { color: #1a1a2e; }
+        .msg-text a { color: #1e88e5; text-decoration: none; }
+        .msg-text a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+    <!-- Login Modal -->
+    <div class="modal-overlay visible" id="login-modal">
+        <div class="modal">
+            <div class="modal-header-bar">
+                <div class="modal-logo">
+                    <svg viewBox="0 0 100 100" fill="none">
+                        <circle cx="50" cy="35" r="22" fill="white"/>
+                        <ellipse cx="50" cy="80" rx="30" ry="18" fill="white"/>
+                        <circle cx="42" cy="32" r="3" fill="#1565c0"/>
+                        <circle cx="58" cy="32" r="3" fill="#1565c0"/>
+                        <path d="M43 42 Q50 48 57 42" stroke="#1565c0" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="modal-title">ProjectsForce AI Helper</div>
+            </div>
+            <div class="modal-subtitle">Sign in with your ProjectsForce account to start chatting</div>
+            <div class="login-error" id="login-error"></div>
+
+            <div class="login-tabs">
+                <button class="login-tab active" onclick="switchLoginTab('pf')">PF Login</button>
+                <button class="login-tab" onclick="switchLoginTab('manual')">Manual Token</button>
+            </div>
+
+            <!-- PF Login -->
+            <div id="pf-login-form">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="login-email" value="ai@mailinator.com" placeholder="you@company.com">
+                </div>
+                <div class="form-group">
+                    <label>Password (encrypted)</label>
+                    <input type="text" id="login-password" value="U2FsdGVkX187+r2d+eIWXxAQ2mjzAzhalXdwStSDJP0=" placeholder="Encrypted password">
+                </div>
+                <div class="form-group">
+                    <label>Identifier</label>
+                    <input type="text" id="login-identifier" value="projectsforce" placeholder="projectsforce">
+                </div>
+                <button class="login-btn" id="pf-login-btn" onclick="doPfLogin()">Sign In</button>
+                <div class="login-hint">
+                    Password must be pre-encrypted (CryptoJS AES with identifier as key).
+                    Get it from the PF frontend network tab or ask your admin.
+                </div>
+            </div>
+
+            <!-- Manual Token -->
+            <div id="manual-token-form" style="display:none;">
+                <div class="form-group">
+                    <label>Auth Token (Bearer)</label>
+                    <input type="text" id="login-token" placeholder="Paste access_token from PF portal DevTools">
+                </div>
+                <div class="form-group">
+                    <label>Client ID (tenant)</label>
+                    <input type="text" id="login-client-id" value="16PF11PF" placeholder="e.g. 16PF11PF">
+                </div>
+                <div class="form-group">
+                    <label>Customer ID</label>
+                    <input type="text" id="login-customer-id" value="90000033" placeholder="e.g. 90000033">
+                </div>
+                <div class="form-group">
+                    <label>User ID</label>
+                    <input type="text" id="login-user-id" value="90000033" placeholder="e.g. 90000033">
+                </div>
+                <button class="login-btn" onclick="doManualLogin()">Connect</button>
+                <div class="login-hint">
+                    To get your token: log in to <b>pf.dev.projectsforce.com</b>,
+                    open DevTools (F12) &gt; Application &gt; Local Storage,
+                    and copy the <code>access_token</code> value.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Widget -->
+    <div class="chat-widget">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="header-avatar">
+                <svg viewBox="0 0 100 100" fill="none">
+                    <circle cx="50" cy="35" r="22" fill="#1e88e5"/>
+                    <ellipse cx="50" cy="80" rx="30" ry="18" fill="#1e88e5"/>
+                    <circle cx="42" cy="32" r="3" fill="white"/>
+                    <circle cx="58" cy="32" r="3" fill="white"/>
+                    <path d="M43 42 Q50 48 57 42" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                </svg>
+            </div>
+            <div class="header-info">
+                <div class="header-title">ProjectsForce 360&deg; AI Helper</div>
+                <div class="header-subtitle" id="header-status">Sign in to start</div>
+            </div>
+            <div class="header-actions">
+                <button class="header-btn" onclick="clearChat()">Clear Chat</button>
+                <button class="header-icon-btn" onclick="toggleSettings()" title="Settings">&#x2699;</button>
+            </div>
+
+            <!-- Settings dropdown -->
+            <div class="settings-panel" id="settings-panel">
+                <div class="settings-title">Settings</div>
+                <div class="setting-row">
+                    <span>Streaming</span>
+                    <label class="setting-toggle">
+                        <input type="checkbox" id="stream-toggle" onchange="useStreaming=this.checked">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-info">
+                    <div><strong>Session:</strong> <span id="session-display" style="font-family:monospace;font-size:10px;">-</span></div>
+                    <div><strong>Agent:</strong> <span id="agent-type">AgentSquad</span></div>
+                    <div><strong>Backend:</strong> ECS Fargate</div>
+                </div>
+                <div style="margin-top:10px;">
+                    <button onclick="newSession()" style="width:100%;padding:8px;background:#f0f4f8;border:1px solid #e0e0e0;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;color:#333;">New Session</button>
+                </div>
+                <div style="margin-top:8px;">
+                    <button onclick="doLogout()" id="logout-btn" style="display:none;width:100%;padding:8px;background:#ffebee;border:1px solid #ef9a9a;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;color:#c62828;">Sign Out</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Messages -->
+        <div class="chat-messages" id="chat-messages">
+        </div>
+
+        <!-- Typing indicator -->
+        <div class="typing-indicator" id="typing-indicator">
+            <div style="width:32px;flex-shrink:0;"></div>
+            <div class="typing-dots">
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+            </div>
+        </div>
+
+        <!-- Input -->
+        <div class="chat-input-area">
+            <input type="text" class="chat-input" id="message-input"
+                placeholder="Type your message..." disabled
+                onkeypress="if(event.key==='Enter')sendMessage()">
+            <button class="send-btn" id="send-btn" onclick="sendMessage()" disabled>
+                <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Debug -->
+    <button class="debug-toggle-btn" onclick="toggleDebug()">&#x1F50D; Debug</button>
+    <div class="debug-panel" id="debug-panel">
+        <div class="debug-panel-header">
+            <span>Debug Console</span>
+            <button class="debug-close" onclick="toggleDebug()">Close</button>
+        </div>
+        <div id="debug-content">
+            <div class="debug-section">
+                <div class="debug-label">Status</div>
+                <div class="debug-value">Waiting for first request...</div>
+            </div>
+        </div>
+    </div>
+
+<script>
+    // ── SVG Templates ────────────────────────────────────────
+    const BOT_AVATAR_SVG = `<svg viewBox="0 0 100 100" fill="none">
+        <circle cx="50" cy="35" r="22" fill="white"/>
+        <ellipse cx="50" cy="80" rx="30" ry="18" fill="white"/>
+        <circle cx="42" cy="32" r="3" fill="#1565c0"/>
+        <circle cx="58" cy="32" r="3" fill="#1565c0"/>
+        <path d="M43 42 Q50 48 57 42" stroke="#1565c0" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+    </svg>`;
+
+    // ── Config ───────────────────────────────────────────────
+    const API_BASE = window.location.origin;
+    let sessionId = 'session-' + Date.now();
+    let useStreaming = false;
+
+    // Auth state
+    let accessToken = null;
+    let clientId = '';
+    let customerId = '';
+    let userId = '';
+    let userName = '';
+    let lastResponse = {};
+
+    // Update session display
+    document.getElementById('session-display').textContent = sessionId.substring(0, 16) + '...';
+
+    // ── Auto-login on page load ──────────────────────────────
+    (async function autoLogin() {
+        try {
+            const email = document.getElementById('login-email').value.trim();
+            const password = document.getElementById('login-password').value.trim();
+            const identifier = document.getElementById('login-identifier').value.trim();
+            if (!email || !password) return;
+
+            const res = await fetch(API_BASE + '/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password, identifier }),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.accesstoken) {
+                console.warn('Auto-login failed:', data);
+                return;
+            }
+            accessToken  = data.accesstoken;
+            clientId     = data.client_id || '';
+            customerId   = data.customer_id || '';
+            userId       = data.user_id || '';
+            userName     = data.user_name || email;
+            onLoginSuccess();
+            console.log('Auto-login OK:', email, '| client:', clientId, '| customer:', customerId);
+
+            sendWelcome();
+        } catch (err) {
+            console.warn('Auto-login error:', err);
+        }
+    })();
+
+    // ── Login tab switching ──────────────────────────────────
+    function switchLoginTab(tab) {
+        document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
+        if (tab === 'pf') {
+            document.querySelectorAll('.login-tab')[0].classList.add('active');
+            document.getElementById('pf-login-form').style.display = 'block';
+            document.getElementById('manual-token-form').style.display = 'none';
+        } else {
+            document.querySelectorAll('.login-tab')[1].classList.add('active');
+            document.getElementById('pf-login-form').style.display = 'none';
+            document.getElementById('manual-token-form').style.display = 'block';
+        }
+        hideLoginError();
+    }
+
+    // ── PF Login ─────────────────────────────────────────────
+    async function doPfLogin() {
+        const email = document.getElementById('login-email').value.trim();
+        const password = document.getElementById('login-password').value.trim();
+        const identifier = document.getElementById('login-identifier').value.trim() || 'projectsforce';
+
+        if (!email || !password) { showLoginError('Please enter email and encrypted password.'); return; }
+
+        const btn = document.getElementById('pf-login-btn');
+        btn.disabled = true; btn.textContent = 'Signing in...';
+        hideLoginError();
+
+        try {
+            const res = await fetch(API_BASE + '/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password, identifier }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Login failed (HTTP ' + res.status + ')');
+
+            accessToken  = data.accesstoken;
+            clientId     = data.client_id || '';
+            customerId   = data.customer_id || '';
+            userId       = data.user_id || '';
+            userName     = data.user_name || email;
+
+            onLoginSuccess();
+            console.log('PF login OK:', email, '| client:', clientId, '| customer:', customerId);
+        } catch (err) {
+            showLoginError(err.message);
+        } finally {
+            btn.disabled = false; btn.textContent = 'Sign In';
+        }
+    }
+
+    // ── Manual Token Login ───────────────────────────────────
+    function doManualLogin() {
+        const token = document.getElementById('login-token').value.trim();
+        const cid   = document.getElementById('login-client-id').value.trim();
+        const custId = document.getElementById('login-customer-id').value.trim();
+        const uid   = document.getElementById('login-user-id').value.trim();
+
+        if (!token) { showLoginError('Please paste your Bearer token.'); return; }
+
+        accessToken  = token;
+        clientId     = cid || '';
+        customerId   = custId || '';
+        userId       = uid || '';
+        userName     = '';
+
+        onLoginSuccess();
+        console.log('Connected with token (first 40 chars):', token.substring(0, 40) + '...');
+    }
+
+    function onLoginSuccess() {
+        hideLoginError();
+        document.getElementById('login-modal').classList.remove('visible');
+        const displayName = userName || ('User ' + (userId || 'Connected'));
+        document.getElementById('header-status').textContent = displayName + (clientId ? ' (' + clientId + ')' : '');
+        document.getElementById('logout-btn').style.display = 'block';
+        document.getElementById('message-input').disabled = false;
+        document.getElementById('send-btn').disabled = false;
+        document.getElementById('message-input').focus();
+    }
+
+    function doLogout() {
+        accessToken = null; clientId = ''; customerId = ''; userId = ''; userName = '';
+        document.getElementById('header-status').textContent = 'Sign in to start';
+        document.getElementById('logout-btn').style.display = 'none';
+        document.getElementById('message-input').disabled = true;
+        document.getElementById('send-btn').disabled = true;
+        document.getElementById('login-modal').classList.add('visible');
+        document.getElementById('settings-panel').classList.remove('visible');
+        newSession();
+    }
+
+    function showLoginError(msg) {
+        const el = document.getElementById('login-error');
+        el.textContent = msg; el.classList.add('visible');
+    }
+    function hideLoginError() { document.getElementById('login-error').classList.remove('visible'); }
+
+    // Enter in login fields
+    ['login-email', 'login-password', 'login-identifier'].forEach(id => {
+        document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') doPfLogin(); });
+    });
+
+    // ── Settings panel ───────────────────────────────────────
+    function toggleSettings() {
+        document.getElementById('settings-panel').classList.toggle('visible');
+    }
+    // Close settings on outside click
+    document.addEventListener('click', e => {
+        const panel = document.getElementById('settings-panel');
+        const gear = document.querySelector('.header-icon-btn');
+        if (panel.classList.contains('visible') && !panel.contains(e.target) && e.target !== gear) {
+            panel.classList.remove('visible');
+        }
+    });
+
+    // ── Session management ───────────────────────────────────
+    function newSession() {
+        sessionId = 'session-' + Date.now();
+        document.getElementById('session-display').textContent = sessionId.substring(0, 16) + '...';
+        document.getElementById('chat-messages').innerHTML = '';
+        if (accessToken) sendWelcome();
+    }
+
+    function clearChat() {
+        newSession();
+    }
+
+    // ── Quick actions (from welcome or inline) ───────────────
+    function quickAction(message) {
+        document.getElementById('message-input').value = message;
+        sendMessage();
+    }
+
+    // ── Welcome flow (auto-fired after login) ────────────────
+    async function sendWelcome() {
+        if (!accessToken) return;
+        showTyping();
+
+        const body = {
+            message: '__WELCOME__',
+            session_id: sessionId,
+            client_id: clientId,
+            customer_id: customerId,
+            user_id: userId,
+            user_name: userName,
+        };
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + accessToken,
+        };
+        try {
+            const res = await fetch(API_BASE + '/chat', { method: 'POST', headers, body: JSON.stringify(body) });
+            if (res.ok) {
+                const data = await res.json();
+                const text = data.response || data.message || '';
+                hideTyping();
+                addBotMessage(text, data.agent_name);
+
+                // Add quick action buttons after welcome
+                addQuickActions([
+                    { label: 'Check projects', message: 'show my projects' },
+                    { label: 'View status', message: 'show scheduled projects' },
+                    { label: 'Schedule appointments', message: 'show new projects' },
+                ]);
+            } else {
+                hideTyping();
+            }
+        } catch (err) {
+            console.warn('Welcome flow error:', err);
+            hideTyping();
+            // Show offline welcome
+            addBotMessage('Welcome' + (userName ? ', ' + userName.split(' ')[0] : '') + '! I\'m your ProjectsForce AI assistant. How can I help you today?');
+            addQuickActions([
+                { label: 'Check projects', message: 'show my projects' },
+                { label: 'View status', message: 'show scheduled projects' },
+                { label: 'Schedule appointments', message: 'show new projects' },
+            ]);
+        }
+    }
+
+    // ── Send message ─────────────────────────────────────────
+    async function sendMessage() {
+        const inputEl = document.getElementById('message-input');
+        const message = inputEl.value.trim();
+        if (!message || !accessToken) return;
+
+        const startTime = Date.now();
+        addUserMessage(message);
+        inputEl.value = '';
+        inputEl.disabled = true;
+        showTyping();
+
+        const body = { message, session_id: sessionId };
+        if (clientId) body.client_id = clientId;
+        if (customerId) body.customer_id = customerId;
+        if (userId) body.user_id = userId;
+        if (userName) body.user_name = userName;
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (accessToken) headers['Authorization'] = 'Bearer ' + accessToken;
+
+        try {
+            if (useStreaming) {
+                await sendStreaming(body, headers, startTime);
+            } else {
+                await sendNonStreaming(body, headers, startTime);
+            }
+        } catch (error) {
+            console.error('Request error:', error);
+            hideTyping();
+            addBotMessage('Sorry, something went wrong. Please try again.');
+        } finally {
+            inputEl.disabled = false;
+            inputEl.focus();
+        }
+    }
+
+    // ── Non-streaming POST /chat ─────────────────────────────
+    async function sendNonStreaming(body, headers, startTime) {
+        const res = await fetch(API_BASE + '/chat', { method: 'POST', headers, body: JSON.stringify(body) });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'HTTP ' + res.status);
+        }
+        const data = await res.json();
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+
+        hideTyping();
+
+        if (data.session_id) {
+            sessionId = data.session_id;
+            document.getElementById('session-display').textContent = sessionId.substring(0, 16) + '...';
+        }
+
+        const agentName = data.agent_name || null;
+        const responseText = data.response || data.message || data.text || JSON.stringify(data);
+
+        if (agentName) document.getElementById('agent-type').textContent = agentName;
+
+        updateDebug({ request: body, response: data, timing: { total: elapsed + 's' }, agent_name: agentName });
+        addBotMessage(responseText, agentName, elapsed);
+    }
+
+    // ── Streaming POST /chat/stream ──────────────────────────
+    async function sendStreaming(body, headers, startTime) {
+        const res = await fetch(API_BASE + '/chat/stream', { method: 'POST', headers, body: JSON.stringify(body) });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'HTTP ' + res.status);
+        }
+        hideTyping();
+
+        const { rowEl, textDiv } = createStreamingRow();
+        let fullText = '';
+        let agentName = null;
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            let eventType = '';
+            for (const line of lines) {
+                if (line.startsWith('event: ')) {
+                    eventType = line.slice(7);
+                } else if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (eventType === 'sources') {
+                            if (data.session_id) {
+                                sessionId = data.session_id;
+                                document.getElementById('session-display').textContent = sessionId.substring(0, 16) + '...';
+                            }
+                            if (data.agent_name) agentName = data.agent_name;
+                        } else if (eventType === 'delta') {
+                            fullText += data.text;
+                            textDiv.innerHTML = formatMarkdown(fullText);
+                            scrollChat();
+                        } else if (eventType === 'done') {
+                            if (data.agent_name) agentName = data.agent_name;
+                        }
+                    } catch (e) { /* skip parse errors */ }
+                    eventType = '';
+                }
+            }
+        }
+
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        textDiv.classList.remove('streaming');
+        if (fullText) textDiv.innerHTML = formatAgentContent(fullText);
+
+        // Add meta
+        const meta = document.createElement('div');
+        meta.className = 'msg-time';
+        meta.textContent = (agentName || 'Agent') + ' | ' + elapsed + 's | ' + new Date().toLocaleTimeString();
+        rowEl.querySelector('.msg-content').appendChild(meta);
+
+        if (agentName) document.getElementById('agent-type').textContent = agentName;
+        scrollChat();
+    }
+
+    function createStreamingRow() {
+        const msgs = document.getElementById('chat-messages');
+        const rowEl = document.createElement('div');
+        rowEl.className = 'msg-row bot';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar bot';
+        avatar.innerHTML = BOT_AVATAR_SVG;
+
+        const content = document.createElement('div');
+        content.className = 'msg-content';
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        const textDiv = document.createElement('div');
+        textDiv.className = 'msg-text streaming';
+        bubble.appendChild(textDiv);
+        content.appendChild(bubble);
+
+        rowEl.appendChild(avatar);
+        rowEl.appendChild(content);
+        msgs.appendChild(rowEl);
+        scrollChat();
+        return { rowEl, textDiv };
+    }
+
+    // ── Typing indicator ─────────────────────────────────────
+    function showTyping() { document.getElementById('typing-indicator').classList.add('active'); scrollChat(); }
+    function hideTyping() { document.getElementById('typing-indicator').classList.remove('active'); }
+
+    // ── Message rendering ────────────────────────────────────
+    function addUserMessage(text) {
+        const msgs = document.getElementById('chat-messages');
+        const row = document.createElement('div');
+        row.className = 'msg-row user';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar user-avatar';
+        avatar.textContent = '\uD83C\uDDFA\uD83C\uDDF8';
+
+        const content = document.createElement('div');
+        content.className = 'msg-content';
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        bubble.textContent = text;
+        content.appendChild(bubble);
+
+        const meta = document.createElement('div');
+        meta.className = 'msg-time';
+        meta.textContent = new Date().toLocaleTimeString();
+        content.appendChild(meta);
+
+        row.appendChild(avatar);
+        row.appendChild(content);
+        msgs.appendChild(row);
+        scrollChat();
+    }
+
+    function addBotMessage(content, agentName, elapsed) {
+        const msgs = document.getElementById('chat-messages');
+        const row = document.createElement('div');
+        row.className = 'msg-row bot';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar bot';
+        avatar.innerHTML = BOT_AVATAR_SVG;
+
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'msg-content';
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        const textDiv = document.createElement('div');
+        textDiv.className = 'msg-text';
+        textDiv.innerHTML = formatAgentContent(content);
+        bubble.appendChild(textDiv);
+        contentDiv.appendChild(bubble);
+
+        const meta = document.createElement('div');
+        meta.className = 'msg-time';
+        meta.textContent = (agentName || 'Agent')
+            + (elapsed ? ' | ' + elapsed + 's' : '')
+            + ' | ' + new Date().toLocaleTimeString();
+        contentDiv.appendChild(meta);
+
+        row.appendChild(avatar);
+        row.appendChild(contentDiv);
+        msgs.appendChild(row);
+        scrollChat();
+    }
+
+    function addQuickActions(actions) {
+        const msgs = document.getElementById('chat-messages');
+        const row = document.createElement('div');
+        row.className = 'msg-row bot';
+        row.style.paddingLeft = '40px';
+
+        const btns = document.createElement('div');
+        btns.className = 'quick-actions';
+        for (const a of actions) {
+            const btn = document.createElement('button');
+            btn.className = 'quick-btn';
+            btn.textContent = a.label;
+            btn.onclick = () => { quickAction(a.message); row.remove(); };
+            btns.appendChild(btn);
+        }
+        row.appendChild(btns);
+        msgs.appendChild(row);
+        scrollChat();
+    }
+
+    // ── Rich response formatting ─────────────────────────────
+    const STATUS_COLORS = {
+        'New': '#2e7d32', 'Scheduled': '#00897b', 'Customer Scheduled': '#5e35b1',
+        'Completed': '#6d4c41', 'In Progress': '#f57f17', 'Pending Reschedule': '#e65100',
+        'Cancelled': '#c62828', 'On Hold': '#546e7a', 'Ready To Schedule': '#546e7a',
+    };
+    const STATUS_CLASSES = {
+        'New': 'status-new', 'Scheduled': 'status-scheduled',
+        'Customer Scheduled': 'status-customer-scheduled',
+        'Completed': 'status-completed', 'In Progress': 'status-inprogress',
+        'Pending Reschedule': 'status-pending', 'Cancelled': 'status-cancelled',
+        'On Hold': 'status-onhold', 'Ready To Schedule': 'status-ready',
+    };
+
+    function formatAgentContent(content) {
+        if (!content || typeof content !== 'string') return '<p>No response</p>';
+
+        // Extract JSON blocks
+        const segments = [];
+        const jsonBlockRegex = /```json\s*([\s\S]*?)```/g;
+        let lastIndex = 0;
+        let match;
+
+        while ((match = jsonBlockRegex.exec(content)) !== null) {
+            const textBefore = content.substring(lastIndex, match.index).trim();
+            if (textBefore) segments.push({ type: 'text', content: textBefore });
+            segments.push({ type: 'json', content: match[1] });
+            lastIndex = match.index + match[0].length;
+        }
+        const textAfter = content.substring(lastIndex).trim();
+        if (textAfter) segments.push({ type: 'text', content: textAfter });
+
+        // Try embedded JSON objects
+        if (segments.length === 0) {
+            const plainJsonMatch = content.match(/(\{[\s\S]*?"projects"\s*:\s*\[[\s\S]*?\]\s*\})/);
+            if (plainJsonMatch) {
+                const before = content.substring(0, plainJsonMatch.index).trim();
+                const after = content.substring(plainJsonMatch.index + plainJsonMatch[0].length).trim();
+                if (before) segments.push({ type: 'text', content: before });
+                segments.push({ type: 'json', content: plainJsonMatch[1] });
+                if (after) segments.push({ type: 'text', content: after });
+            }
+        }
+
+        if (segments.length === 0) return formatMarkdown(content);
+
+        let html = '';
+        for (const seg of segments) {
+            if (seg.type === 'text') {
+                html += formatMarkdown(seg.content);
+            } else {
+                try {
+                    html += renderRichData(JSON.parse(seg.content));
+                } catch (e) {
+                    html += '<pre style="background:#f0f4f8;padding:10px;border-radius:8px;overflow-x:auto;font-size:11px;">'
+                        + escapeHtml(seg.content) + '</pre>';
+                }
+            }
+        }
+        return html;
+    }
+
+    function renderRichData(data) {
+        let html = '';
+
+        // ── Confirmation / Success ───────────────────────────
+        if (data.status === 'success' && data.appointment) {
+            const a = data.appointment;
+            html += '<div class="rich-component">';
+            html += '<div class="success-card"><span class="success-icon">&#x2705;</span><span>'
+                + escapeHtml(data.message || 'Appointment confirmed!') + '</span></div>';
+            if (a.date || a.time || a.technician) {
+                html += '<div class="appt-preview" style="border-radius:12px;margin-top:8px;">';
+                if (a.project) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">' + escapeHtml(String(a.project)) + '</span></div>';
+                if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(a.date) + '</span></div>';
+                if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(a.time) + '</span></div>';
+                if (a.technician) html += '<div class="appt-row"><span class="appt-label">Technician</span><span class="appt-value">' + escapeHtml(a.technician) + '</span></div>';
+                html += '</div>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        // ── Appointment Preview (pre-confirmation) ───────────
+        if (data.confirmation_required || data.pending_action) {
+            const a = data.appointment || data.pending_action || {};
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CB;</span> Appointment Preview</div>';
+            html += '<div class="appt-preview">';
+            if (a.project || a.projectNumber) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">#' + escapeHtml(String(a.project || a.projectNumber || '')) + '</span></div>';
+            if (a.type || a.projectType) html += '<div class="appt-row"><span class="appt-label">Type</span><span class="appt-value">' + escapeHtml(a.type || a.projectType || '') + '</span></div>';
+            if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(a.date) + '</span></div>';
+            if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(a.time) + '</span></div>';
+            html += '<div class="appt-actions">';
+            html += '<button class="appt-btn appt-confirm" onclick="quickAction(\'Confirm\')">Confirm</button>';
+            html += '<button class="appt-btn appt-decline" onclick="quickAction(\'Decline\')">Decline</button>';
+            html += '</div></div></div>';
+            return html;
+        }
+
+        // ── Time Slots ───────────────────────────────────────
+        if (data.time_slots || data.timeSlots || data.available_times) {
+            const slots = data.time_slots || data.timeSlots || data.available_times;
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F552;</span> '
+                + escapeHtml(data.message || 'Available Time Slots') + '</div>';
+            html += '<div class="timeslots-container">';
+
+            if (Array.isArray(slots)) {
+                // Group by period if slots have period info
+                const groups = { 'Morning': [], 'Afternoon': [], 'Evening': [] };
+                let hasGroups = false;
+                for (const s of slots) {
+                    const time = typeof s === 'string' ? s : (s.time || s.label || '');
+                    const period = typeof s === 'object' ? (s.period || '') : '';
+                    if (period && groups[period]) { groups[period].push(time); hasGroups = true; }
+                    else {
+                        // Auto-classify
+                        const h = parseInt(time);
+                        if (h < 12) groups['Morning'].push(time);
+                        else if (h < 17 || time.includes('PM') && h < 5) groups['Afternoon'].push(time);
+                        else groups['Evening'].push(time);
+                    }
+                }
+
+                for (const [period, times] of Object.entries(groups)) {
+                    if (times.length === 0) continue;
+                    html += '<div class="timeslot-group"><div class="timeslot-label">' + period + '</div>';
+                    html += '<div class="timeslot-buttons">';
+                    for (const t of times) {
+                        html += '<button class="timeslot-btn" onclick="quickAction(\'' + escapeHtml(t) + '\')">' + escapeHtml(t) + '</button>';
+                    }
+                    html += '</div></div>';
+                }
+            }
+            html += '</div></div>';
+            return html;
+        }
+
+        // ── Available Dates ──────────────────────────────────
+        if (data.dates || data.available_dates || data.dates_with_weather) {
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4C5;</span> '
+                + escapeHtml(data.message || 'Available Dates') + '</div>';
+
+            const dates = data.dates_with_weather || data.dates || data.available_dates;
+            if (dates && dates.length > 0) {
+                html += '<div class="dates-grid">';
+                for (const d of dates) {
+                    if (typeof d === 'object') {
+                        const indicator = (d.weatherIndicator || d.indicator || '').trim();
+                        const temp = d.highTemp || d.high_temp || d.temperature || '';
+                        const day = d.dayName || d.day_name || '';
+                        const monthDay = d.monthDay || d.month_day || d.date || '';
+                        const condition = (d.weatherCondition || d.condition || '').toLowerCase();
+                        const warnings = d.weatherWarnings || d.warnings || [];
+
+                        let cls = 'date-card';
+                        if (condition.includes('snow') || condition.includes('storm') || condition.includes('blizzard')) {
+                            cls += ' weather-bad severe';
+                        } else if (warnings.length > 0 || condition.includes('rain') || condition.includes('wind')) {
+                            cls += ' weather-warn';
+                        } else if (indicator.includes('\u2600') || condition.includes('clear') || condition.includes('sunny') || condition.includes('partly')) {
+                            cls += ' weather-good';
+                        }
+
+                        const dateStr = monthDay || d.date || '';
+                        html += '<div class="' + cls + '" onclick="quickAction(\'schedule for ' + escapeHtml(dateStr) + '\')">';
+                        html += '<div class="day-name">' + escapeHtml(day) + '</div>';
+                        html += '<div class="day-date">' + escapeHtml(dateStr) + '</div>';
+                        if (temp) html += '<div class="day-temp">' + escapeHtml(String(temp)) + '&deg;F</div>';
+                        if (d.weatherCondition || d.condition) html += '<div class="day-condition">' + escapeHtml(d.weatherCondition || d.condition) + '</div>';
+                        html += '</div>';
+                    } else {
+                        html += '<div class="date-card" onclick="quickAction(\'schedule for ' + escapeHtml(String(d)) + '\')">';
+                        html += '<div class="day-date">' + escapeHtml(String(d)) + '</div>';
+                        html += '</div>';
+                    }
+                }
+                html += '</div>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        // ── Projects List (table) ────────────────────────────
+        if (data.projects && Array.isArray(data.projects) && data.projects.length > 0) {
+            // Filter out completed projects
+            const activeProjects = data.projects.filter(p => (p.status || '').toLowerCase() !== 'completed');
+            if (activeProjects.length === 0) {
+                return '<div style="background:#f0f4f8;border-radius:10px;padding:12px 16px;margin:6px 0;">All projects are completed. No active projects to show.</div>';
+            }
+
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4E6;</span> '
+                + escapeHtml(data.message || 'Found ' + activeProjects.length + ' project(s):') + '</div>';
+
+            html += '<table class="projects-table"><thead><tr>';
+            html += '<th>Project #</th><th>Status</th><th>Category</th><th>Type</th><th>Date Sold</th>';
+            html += '</tr></thead><tbody>';
+
+            for (const p of activeProjects) {
+                const number = p.projectNumber || p.number || p.id || '';
+                const status = p.status || 'Unknown';
+                const statusCls = STATUS_CLASSES[status] || 'status-ready';
+                const category = p.category || '';
+                const type = p.projectType || p.type || '';
+                const date = p.dateSold || p.date_sold || p.date || p.scheduledDate || '';
+
+                html += '<tr onclick="quickAction(\'Schedule project ' + escapeHtml(String(number)) + '\')">';
+                html += '<td style="font-weight:600;color:#1565c0;">' + escapeHtml(String(number)) + '</td>';
+                html += '<td><span class="status-badge ' + statusCls + '">' + escapeHtml(status) + '</span></td>';
+                html += '<td>' + escapeHtml(category) + '</td>';
+                html += '<td>' + escapeHtml(type) + '</td>';
+                html += '<td>' + escapeHtml(date) + '</td>';
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            return html;
+        }
+
+        // ── Single Project Detail ────────────────────────────
+        if (data.project && typeof data.project === 'object') {
+            const proj = data.project;
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CB;</span> Project #'
+                + escapeHtml(String(proj.id || proj.projectNumber || '')) + ' Details</div>';
+            html += '<div class="project-detail"><div class="project-detail-body">';
+
+            if (proj.name || proj.category) {
+                html += '<div class="project-detail-name">' + escapeHtml(proj.name || proj.category || '') + '</div>';
+            }
+            if (proj.projectType || proj.type) {
+                html += '<div class="project-detail-type">' + escapeHtml(proj.projectType || proj.type || '') + '</div>';
+            }
+            const status = proj.status || '';
+            if (status) {
+                const statusCls = STATUS_CLASSES[status] || 'status-ready';
+                html += '<div style="margin:10px 0;"><span class="status-badge ' + statusCls + '">' + escapeHtml(status) + '</span></div>';
+            }
+
+            if (proj.scheduledDate || proj.date) {
+                html += '<div class="project-detail-row"><span class="icon">&#x1F4C5;</span> '
+                    + escapeHtml(proj.scheduledDate || proj.date) + '</div>';
+            }
+
+            // Technician card
+            const tech = proj.technician || (proj.installer ? proj.installer.name : '') || '';
+            if (tech) {
+                html += '<div class="tech-card"><div class="tech-card-label">Your Technician</div>'
+                    + '<div class="tech-card-name">' + escapeHtml(tech) + '</div></div>';
+            }
+
+            // Address
+            let address = '';
+            if (proj.address) {
+                if (typeof proj.address === 'string') address = proj.address;
+                else address = [proj.address.address1, proj.address.city, proj.address.state, proj.address.zipcode].filter(Boolean).join(', ');
+            }
+            if (address) {
+                html += '<div class="address-section"><div class="address-label">Installation Address</div>'
+                    + '<div class="address-content"><span class="address-pin">&#x1F4CD;</span><span>' + escapeHtml(address) + '</span></div></div>';
+            }
+
+            html += '</div></div></div>';
+            return html;
+        }
+
+        // ── Weather ──────────────────────────────────────────
+        if (data.weather || data.current || data.forecast) {
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x2600;</span> '
+                + escapeHtml(data.message || 'Weather Outlook') + '</div>';
+            html += '<div class="weather-grid">';
+
+            const current = data.current || data.weather || {};
+            if (current.temperature || current.temp) {
+                html += '<div class="weather-card">';
+                html += '<div class="weather-card-title">Current Conditions</div>';
+                html += '<div class="weather-temp">' + escapeHtml(String(current.temperature || current.temp || '')) + '&deg;F</div>';
+                if (current.condition) html += '<div class="weather-condition">' + escapeHtml(current.condition) + '</div>';
+                html += '</div>';
+            }
+
+            const forecast = data.forecast || {};
+            if (forecast.high || forecast.low) {
+                html += '<div class="weather-card">';
+                html += '<div class="weather-card-title">Forecast</div>';
+                html += '<div class="weather-detail">';
+                if (forecast.high) html += '<span class="weather-badge high">High ' + escapeHtml(String(forecast.high)) + '&deg;</span>';
+                if (forecast.low) html += '<span class="weather-badge low">Low ' + escapeHtml(String(forecast.low)) + '&deg;</span>';
+                html += '</div>';
+                if (forecast.precipitation) html += '<div style="margin-top:6px;"><span class="weather-badge precip">' + escapeHtml(String(forecast.precipitation)) + '% precip</span></div>';
+                if (forecast.condition) html += '<div class="weather-condition" style="margin-top:6px;">' + escapeHtml(forecast.condition) + '</div>';
+                html += '</div>';
+            }
+
+            html += '</div></div>';
+            return html;
+        }
+
+        // ── Generic message ──────────────────────────────────
+        if (data.message) {
+            return '<div style="background:#f0f4f8;border-radius:10px;padding:12px 16px;margin:6px 0;">'
+                + escapeHtml(data.message) + '</div>';
+        }
+
+        // ── Unknown JSON ─────────────────────────────────────
+        return '<pre style="background:#f0f4f8;padding:10px;border-radius:8px;overflow-x:auto;font-size:11px;">'
+            + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>';
+    }
+
+    // ── Markdown formatter ───────────────────────────────────
+    function formatMarkdown(md) {
+        let html = escapeHtml(md);
+        html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => '<pre><code>' + code.trim() + '</code></pre>');
+        html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+        html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+        html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+        html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+        html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+        html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
+        html = html.replace(/^[-*]\s+(.+)$/gm, '<li>$1</li>');
+        html = html.replace(/((<li>.*<\/li>\n?)+)/g, m => '<ul>' + m + '</ul>');
+        html = html.replace(/^(?!<[huploi])((?!<).+)$/gm, '<p>$1</p>');
+        html = html.replace(/\n{2,}/g, '\n');
+        return html;
+    }
+
+    function escapeHtml(str) {
+        if (typeof str !== 'string') str = String(str);
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────
+    function scrollChat() {
+        requestAnimationFrame(() => {
+            const msgs = document.getElementById('chat-messages');
+            msgs.scrollTop = msgs.scrollHeight;
+        });
+    }
+
+    // ── Debug panel ──────────────────────────────────────────
+    function toggleDebug() { document.getElementById('debug-panel').classList.toggle('visible'); }
+
+    function updateDebug(data) {
+        document.getElementById('debug-content').innerHTML =
+            '<div class="debug-section"><div class="debug-label">Last Request</div>'
+            + '<div class="debug-value">' + JSON.stringify(data.request || {}, null, 2) + '</div></div>'
+            + '<div class="debug-section"><div class="debug-label">Last Response</div>'
+            + '<div class="debug-value">' + JSON.stringify(data.response || {}, null, 2) + '</div></div>'
+            + '<div class="debug-section"><div class="debug-label">Performance</div>'
+            + '<div class="debug-value">' + JSON.stringify(data.timing || {}, null, 2) + '</div></div>'
+            + '<div class="debug-section"><div class="debug-label">Session</div>'
+            + '<div class="debug-value">Session ID: ' + sessionId + '\nClient: ' + clientId
+            + '\nCustomer: ' + customerId + '\nUser: ' + userId
+            + '\nAgent: ' + (data.agent_name || 'Unknown') + '</div></div>';
+    }
+
+    // ── Init ─────────────────────────────────────────────────
+    document.getElementById('login-email').focus();
+</script>
+</body>
+</html>

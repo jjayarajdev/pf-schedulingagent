@@ -1,0 +1,997 @@
+"""Scheduling tool handlers — 10 async functions for PF Scheduler API.
+
+Ported from v1.2.9 scheduling-actions/handler.py.
+All functions are async, use httpx.AsyncClient, return str for the LLM agent.
+
+Architecture: Projects are loaded ONCE per session via the dashboard API and
+cached in ``_projects_cache``.  Every tool that needs project data reads from
+the cache instead of re-calling the API.  Write operations (schedule, cancel)
+invalidate the cache so the next read fetches fresh data.
+"""
+
+import asyncio
+import json
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+
+from auth.context import AuthContext
+from tools.api_client import build_headers, get_pf_api_base, log_curl, log_response
+from tools.date_utils import convert_natural_date, extract_date_range
+from tools.project_rules import ProjectStatusRules
+
+logger = logging.getLogger(__name__)
+
+# Scheduler API can be slow (slot computation) — use generous timeout
+_SCHEDULER_TIMEOUT = 60.0
+
+# ---------------------------------------------------------------------------
+#  Caches (module-level, keyed by customer_id)
+# ---------------------------------------------------------------------------
+
+# Projects cache: customer_id → {"projects": [...], "loaded_at": datetime}
+_projects_cache: dict[str, dict] = {}
+
+# Cache TTL — 60 seconds: short enough to pick up external changes,
+# long enough to avoid redundant calls within a scheduling flow.
+_CACHE_TTL_SECONDS = 60
+
+# Cache of request_id per project_id — populated by get_available_dates, used by get_time_slots/confirm
+_request_id_by_project: dict[str, int] = {}
+
+# Lock to prevent concurrent API fetches for the same customer
+_load_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+#  Time normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_time(time_str: str) -> str:
+    """Normalize a time string to HH:MM:SS (24-hour) format.
+
+    Accepts: "8:00 AM", "1:00 PM", "08:00", "8:00:00", "13:00:00", etc.
+    Returns: "08:00:00", "13:00:00", etc.
+    """
+    t = time_str.strip()
+
+    # Already in HH:MM:SS 24-hour format
+    if re.match(r"^\d{2}:\d{2}:\d{2}$", t):
+        return t
+
+    # AM/PM format
+    am_pm = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)$", t, re.IGNORECASE)
+    if am_pm:
+        hour = int(am_pm.group(1))
+        minute = am_pm.group(2)
+        second = am_pm.group(3) or "00"
+        period = am_pm.group(4).upper()
+        if period == "PM" and hour != 12:
+            hour += 12
+        elif period == "AM" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute}:{second}"
+
+    # HH:MM format (no seconds)
+    hhmm = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if hhmm:
+        return f"{int(hhmm.group(1)):02d}:{hhmm.group(2)}:00"
+
+    # Fallback — return as-is
+    logger.warning("Could not normalize time format: %s", time_str)
+    return t
+
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_get(obj: Any, *keys, default=None) -> Any:
+    """Safely navigate nested dictionaries."""
+    result = obj
+    for key in keys:
+        if isinstance(result, dict):
+            result = result.get(key)
+            if result is None:
+                return default
+        else:
+            return default
+    return result if result is not None else default
+
+
+def _extract_project_minimal(item: dict) -> dict[str, Any]:
+    """Extract key fields from a raw project API response."""
+    project_type = (
+        _safe_get(item, "project_type_project_type", default="")
+        or _safe_get(item, "project_type", default="")
+        or _safe_get(item, "projectType", default="")
+        or _safe_get(item, "work_type", default="")
+    )
+    project = {
+        "id": str(_safe_get(item, "project_project_id", default="")),
+        "projectNumber": _safe_get(item, "project_project_number", default=""),
+        "status": _safe_get(item, "status_info_status", default=""),
+        "category": _safe_get(item, "project_category_category", default=""),
+        "projectType": project_type,
+    }
+
+    scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
+    if scheduled_date:
+        project["scheduledDate"] = scheduled_date
+        project["scheduledEndDate"] = _safe_get(item, "convertedProjectEndScheduledDate", default="")
+
+    installer_name = _safe_get(item, "user_idata_first_name")
+    if installer_name:
+        installer_last = _safe_get(item, "user_idata_last_name", default="")
+        project["installer"] = {
+            "name": f"{installer_name} {installer_last}".strip(),
+            "id": str(_safe_get(item, "installer_details_installer_id", default="")),
+        }
+
+    address = {
+        "address1": _safe_get(item, "installation_address_address1", default=""),
+        "city": _safe_get(item, "installation_address_city", default=""),
+        "state": _safe_get(item, "installation_address_state", default=""),
+        "zipcode": _safe_get(item, "installation_address_zipcode", default=""),
+    }
+    project["address"] = {k: v for k, v in address.items() if v}
+
+    project["store"] = {
+        "storeName": _safe_get(item, "store_info_store_name", default=""),
+        "storeNumber": _safe_get(item, "store_info_store_number", default=""),
+    }
+
+    return project
+
+
+def _build_scheduler_url(client_id: str, project_id: str) -> str:
+    """Build the scheduler API URL path."""
+    base = get_pf_api_base()
+    return f"{base}/scheduler/client/{client_id}/project/{project_id}"
+
+
+def _unwrap(data: dict) -> dict:
+    """Unwrap the PF API 'data' envelope if present."""
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        return inner
+    return data
+
+
+# ---------------------------------------------------------------------------
+#  Project cache operations
+# ---------------------------------------------------------------------------
+
+async def _load_projects(force: bool = False) -> list[dict[str, Any]]:
+    """Load and cache all projects for the current customer.
+
+    Returns the list of extracted project dicts.  Hits the API only if
+    the cache is empty, stale (>60s), or ``force=True``.
+    Uses an asyncio.Lock to prevent concurrent API fetches.
+    """
+    customer_id = AuthContext.get_customer_id()
+    if not customer_id:
+        return []
+
+    # Fast path: check cache WITHOUT the lock
+    if not force and customer_id in _projects_cache:
+        entry = _projects_cache[customer_id]
+        age = (datetime.now(timezone.utc) - entry["loaded_at"]).total_seconds()
+        if age < _CACHE_TTL_SECONDS:
+            return entry["projects"]
+
+    # Slow path: acquire lock, re-check, then fetch
+    async with _load_lock:
+        # Re-check under lock (another coroutine may have populated it)
+        if not force and customer_id in _projects_cache:
+            entry = _projects_cache[customer_id]
+            age = (datetime.now(timezone.utc) - entry["loaded_at"]).total_seconds()
+            if age < _CACHE_TTL_SECONDS:
+                return entry["projects"]
+
+        # Fetch from API
+        client_id = AuthContext.get_client_id()
+        url = f"{get_pf_api_base()}/dashboard/get/{client_id}/{customer_id}"
+        headers = build_headers()
+        log_curl("GET", url, headers)
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.get(url, headers=headers)
+
+            log_response(response, "load_projects")
+
+            if response.status_code in (401, 403):
+                return []
+
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError:
+            logger.exception("Failed to load projects for cache")
+            return _projects_cache.get(customer_id, {}).get("projects", [])
+
+        raw_data = data.get("data", [])
+        projects = [_extract_project_minimal(item) for item in raw_data]
+
+        _projects_cache[customer_id] = {
+            "projects": projects,
+            "loaded_at": datetime.now(timezone.utc),
+        }
+        logger.info("Projects cache loaded: %d projects for customer %s", len(projects), customer_id)
+        return projects
+
+
+def _get_cached_project(project_id: str) -> dict[str, Any] | None:
+    """Look up a single project from the cache by ID or project number."""
+    customer_id = AuthContext.get_customer_id()
+    entry = _projects_cache.get(customer_id)
+    if not entry:
+        return None
+
+    pid = str(project_id)
+    for p in entry["projects"]:
+        if p["id"] == pid or p.get("projectNumber") == pid:
+            return p
+    return None
+
+
+def _invalidate_projects() -> None:
+    """Invalidate the project cache for the current customer.
+
+    Called after write operations (schedule, cancel) so the next read
+    picks up the updated status.
+    """
+    customer_id = AuthContext.get_customer_id()
+    if customer_id in _projects_cache:
+        del _projects_cache[customer_id]
+        logger.info("Projects cache invalidated for customer %s", customer_id)
+
+
+# ---------------------------------------------------------------------------
+#  Tool handlers
+# ---------------------------------------------------------------------------
+
+_SCHEDULED_STATUSES = {
+    "scheduled", "tentatively scheduled", "customer scheduled",
+    "store scheduled", "install scheduled", "hdms scheduled",
+}
+_CANCELLED_STATUSES = {"cancelled", "cancelled/surge", "ready to cancel"}
+_COMPLETED_STATUSES = {
+    "completed", "work complete", "project completed",
+    "work order completed", "done", "completed-archived",
+}
+_ON_HOLD_STATUSES = {
+    "on hold", "waiting for product", "waiting product",
+    "missing product", "paused - missing product",
+    "paused - waiting on product", "waiting for permit",
+    "needs permit", "product ordered", "pending",
+}
+
+
+def _build_intelligent_fallback(all_projects: list[dict[str, Any]]) -> str:
+    """When no schedulable projects remain, explain WHY with context.
+
+    Categorizes projects by status and returns a helpful message with
+    actionable next steps.
+    """
+    scheduled = []
+    cancelled = []
+    completed = []
+    on_hold = []
+    other = []
+
+    for p in all_projects:
+        s = p.get("status", "").lower()
+        if s in _SCHEDULED_STATUSES:
+            scheduled.append(p)
+        elif s in _CANCELLED_STATUSES:
+            cancelled.append(p)
+        elif s in _COMPLETED_STATUSES:
+            completed.append(p)
+        elif s in _ON_HOLD_STATUSES:
+            on_hold.append(p)
+        else:
+            other.append(p)
+
+    # Priority order: already scheduled → cancelled → completed → on hold → generic
+    if scheduled:
+        items = [
+            f"{p.get('category', 'Project')} (#{p['id']})"
+            + (f" scheduled for {p['scheduledDate']}" if p.get("scheduledDate") else "")
+            for p in scheduled
+        ]
+        info = "; ".join(items)
+        result = {
+            "message": (
+                f"I found {len(scheduled)} project(s), but they're already scheduled: {info}. "
+                "Would you like to reschedule, cancel, or check the details?"
+            ),
+            "projects": scheduled,
+            "already_scheduled": True,
+        }
+        return json.dumps(result, indent=2)
+
+    if cancelled:
+        cat = cancelled[0].get("category", "project")
+        return (
+            f"Your {cat} project has been cancelled and cannot be scheduled. "
+            "Would you like more information or to speak with customer service?"
+        )
+
+    if completed:
+        cat = completed[0].get("category", "project")
+        return (
+            f"Your {cat} project has been completed. "
+            "Is there anything else I can help you with?"
+        )
+
+    if on_hold:
+        p = on_hold[0]
+        actual_status = p.get("status", "on hold")
+        cat = p.get("category", "project")
+        return (
+            f"Your {cat} project is currently {actual_status} and cannot be scheduled yet. "
+            "Would you like more details?"
+        )
+
+    # Generic — show what we have
+    items = [
+        f"{p.get('category', 'Project')} (#{p['id']}): {p.get('status', 'Unknown')}"
+        for p in all_projects[:5]
+    ]
+    info = "; ".join(items)
+    return (
+        f"I found {len(all_projects)} project(s): {info}. "
+        "None are ready to schedule right now. Would you like more details?"
+    )
+
+
+async def list_projects(
+    status: str = "", category: str = "", project_type: str = "",
+    scheduled_month: str = "", scheduled_date: str = "",
+) -> str:
+    """List projects for the authenticated customer.
+
+    Supports filtering by status, category, projectType, scheduled_month,
+    and scheduled_date. A special ``status="schedulable"`` filter matches
+    projects in schedulable statuses (new, ready to schedule, etc.).
+    """
+    customer_id = AuthContext.get_customer_id()
+    if not customer_id:
+        return "Error: No customer ID available. Please ensure you're authenticated."
+
+    projects = await _load_projects()
+
+    if not projects:
+        return "No projects found."
+
+    # Exclude terminal statuses by default (unless a specific status filter asks for them)
+    excluded = {"closed", "cancelled", "completed", "work complete", "done", "archived"}
+    if status and status.lower() in excluded:
+        # If user explicitly asks for a terminal status, don't exclude it
+        filtered = list(projects)
+    else:
+        filtered = [p for p in projects if p.get("status", "").lower() not in excluded]
+
+    # Apply filters
+    if status:
+        status_lower = status.lower()
+        if status_lower == "schedulable":
+            schedulable = {"new", "pending reschedule", "not scheduled", "ready to schedule"}
+            filtered = [p for p in filtered if p.get("status", "").lower() in schedulable]
+        else:
+            filtered = [p for p in filtered if status_lower in p.get("status", "").lower()]
+
+    if category:
+        cat_lower = category.lower()
+        filtered = [p for p in filtered if cat_lower in p.get("category", "").lower()]
+
+    if project_type:
+        pt_lower = project_type.lower()
+        filtered = [
+            p for p in filtered
+            if pt_lower in (p.get("projectType") or "").lower()
+        ]
+
+    if scheduled_month:
+        month_lower = scheduled_month.lower()[:3]  # "January" → "jan"
+        filtered = [
+            p for p in filtered
+            if _match_scheduled_month(p.get("scheduledDate", ""), month_lower)
+        ]
+
+    if scheduled_date:
+        filtered = [
+            p for p in filtered
+            if _match_scheduled_date(p.get("scheduledDate", ""), scheduled_date)
+        ]
+
+    if not filtered:
+        # Intelligent fallback — explain why no projects match
+        return _build_intelligent_fallback(projects)
+
+    return json.dumps({"message": f"Found {len(filtered)} project(s):", "projects": filtered}, indent=2)
+
+
+def _match_scheduled_month(scheduled_date: str, month_abbrev: str) -> bool:
+    """Check if a scheduledDate falls in a given month (e.g., 'jan', 'feb')."""
+    if not scheduled_date:
+        return False
+    try:
+        dt = datetime.strptime(scheduled_date[:10], "%Y-%m-%d")
+        return dt.strftime("%b").lower() == month_abbrev
+    except ValueError:
+        return False
+
+
+def _match_scheduled_date(scheduled_date: str, target_date: str) -> bool:
+    """Check if a scheduledDate matches a target date (YYYY-MM-DD)."""
+    if not scheduled_date:
+        return False
+    return scheduled_date[:10] == target_date[:10]
+
+
+async def get_project_details(project_id: str) -> str:
+    """Get detailed information about a specific project.
+
+    Reads from the project cache.  If not found, forces a cache refresh
+    and retries once.
+    """
+    customer_id = AuthContext.get_customer_id()
+    if not customer_id:
+        return "Error: No customer ID available. Please ensure you're authenticated."
+
+    # Try cache first
+    project = _get_cached_project(project_id)
+    if not project:
+        # Cache miss — load fresh and retry
+        await _load_projects(force=True)
+        project = _get_cached_project(project_id)
+
+    if not project:
+        return f"Project {project_id} not found. Please check the project ID and try again."
+
+    return json.dumps(project, indent=2, default=str)
+
+
+async def get_available_dates(project_id: str, start_date: str = "", end_date: str = "") -> str:
+    """Get available scheduling dates. Returns dates + request_id (critical for downstream calls)."""
+    client_id = AuthContext.get_client_id()
+    base_url = _build_scheduler_url(client_id, project_id)
+
+    if start_date and not end_date:
+        range_result = extract_date_range(start_date)
+        if range_result:
+            start_date = range_result["start_date"]
+            end_date = range_result["end_date"]
+        else:
+            date_result = convert_natural_date(start_date)
+            if date_result:
+                start_date = date_result["start_date"]
+                end_date = date_result.get("end_date", "")
+
+    if not start_date:
+        tomorrow = datetime.now() + timedelta(days=1)
+        start_date = tomorrow.strftime("%Y-%m-%d")
+    if not end_date:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = (start_dt + timedelta(days=10)).strftime("%Y-%m-%d")
+
+    url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
+    headers = build_headers()
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "get_available_dates")
+
+        # Check for "already scheduled" errors BEFORE raise_for_status
+        if response.status_code == 400:
+            error_body = response.text.lower()
+            if any(phrase in error_body for phrase in (
+                "already requested", "already scheduled",
+                "already contains a technician", "technician already assigned",
+            )):
+                logger.info("Project %s is already scheduled (API 400)", project_id)
+                result = {
+                    "project_id": project_id,
+                    "already_scheduled": True,
+                    "available_dates": [],
+                    "message": (
+                        "This project is already scheduled. "
+                        "Would you like to reschedule to a different date?"
+                    ),
+                }
+                return json.dumps(result, indent=2)
+
+        response.raise_for_status()
+        data = _unwrap(response.json())
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to get available dates")
+        return f"Sorry, I couldn't check available dates. Error: {exc}"
+
+    dates = data.get("dates", data.get("availableDates", []))
+    api_request_id = data.get("request_id")
+
+    if not dates:
+        expanded_end = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=21)).strftime("%Y-%m-%d")
+        url = f"{base_url}/startDate/{start_date}/endDate/{expanded_end}/slotsChatbot"
+        try:
+            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            data = _unwrap(response.json())
+            dates = data.get("dates", data.get("availableDates", []))
+            api_request_id = data.get("request_id", api_request_id)
+        except httpx.HTTPError:
+            logger.exception("Failed on expanded date search")
+
+    if not dates:
+        return f"No available dates found between {start_date} and {end_date}. Try a different date range."
+
+    # Weather enrichment for outdoor projects
+    weather_dates = None
+    project = _get_cached_project(project_id)
+    if project:
+        category = project.get("category", "") or project.get("projectType", "")
+        from tools.weather_aware import enrich_dates_with_weather, is_outdoor_project
+
+        if is_outdoor_project(project.get("category", ""), project.get("projectType", "")):
+            try:
+                weather_dates = await enrich_dates_with_weather(dates, category, project)
+            except Exception:
+                logger.exception("Weather enrichment failed (non-fatal)")
+
+    result: dict[str, Any] = {
+        "project_id": project_id,
+        "available_dates": dates,
+        "date_range": {"start": start_date, "end": end_date},
+        "message": f"Found {len(dates)} available date(s) for project {project_id}.",
+    }
+
+    if api_request_id:
+        result["request_id"] = api_request_id
+        _request_id_by_project[project_id] = api_request_id
+
+    if weather_dates:
+        result["dates_with_weather"] = weather_dates
+        good = sum(1 for d in weather_dates if d.get("suitable", True))
+        bad = len(weather_dates) - good
+        result["has_weather_concerns"] = bad > 0
+        result["suitable_date_count"] = good
+        result["unsuitable_date_count"] = bad
+        result["message"] += (
+            f" Weather checked for {project.get('category', 'outdoor')} work: "
+            f"{good} good day(s), {bad} day(s) with concerns."
+        )
+
+    return json.dumps(result, indent=2)
+
+
+async def get_time_slots(project_id: str, date: str) -> str:
+    """Get available time slots for a specific date."""
+    # Fix common LLM date errors: wrong year
+    try:
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        current_year = datetime.now().year
+        if date_obj.year < current_year:
+            date = date.replace(str(date_obj.year), str(current_year), 1)
+            logger.warning("Corrected date year from %d to %d: %s", date_obj.year, current_year, date)
+    except ValueError:
+        pass
+
+    # Get request_id from cache (populated by get_available_dates)
+    request_id = _request_id_by_project.get(project_id)
+    if not request_id:
+        logger.warning("No cached request_id for project %s — calling get_available_dates first", project_id)
+        await get_available_dates(project_id)
+        request_id = _request_id_by_project.get(project_id)
+    if not request_id:
+        return f"Could not get request_id for project {project_id}. Please call get_available_dates first."
+
+    client_id = AuthContext.get_client_id()
+    base_url = _build_scheduler_url(client_id, project_id)
+    url = f"{base_url}/date/{date}/selected/{date}/slots"
+    headers = build_headers()
+    params = {"request_id": str(request_id)}
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers, params=params)
+        log_response(response, "get_time_slots")
+        response.raise_for_status()
+        data = _unwrap(response.json())
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to get time slots")
+        return f"Sorry, I couldn't fetch time slots for {date}. Error: {exc}"
+
+    slots = data.get("slots", data.get("timeSlots", []))
+    if not slots:
+        return f"No time slots available for {date}. Please try another date."
+
+    # Use request_id from response if available, otherwise use the one passed in
+    api_rid = data.get("request_id", request_id)
+    result = {
+        "project_id": project_id,
+        "date": date,
+        "time_slots": slots,
+        "request_id": api_rid,
+        "message": (
+            f"Found {len(slots)} available time slot(s) for project {project_id} on {date}. "
+            f"To confirm, use project_id={project_id} and request_id={api_rid}."
+        ),
+    }
+    return json.dumps(result, indent=2)
+
+
+async def confirm_appointment(
+    project_id: str, date: str, time: str, confirmed: bool = False
+) -> str:
+    """Confirm/schedule an appointment. Requires explicit user confirmation."""
+    if not confirmed:
+        return (
+            f"Please confirm: Schedule appointment for project {project_id} "
+            f"on {date} at {time}? (Call this tool again with confirmed=true to proceed)"
+        )
+
+    # Validate status from cache (no extra API call)
+    project = _get_cached_project(project_id)
+    if project:
+        status = project.get("status", "")
+        if status:
+            can_schedule, reason = ProjectStatusRules.can_schedule(status)
+            if not can_schedule:
+                return reason
+
+    # Use the request_id from cache (populated by get_available_dates)
+    request_id = _request_id_by_project.get(project_id, 0)
+    normalized_time = _normalize_time(time)
+
+    client_id = AuthContext.get_client_id()
+    base_url = _build_scheduler_url(client_id, project_id)
+    url = f"{base_url}/schedule"
+    headers = build_headers()
+    # Match v1.2.9 payload exactly: snake_case field names, integer request_id
+    payload = {
+        "created_at": datetime.now(timezone.utc).strftime("%m/%d/%Y %H:%M:%S"),
+        "date": date,
+        "time": normalized_time,
+        "request_id": request_id,
+        "is_chatbot": "true",
+        "aIBot": True,
+    }
+    log_curl("POST", url, headers, payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        log_response(response, "confirm_appointment")
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to confirm appointment")
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 400:
+            return "Invalid appointment details. The time slot may no longer be available. Please check available dates again."
+        if status_code == 409:
+            return "This time slot has already been booked or there's a conflict. Please choose a different time."
+        if status_code == 401:
+            return "Authentication expired. Please log in again."
+        return f"Sorry, I couldn't schedule the appointment. Error: {exc}"
+
+    # Log the full response for debugging
+    logger.info("Confirm appointment response body: %s", json.dumps(data, default=str))
+
+    # Validate the response — PF API may return 200 with error in body
+    if isinstance(data, dict):
+        # Check for error indicators in response
+        error_msg = data.get("error") or data.get("message", "")
+        if data.get("error"):
+            logger.error("Confirm API returned error in body: %s", error_msg)
+            return f"Scheduling failed: {error_msg}"
+
+    # Invalidate project cache — status will change after scheduling
+    _invalidate_projects()
+
+    # Extract confirmation details (API may return data as True or a dict)
+    confirmation_details = data.get("data", {})
+    if not isinstance(confirmation_details, dict):
+        confirmation_details = {}
+
+    confirmation_number = (
+        confirmation_details.get("confirmation_number", "")
+        or data.get("confirmationNumber", "")
+        or data.get("confirmation_number", "")
+    )
+
+    msg = f"Appointment confirmed! Project {project_id} is scheduled for {date} at {normalized_time}."
+    if confirmation_number:
+        msg += f" Confirmation number: {confirmation_number}"
+    else:
+        msg += " You will receive a confirmation to your registered email and phone number."
+    return msg
+
+
+async def reschedule_appointment(project_id: str) -> str:
+    """Start reschedule flow — cancels existing appointment and fetches new dates.
+
+    Uses the dedicated ``get-reschedule-slotsChatBot`` API endpoint which
+    ignores current appointment status and returns alternative availability.
+    """
+    # Read from cache (no extra API call)
+    project = _get_cached_project(project_id)
+    if not project:
+        await _load_projects(force=True)
+        project = _get_cached_project(project_id)
+
+    if not project:
+        return f"Project {project_id} not found. Please check the project ID."
+
+    status = project.get("status", "")
+    has_date = bool(project.get("scheduledDate"))
+
+    if status:
+        can_reschedule, reason = ProjectStatusRules.can_reschedule(status, has_date)
+        if not can_reschedule:
+            return reason
+
+    # Cancel existing appointment first
+    cancel_result = await cancel_appointment(project_id)
+    if "error" in cancel_result.lower() or "cannot" in cancel_result.lower():
+        return f"Couldn't cancel existing appointment to reschedule: {cancel_result}"
+
+    # Fetch new dates using the rescheduler-specific endpoint
+    reschedule_dates = await _get_reschedule_slots(project_id)
+    if reschedule_dates:
+        return reschedule_dates
+
+    return (
+        f"The existing appointment for project {project_id} has been cancelled. "
+        "Now let's find new dates. Please use get_available_dates to see available scheduling dates."
+    )
+
+
+async def _get_reschedule_slots(project_id: str) -> str | None:
+    """Fetch available reschedule dates via the dedicated rescheduler API.
+
+    Uses ``get-reschedule-slotsChatBot`` which ignores current appointment
+    status and returns alternative availability.
+
+    Returns a JSON response string on success, or ``None`` to fall back
+    to the standard ``get_available_dates`` flow.
+    """
+    client_id = AuthContext.get_client_id()
+    base_url = _build_scheduler_url(client_id, project_id)
+
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d")
+
+    url = (
+        f"{base_url}/date/{tomorrow}/selected/{end_date}"
+        f"/get-reschedule-slotsChatBot"
+    )
+    headers = build_headers()
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "get_reschedule_slots")
+
+        if response.status_code != 200:
+            error_text = response.text.lower()
+            if "project status should be" in error_text:
+                logger.warning("Rescheduler API rejected project %s — status mismatch", project_id)
+                return None
+            logger.warning("Rescheduler API returned %d for project %s", response.status_code, project_id)
+            return None
+
+        data = _unwrap(response.json())
+    except httpx.HTTPError:
+        logger.exception("Rescheduler API failed for project %s — falling back", project_id)
+        return None
+
+    dates = data.get("dates", data.get("availableDates", []))
+
+    if not dates:
+        return None
+
+    # Weather enrichment for outdoor projects
+    weather_dates = None
+    project = _get_cached_project(project_id)
+    if project:
+        from tools.weather_aware import enrich_dates_with_weather, is_outdoor_project
+
+        if is_outdoor_project(project.get("category", ""), project.get("projectType", "")):
+            try:
+                category = project.get("category", "") or project.get("projectType", "")
+                weather_dates = await enrich_dates_with_weather(dates, category, project)
+            except Exception:
+                logger.exception("Weather enrichment failed during reschedule (non-fatal)")
+
+    result: dict[str, Any] = {
+        "project_id": project_id,
+        "is_reschedule": True,
+        "available_dates": dates,
+        "message": (
+            f"The existing appointment has been cancelled. "
+            f"Found {len(dates)} new date(s) for project {project_id}."
+        ),
+    }
+
+    if weather_dates:
+        result["dates_with_weather"] = weather_dates
+        good = sum(1 for d in weather_dates if d.get("suitable", True))
+        bad = len(weather_dates) - good
+        result["has_weather_concerns"] = bad > 0
+        result["suitable_date_count"] = good
+        result["unsuitable_date_count"] = bad
+
+    return json.dumps(result, indent=2)
+
+
+async def cancel_appointment(project_id: str) -> str:
+    """Cancel an existing appointment."""
+    # Validate from cache (no extra API call)
+    project = _get_cached_project(project_id)
+    if project:
+        status = project.get("status", "")
+        has_date = bool(project.get("scheduledDate"))
+        if status:
+            can_cancel, reason = ProjectStatusRules.can_cancel(status, has_date)
+            if not can_cancel:
+                return reason
+
+    client_id = AuthContext.get_client_id()
+    base_url = _build_scheduler_url(client_id, project_id)
+    url = f"{base_url}/cancel-reschedule"
+    headers = build_headers()
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "cancel_appointment")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to cancel appointment")
+        return f"Sorry, I couldn't cancel the appointment. Error: {exc}"
+
+    # Invalidate project cache — status changed
+    _invalidate_projects()
+
+    return f"Appointment for project {project_id} has been cancelled successfully."
+
+
+async def add_note(project_id: str, note_text: str) -> str:
+    """Add a note to a project."""
+    client_id = AuthContext.get_client_id()
+    customer_id = AuthContext.get_customer_id()
+    url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note"
+    headers = build_headers()
+    payload = {"note": note_text}
+    log_curl("POST", url, headers, payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        log_response(response, "add_note")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to add note")
+        return f"Sorry, I couldn't add the note. Error: {exc}"
+
+    return f"Note added successfully to project {project_id}."
+
+
+async def list_notes(project_id: str) -> str:
+    """List notes for a project."""
+    client_id = AuthContext.get_client_id()
+    customer_id = AuthContext.get_customer_id()
+    url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/notes"
+    headers = build_headers()
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "list_notes")
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to list notes")
+        return f"Sorry, I couldn't fetch notes. Error: {exc}"
+
+    notes = data if isinstance(data, list) else data.get("notes", data.get("data", []))
+    if not notes:
+        return f"No notes found for project {project_id}."
+
+    return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
+
+
+async def get_business_hours() -> str:
+    """Get business hours for the client."""
+    client_id = AuthContext.get_client_id()
+    url = f"{get_pf_api_base()}/scheduler/client/{client_id}/business-hours"
+    headers = build_headers()
+    log_curl("GET", url, headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "get_business_hours")
+        response.raise_for_status()
+        data = _unwrap(response.json())
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to get business hours")
+        return f"Sorry, I couldn't fetch business hours. Error: {exc}"
+
+    return json.dumps(data, indent=2, default=str)
+
+
+async def get_project_weather(project_id: str = "") -> str:
+    """Get weather forecast for a project's installation address.
+
+    If ``project_id`` is provided, looks up that project's address.
+    Otherwise uses the first project with an address from the cache.
+    """
+    from tools.weather import get_weather
+
+    projects: list[dict[str, Any]] = []
+    customer_id = AuthContext.get_customer_id()
+    entry = _projects_cache.get(customer_id)
+    if entry:
+        projects = entry["projects"]
+    else:
+        projects = await _load_projects()
+
+    if not projects:
+        return "No projects found. Please list your projects first."
+
+    # Find the target project
+    target = None
+    if project_id:
+        pid = str(project_id)
+        for p in projects:
+            if p["id"] == pid or p.get("projectNumber") == pid:
+                target = p
+                break
+        if not target:
+            return f"Project {project_id} not found."
+    else:
+        # Use the first project with an address
+        for p in projects:
+            addr = p.get("address", {})
+            if addr.get("city"):
+                target = p
+                break
+
+    if not target:
+        return "No project address available. Please specify a location."
+
+    addr = target.get("address", {})
+    city = addr.get("city", "")
+    state = addr.get("state", "")
+    zipcode = addr.get("zipcode", "")
+
+    if not city:
+        return f"Project {target['id']} has no address on file. Please provide a location."
+
+    parts = [city]
+    if state:
+        parts.append(state)
+    if zipcode:
+        parts.append(zipcode)
+    location = ", ".join(parts)
+
+    logger.info("Weather for project %s at %s", target["id"], location)
+    result = await get_weather(location)
+
+    # Prepend project context
+    project_label = target.get("category", target.get("projectType", "Project"))
+    return f"Weather for {project_label} at {location}:\n\n{result}"

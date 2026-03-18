@@ -1,0 +1,193 @@
+[
+  {
+    "id": "list_all_projects",
+    "question": "Show me all my projects",
+    "tool": "list_projects",
+    "params": {},
+    "expect_json": true,
+    "expect_key": "projects"
+  },
+  {
+    "id": "list_projects_fields",
+    "question": "What details do you have for my projects? I need ID, status, and category.",
+    "tool": "list_projects",
+    "params": {},
+    "expect_json": true,
+    "expect_fields": ["id", "status", "category"]
+  },
+  {
+    "id": "filter_schedulable",
+    "question": "Which of my projects are ready to schedule?",
+    "tool": "list_projects",
+    "params": {"status": "schedulable"},
+    "expect_json": false
+  },
+  {
+    "id": "filter_by_category",
+    "question": "Show me only my Windows projects",
+    "tool": "list_projects",
+    "params": {"category": "Windows"},
+    "expect_json": false
+  },
+  {
+    "id": "filter_scheduled",
+    "question": "Which projects are already scheduled?",
+    "tool": "list_projects",
+    "params": {"status": "scheduled"},
+    "expect_json": false
+  },
+  {
+    "id": "filter_nonexistent_category",
+    "question": "Do I have any Solar Panel projects?",
+    "tool": "list_projects",
+    "params": {"category": "Solar Panel"},
+    "expect_json": false,
+    "expect_min_length": 20
+  },
+  {
+    "id": "project_details_by_id",
+    "question": "Tell me about project {project_id} — what's the status and address?",
+    "tool": "get_project_details",
+    "params": {"project_id": "{first_project_id}"},
+    "expect_json": true,
+    "expect_fields": ["id", "status"]
+  },
+  {
+    "id": "project_details_by_number",
+    "question": "Look up order number {project_number} — is it scheduled?",
+    "tool": "get_project_details",
+    "params": {"project_id": "{first_project_number}"},
+    "expect_json": false
+  },
+  {
+    "id": "nonexistent_project",
+    "question": "What's the status of project 99999999?",
+    "tool": "get_project_details",
+    "params": {"project_id": "99999999"},
+    "expect_json": false,
+    "expect_contains": "not found"
+  },
+  {
+    "id": "scheduled_project_details",
+    "question": "Show me details for my scheduled project {scheduled_project_id}",
+    "tool": "get_project_details",
+    "params": {"project_id": "{scheduled_project_id}"},
+    "expect_json": true,
+    "expect_fields": ["id", "status"]
+  },
+  {
+    "id": "available_dates_default",
+    "question": "When can I schedule project {schedulable_project_id}?",
+    "tool": "get_available_dates",
+    "params": {"project_id": "{schedulable_project_id}"},
+    "expect_json": true
+  },
+  {
+    "id": "available_dates_next_week",
+    "question": "Show me available dates for next week for project {schedulable_project_id}",
+    "tool": "get_available_dates",
+    "params": {"project_id": "{schedulable_project_id}", "start_date": "next week"},
+    "expect_json": true
+  },
+  {
+    "id": "available_dates_custom_range",
+    "question": "Are there any openings between April 1st and April 15th for project {schedulable_project_id}?",
+    "tool": "get_available_dates",
+    "params": {"project_id": "{schedulable_project_id}", "start_date": "2026-04-01", "end_date": "2026-04-15"},
+    "expect_json": true
+  },
+  {
+    "id": "available_dates_tomorrow",
+    "question": "Can I get an appointment tomorrow for project {schedulable_project_id}?",
+    "tool": "get_available_dates",
+    "params": {"project_id": "{schedulable_project_id}", "start_date": "tomorrow"},
+    "expect_json": true
+  },
+  {
+    "id": "already_scheduled_dates",
+    "question": "When can I schedule project {scheduled_project_id}? It might already be booked.",
+    "tool": "get_available_dates",
+    "params": {"project_id": "{scheduled_project_id}"},
+    "expect_json": false,
+    "expect_min_length": 10
+  },
+  {
+    "id": "time_slots",
+    "question": "What time slots are available on {first_available_date} for project {schedulable_project_id}?",
+    "tool": "get_time_slots",
+    "params": {"project_id": "{schedulable_project_id}", "date": "{first_available_date}"},
+    "depends_on": "available_dates_default",
+    "expect_json": true
+  },
+  {
+    "id": "business_hours",
+    "question": "What are your business hours?",
+    "tool": "get_business_hours",
+    "params": {},
+    "expect_json": true
+  },
+  {
+    "id": "project_address",
+    "question": "What is the installation address for my projects?",
+    "tool": "list_projects",
+    "params": {},
+    "expect_json": true,
+    "check_address": true
+  },
+  {
+    "id": "project_installer",
+    "question": "Who is the technician assigned to my scheduled projects?",
+    "tool": "list_projects",
+    "params": {"status": "scheduled"},
+    "expect_json": false,
+    "check_installer": true
+  },
+  {
+    "id": "project_store_info",
+    "question": "Which store is handling my projects?",
+    "tool": "list_projects",
+    "params": {},
+    "expect_json": true,
+    "expect_key": "projects"
+  },
+  {
+    "id": "weather_for_project",
+    "question": "What's the weather like at my project's location?",
+    "tool": "get_project_weather",
+    "params": {},
+    "expect_json": false,
+    "expect_min_length": 20
+  },
+  {
+    "id": "add_note",
+    "question": "Add a note to project {project_id}: Customer requested morning appointment",
+    "tool": "add_note",
+    "params": {"project_id": "{first_project_id}", "note_text": "Customer requested morning appointment"},
+    "expect_json": false
+  },
+  {
+    "id": "list_notes",
+    "question": "Show me the notes for project {project_id}",
+    "tool": "list_notes",
+    "params": {"project_id": "{first_project_id}"},
+    "expect_json": false
+  },
+  {
+    "id": "schedule_confirm_prompt",
+    "question": "Schedule project {schedulable_project_id} for {first_available_date} at {first_time_slot} please",
+    "tool": "confirm_appointment",
+    "params": {"project_id": "{schedulable_project_id}", "date": "{first_available_date}", "time": "{first_time_slot}", "confirmed": false},
+    "depends_on": "time_slots",
+    "expect_json": false,
+    "expect_contains": "confirm"
+  },
+  {
+    "id": "all_info_incorrect",
+    "question": "All my project information is showing incorrectly, can you check?",
+    "tool": "list_projects",
+    "params": {},
+    "expect_json": true,
+    "expect_key": "projects",
+    "note": "Customer complaint - show all project data for verification"
+  }
+]

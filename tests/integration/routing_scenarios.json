@@ -1,0 +1,122 @@
+[
+  {
+    "id": "schedule_projects",
+    "query": "Show me all my projects",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_available_dates",
+    "query": "When can I schedule my project?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_time_slots",
+    "query": "What time slots are available for tomorrow?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_book",
+    "query": "Schedule my project for next Tuesday at 9am",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_reschedule",
+    "query": "I need to reschedule my appointment",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_cancel",
+    "query": "Cancel my appointment please",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_status",
+    "query": "What's the status of my project?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_add_note",
+    "query": "Add a note to my project: gate code is 1234",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_business_hours",
+    "query": "What are your business hours?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_installer",
+    "query": "Who is the technician coming to my house?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_address",
+    "query": "What is the installation address?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "schedule_project_weather",
+    "query": "What's the weather at my project location?",
+    "expected_agent": "Scheduling Agent",
+    "category": "scheduling"
+  },
+  {
+    "id": "chitchat_hello",
+    "query": "Hello!",
+    "expected_agent": "Chitchat Agent",
+    "category": "chitchat"
+  },
+  {
+    "id": "chitchat_help",
+    "query": "What can you help me with?",
+    "expected_agent": "Chitchat Agent",
+    "category": "chitchat"
+  },
+  {
+    "id": "chitchat_thanks",
+    "query": "Thanks, that's all I needed!",
+    "expected_agent": "Chitchat Agent",
+    "category": "chitchat"
+  },
+  {
+    "id": "chitchat_bye",
+    "query": "Goodbye, have a nice day",
+    "expected_agent": "Chitchat Agent",
+    "category": "chitchat"
+  },
+  {
+    "id": "chitchat_how_are_you",
+    "query": "How are you doing today?",
+    "expected_agent": "Chitchat Agent",
+    "category": "chitchat"
+  },
+  {
+    "id": "weather_city",
+    "query": "What's the weather like in Miami?",
+    "expected_agent": "Weather Agent",
+    "category": "weather"
+  },
+  {
+    "id": "weather_forecast",
+    "query": "Will it rain in New York this week?",
+    "expected_agent": "Weather Agent",
+    "category": "weather"
+  },
+  {
+    "id": "weather_zip",
+    "query": "Give me the weather forecast for 90210",
+    "expected_agent": "Weather Agent",
+    "category": "weather"
+  }
+]

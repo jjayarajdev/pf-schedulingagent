@@ -1,0 +1,56 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# === UV / Virtual environments ===
+.venv/
+.python-version
+
+# === Testing ===
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+E2E_*.xlsx
+tests/integration/.pf-creds.json
+
+# === Ruff ===
+.ruff_cache/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === macOS ===
+.DS_Store
+
+# === Environment / Secrets ===
+.env
+.env.*
+*.pem
+*.key
+
+# === Claude Code ===
+.claude/
+CLAUDE.md
+
+# === Logs ===
+*.log
+
+# === Misc ===
+tmp/
+temp/
+docs/
+planning/
+reference/
