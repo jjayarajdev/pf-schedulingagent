@@ -61,23 +61,249 @@ async def verify_vapi_secret(request: Request) -> None:
 # ── Webhook endpoint ─────────────────────────────────────────────────────
 
 
-@router.post("/webhook", dependencies=[Depends(verify_vapi_secret)])
+@router.post("/webhook")
 async def vapi_webhook(request: Request):
-    """Vapi webhook — handles tool calls and server events."""
+    """Vapi webhook — handles tool calls and server events.
+
+    Auth is enforced for all events except ``assistant-request``, which
+    arrives at call start before Vapi has the assistant's server secret.
+    The returned assistant config includes ``server.secret`` so all
+    subsequent events (tool calls, status updates) are authenticated.
+    """
     body = await request.json()
 
     # Server URL event: nested "message" dict with "type"
     if isinstance(body.get("message"), dict) and "type" in body["message"]:
         event_type = body["message"].get("type", "")
+
+        # assistant-request arrives before Vapi knows the server secret —
+        # skip auth here; the response includes server.secret for future calls
+        if event_type == "assistant-request":
+            return await _handle_assistant_request(body)
+
+        # All other events require auth
+        await verify_vapi_secret(request)
+
         if event_type == "tool-calls":
             return await _handle_tool_calls(body)
         if event_type == "function-call":
             return await _handle_function_call(body)
         return _handle_server_event(body)
 
-    # Unrecognized payload — acknowledge to avoid Vapi retries
+    # Unrecognized payload — still require auth
+    await verify_vapi_secret(request)
     logger.warning("Unrecognized Vapi payload keys: %s", list(body.keys()))
     return {"status": "ok"}
+
+
+# ── Assistant request handler (dynamic greeting at call start) ───────────
+
+
+async def _handle_assistant_request(body: dict) -> dict:
+    """Handle Vapi ``assistant-request`` — return full assistant config with personalized greeting.
+
+    Vapi sends this at call start when the phone number uses server-URL mode
+    (no fixed assistantId).  We authenticate the caller by phone number to get
+    their name, then return the complete assistant configuration with a
+    ``firstMessage`` that includes the caller's first name.
+    """
+    message = body.get("message", {})
+    call_data = message.get("call", body.get("call", {}))
+    call_id = call_data.get("id", "unknown")
+
+    from_phone = _extract_phone_number(call_data)
+    to_phone = _resolve_to_phone(call_data)
+
+    logger.info("Vapi assistant-request: call_id=%s from=***%s", call_id, from_phone[-4:] if from_phone else "none")
+
+    # Authenticate caller to get their name
+    first_name = ""
+    client_name = "ProjectsForce"
+    if from_phone:
+        try:
+            creds = await get_or_authenticate(from_phone, to_phone)
+            user_name = creds.get("user_name", "")
+            first_name = user_name.split()[0] if user_name and user_name.strip() else ""
+            client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
+        except Exception:
+            logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
+
+    greeting = _generate_dynamic_greeting(first_name, client_name)
+    logger.info(
+        "Vapi dynamic greeting: call_id=%s name=%s client=%s",
+        call_id,
+        first_name or "(anonymous)",
+        client_name,
+    )
+
+    # Include webhook secret so Vapi sends x-vapi-secret on subsequent tool calls
+    webhook_secret = get_secrets().vapi_api_key
+    return {"assistant": _build_assistant_config(greeting, webhook_secret)}
+
+
+def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
+    """Build a personalized SSML greeting with the caller's first name.
+
+    Returns an SSML string with ``<break>`` pauses for natural pacing:
+    - 3s initial pause (call connection settling)
+    - 300ms after name
+    - 500ms after intro
+    """
+    name_part = f"Hello {first_name}!" if first_name else "Hello!"
+    intro = f"I'm J, your AI assistant from {client_name}."
+    guidance = (
+        "I can help you view your projects, check available dates, "
+        "or schedule appointments. What would you like to do today?"
+    )
+    return (
+        f'<break time="3000ms"/> {name_part} <break time="300ms"/> '
+        f'{intro} <break time="500ms"/> '
+        f'{guidance}'
+    )
+
+
+def _build_assistant_config(first_message: str, server_secret: str = "") -> dict:
+    """Build the full Vapi assistant config returned on ``assistant-request``.
+
+    This mirrors the assistant settings previously stored in Vapi's dashboard
+    but with a dynamic ``firstMessage``.
+    """
+    server_config: dict = {
+        "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "timeoutSeconds": 30,
+    }
+    if server_secret:
+        server_config["secret"] = server_secret
+    return {
+        "name": "ProjectsForce Scheduling Bot",
+        "voice": {
+            "model": "sonic-3",
+            "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
+            "provider": "cartesia",
+        },
+        "model": {
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "temperature": 0.3,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are J, a friendly phone assistant for ProjectsForce "
+                        "— a home improvement scheduling service.\n\n"
+                        "CRITICAL RULES:\n"
+                        '1. You MUST call ask_scheduling_bot for EVERY user request — no exceptions. '
+                        "You cannot answer any question about projects, scheduling, dates, times, "
+                        "appointments, or any follow-up from memory.\n"
+                        "2. Pass the user's EXACT words in the \"question\" field. Do NOT rephrase, "
+                        "summarize, or add your own questions.\n"
+                        "3. NEVER ask clarifying questions before calling the tool. Let the scheduling "
+                        "bot handle clarification — it knows the user's projects and context.\n"
+                        "4. When the tool returns a response, speak it naturally to the user. "
+                        "Keep it conversational — you are on a phone call.\n"
+                        "5. For multi-step flows (scheduling, rescheduling), call ask_scheduling_bot "
+                        "for EVERY step. The bot maintains conversation context.\n"
+                        '6. If the user asks for a support number or to speak to someone, '
+                        'call ask_scheduling_bot with action="send_support_sms".\n'
+                        "7. Only handle basic greetings and goodbyes yourself. "
+                        "Everything else goes through ask_scheduling_bot.\n"
+                        "8. Keep your spoken responses concise — this is a phone call, not a text chat. "
+                        "No bullet points, no markdown.\n"
+                        "9. Use natural filler phrases while waiting: "
+                        '"Let me check that for you", "One moment please".\n'
+                        "10. If the tool call fails, say: "
+                        '"I\'m having trouble looking that up. Let me try again." and retry once.'
+                    ),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_scheduling_bot",
+                        "description": (
+                            "REQUIRED for ALL user requests. Call this tool for every question, "
+                            "request, or follow-up about projects, scheduling, appointments, "
+                            "dates, times, rescheduling, cancellation, notes, weather, or "
+                            "anything related to their service. The bot has full context about "
+                            "the caller's account and projects. NEVER try to answer without "
+                            "calling this tool first."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": ["question"],
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": (
+                                        "The user's EXACT words. Pass verbatim what they said "
+                                        "— do not rephrase or add context."
+                                    ),
+                                },
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["ask", "send_support_sms"],
+                                    "description": (
+                                        'Use "ask" for all normal questions (default). '
+                                        'Use "send_support_sms" only when user explicitly asks '
+                                        "for the office phone number or to speak to a human."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                    "messages": [
+                        {"type": "request-start", "content": "Sure, let me check."},
+                        {
+                            "type": "request-response-delayed",
+                            "content": "Still working on that.",
+                            "timingMilliseconds": 3000,
+                        },
+                        {
+                            "type": "request-response-delayed",
+                            "content": "Almost there.",
+                            "timingMilliseconds": 5000,
+                        },
+                        {
+                            "type": "request-failed",
+                            "content": "I had some trouble with that. Could you try asking again?",
+                        },
+                    ],
+                }
+            ],
+        },
+        "transcriber": {
+            "model": "nova-3",
+            "language": "en",
+            "provider": "deepgram",
+            "endpointing": 150,
+        },
+        "firstMessage": first_message,
+        "endCallMessage": (
+            "Thank you for calling ProjectsForce. "
+            "Your scheduling is all set. Have a wonderful day!"
+        ),
+        "endCallPhrases": [
+            "goodbye", "bye", "bye bye", "bye now",
+            "talk to you later", "have a great day",
+            "have a good day", "that's all",
+        ],
+        "endCallFunctionEnabled": True,
+        "voicemailMessage": (
+            "Hello, this is J from ProjectsForce. I'm calling about your "
+            "home improvement project. Please call us back at your earliest convenience."
+        ),
+        "silenceTimeoutSeconds": 30,
+        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.4,
+            "smartEndpointingEnabled": True,
+        },
+        "hipaaEnabled": False,
+        "server": server_config,
+        "serverUrl": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+    }
 
 
 # ── Tool calls handler (current Vapi format) ────────────────────────────
