@@ -365,17 +365,17 @@ class TestChatAPI:
 # ---------------------------------------------------------------------------
 
 
-class TestScheduleBalconyGrill:
-    """Full scheduling flow for Balcony grill project (Order #74356).
+class TestScheduleFenceInstallation:
+    """Full scheduling flow for Fence Installation project (Order #74356_1).
 
-    Flow: list schedulable -> pick Balcony grill #74356 -> get dates ->
+    Flow: list schedulable -> pick Fence Installation #74356_1 -> get dates ->
           pick date -> get time slots -> pick slot -> confirm -> cancel (cleanup)
     """
 
     async def test_schedule_flow(self, pf_credentials, http_capture):
         session_id = str(uuid.uuid4())
         creds = pf_credentials
-        G = "Schedule Balcony Grill #74356"
+        G = "Schedule Fence Installation #74356_1"
 
         # Step 1: List schedulable projects
         r = await _chat(
@@ -385,9 +385,9 @@ class TestScheduleBalconyGrill:
         )
         assert len(r["response"]) > 20
 
-        # Step 2: Pick Balcony grill by order number and ask for dates
+        # Step 2: Pick Fence Installation by order number and ask for dates
         r = await _chat(
-            "I want to schedule my Balcony grill project, order number 74356. What dates are available?",
+            "I want to schedule my Fence Installation project, order number 74356_1. What dates are available?",
             session_id, creds, http_capture,
             group=G, step="2. Get available dates",
         )

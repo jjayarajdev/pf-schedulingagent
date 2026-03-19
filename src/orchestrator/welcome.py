@@ -14,7 +14,7 @@ import time
 import boto3
 
 from config import get_settings
-from tools.scheduling import _load_projects
+from tools.scheduling import _TERMINAL_STATUSES, _load_projects
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,8 @@ async def handle_welcome(user_name: str) -> dict:
     """
     start = time.time()
 
-    projects = await _load_projects()
+    all_projects = await _load_projects()
+    projects = [p for p in all_projects if p.get("status", "").lower() not in _TERMINAL_STATUSES]
 
     greeting = _generate_greeting(user_name, projects)
 

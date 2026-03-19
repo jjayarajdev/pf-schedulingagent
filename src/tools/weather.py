@@ -1,7 +1,9 @@
 """Weather tool handler — Open-Meteo API for forecasts."""
 
+import json
 import logging
 import re
+from datetime import datetime
 from urllib.parse import quote
 
 import httpx
@@ -181,21 +183,44 @@ async def get_weather(location: str = "") -> str:
         return "No forecast data available."
 
     location_name = f"{geo['name']}, {geo['admin1']}" if geo.get("admin1") else geo["name"]
-    lines = [f"5-Day Forecast for {location_name}:\n"]
 
-    for i, date in enumerate(dates):
+    # Build structured forecast for frontend rendering
+    forecast_days = []
+    for i, date_str in enumerate(dates):
         code = daily.get("weather_code", [0])[i] if i < len(daily.get("weather_code", [])) else 0
-        high = daily.get("temperature_2m_max", [0])[i] if i < len(daily.get("temperature_2m_max", [])) else "N/A"
-        low = daily.get("temperature_2m_min", [0])[i] if i < len(daily.get("temperature_2m_min", [])) else "N/A"
+        high = daily.get("temperature_2m_max", [0])[i] if i < len(daily.get("temperature_2m_max", [])) else None
+        low = daily.get("temperature_2m_min", [0])[i] if i < len(daily.get("temperature_2m_min", [])) else None
         precip = daily.get("precipitation_sum", [0])[i] if i < len(daily.get("precipitation_sum", [])) else 0
         wind = daily.get("wind_speed_10m_max", [0])[i] if i < len(daily.get("wind_speed_10m_max", [])) else 0
         condition = WEATHER_CODES.get(code, f"Code {code}")
 
-        line = f"{date}: {condition}, High {high}F / Low {low}F"
-        if precip and precip > 0:
-            line += f", Precip {precip} in"
-        if wind and wind > 20:
-            line += f", Wind {wind} mph"
-        lines.append(line)
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            day_name = dt.strftime("%A")
+        except ValueError:
+            day_name = ""
 
-    return "\n".join(lines)
+        forecast_days.append({
+            "date": date_str,
+            "day_name": day_name,
+            "condition": condition,
+            "high": high,
+            "low": low,
+            "precipitation": precip,
+            "wind": wind,
+        })
+
+    # Current = today's forecast
+    today = forecast_days[0] if forecast_days else {}
+
+    result = {
+        "location": location_name,
+        "current": {
+            "temperature": today.get("high"),
+            "condition": today.get("condition", ""),
+        },
+        "forecast": forecast_days,
+        "message": f"5-Day Forecast for {location_name}",
+    }
+
+    return json.dumps(result, indent=2)

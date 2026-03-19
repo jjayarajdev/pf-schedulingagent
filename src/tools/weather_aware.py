@@ -354,8 +354,17 @@ async def _fetch_forecast(location: str, dates: list[str]) -> dict[str, dict] | 
 
 
 def _get_project_location(project: dict) -> str | None:
-    """Extract a geocodable location string from a cached project."""
+    """Extract a geocodable location string from a cached project.
+
+    Falls back to any other project in the cache with an address
+    (same customer, typically same area).
+    """
     addr = project.get("address", {})
+    logger.info(
+        "Weather location lookup: project=%s, address=%s",
+        project.get("projectNumber", project.get("id", "?")),
+        addr,
+    )
     city = addr.get("city", "")
     state = addr.get("state", "")
     zipcode = addr.get("zipcode", "")
@@ -366,6 +375,28 @@ def _get_project_location(project: dict) -> str | None:
         if zipcode:
             parts.append(zipcode)
         return ", ".join(parts)
+
+    # Fallback: try other projects in cache for this customer
+    try:
+        from auth.context import AuthContext
+        from tools.scheduling import _projects_cache
+
+        customer_id = AuthContext.get_customer_id()
+        entry = _projects_cache.get(customer_id)
+        if entry:
+            for p in entry["projects"]:
+                a = p.get("address", {})
+                if a.get("city"):
+                    parts = [a["city"]]
+                    if a.get("state"):
+                        parts.append(a["state"])
+                    if a.get("zipcode"):
+                        parts.append(a["zipcode"])
+                    logger.info("Weather: using fallback address from project %s", p.get("id", ""))
+                    return ", ".join(parts)
+    except Exception:
+        logger.debug("Could not resolve fallback location from cache")
+
     return None
 
 

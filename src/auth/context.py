@@ -11,6 +11,8 @@ _client_id: ContextVar[str] = ContextVar("client_id", default="")
 _customer_id: ContextVar[str] = ContextVar("customer_id", default="")
 _user_id: ContextVar[str] = ContextVar("user_id", default="")
 _user_name: ContextVar[str] = ContextVar("user_name", default="")
+_caller_type: ContextVar[str] = ContextVar("caller_type", default="customer")
+_tenant_phone: ContextVar[str] = ContextVar("tenant_phone", default="")
 
 
 class AuthContext:
@@ -24,6 +26,8 @@ class AuthContext:
         customer_id: str | None = None,
         user_id: str | None = None,
         user_name: str | None = None,
+        caller_type: str | None = None,
+        tenant_phone: str | None = None,
     ) -> None:
         if auth_token is not None:
             _auth_token.set(auth_token)
@@ -35,6 +39,10 @@ class AuthContext:
             _user_id.set(user_id)
         if user_name is not None:
             _user_name.set(user_name)
+        if caller_type is not None:
+            _caller_type.set(caller_type)
+        if tenant_phone is not None:
+            _tenant_phone.set(tenant_phone)
 
     @staticmethod
     def get_auth_token() -> str:
@@ -57,9 +65,19 @@ class AuthContext:
         return _user_name.get()
 
     @staticmethod
+    def get_caller_type() -> str:
+        return _caller_type.get()
+
+    @staticmethod
+    def get_tenant_phone() -> str:
+        return _tenant_phone.get()
+
+    @staticmethod
     def clear() -> None:
         _auth_token.set("")
         _client_id.set("")
         _customer_id.set("")
         _user_id.set("")
         _user_name.set("")
+        _caller_type.set("customer")
+        _tenant_phone.set("")

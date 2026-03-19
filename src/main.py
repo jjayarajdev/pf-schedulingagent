@@ -129,9 +129,10 @@ if settings.environment == "dev" or settings.dev_server:
                 "device_type": 1,
             })
         data = resp.json()
-        if resp.status_code != 200 or "accesstoken" not in data:
+        if resp.status_code != 200 or not isinstance(data, dict) or "accesstoken" not in data:
             from fastapi import HTTPException
-            raise HTTPException(status_code=resp.status_code, detail=data.get("message", "Login failed"))
+            detail = data.get("message", "Login failed") if isinstance(data, dict) else "Login failed"
+            raise HTTPException(status_code=resp.status_code or 400, detail=detail)
 
         # Verify the token
         verify_url = f"{settings.pf_api_base_url}/authentication/verify?identifier={req.identifier}"

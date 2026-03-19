@@ -28,6 +28,10 @@ TOKEN_REFRESH_BUFFER_SECONDS = 30
 class AuthenticationError(Exception):
     """Raised when phone authentication fails."""
 
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 # ── Public API ────────────────────────────────────────────────────────────
 
@@ -255,7 +259,10 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
         if resp.status_code != 200:
             error_msg = resp.text[:200]
             logger.error("Phone auth API failed: %d — %s", resp.status_code, error_msg)
-            raise AuthenticationError(f"Authentication failed: {error_msg}")
+            raise AuthenticationError(
+                f"Authentication failed: {error_msg}",
+                status_code=resp.status_code,
+            )
 
         data = resp.json()
 
@@ -286,3 +293,93 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
     except httpx.HTTPError as exc:
         logger.exception("Phone auth API request error")
         raise AuthenticationError(f"Authentication request failed: {exc}") from exc
+
+
+# ── Store authentication ─────────────────────────────────────────────────
+
+
+async def authenticate_store(
+    tenant_phone: str, lookup_type: str, lookup_value: str
+) -> dict:
+    """Authenticate a store caller via POST /authentication/store-login.
+
+    Args:
+        tenant_phone: The destination phone number (identifies the tenant).
+        lookup_type: One of ``project_number``, ``po_number``, ``customer_name``.
+        lookup_value: The value to look up (e.g. a PO number or customer name).
+
+    Returns:
+        Credentials dict with the same keys as ``get_or_authenticate``.
+
+    Raises:
+        AuthenticationError: On network errors, non-200 status, or missing token.
+    """
+    if not lookup_type or not lookup_value:
+        raise AuthenticationError("Missing lookup_type or lookup_value for store login")
+
+    # Check DynamoDB cache first
+    cache_key = f"store:{tenant_phone}:{lookup_value}"
+    cached = _get_cached_creds(cache_key)
+    if cached:
+        logger.info("Using cached store credentials for %s", lookup_value)
+        return cached
+
+    settings = get_settings()
+    url = f"{settings.pf_api_base_url}/authentication/store-login"
+    payload = {
+        "tenant_phone": tenant_phone,
+        "lookup_type": lookup_type,
+        "lookup_value": lookup_value,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+
+        if resp.status_code != 200:
+            error_msg = resp.text[:200]
+            logger.error("Store login API failed: %d — %s", resp.status_code, error_msg)
+            raise AuthenticationError(
+                f"Store authentication failed: {error_msg}",
+                status_code=resp.status_code,
+            )
+
+        data = resp.json()
+
+        if "accesstoken" not in data:
+            error_msg = data.get("message", "No access token in response")
+            logger.error("Invalid store login response: %s", error_msg)
+            raise AuthenticationError(f"Store authentication failed: {error_msg}")
+
+        user = data.get("user", {})
+
+        credentials = {
+            "bearer_token": data["accesstoken"],
+            "refresh_token": data.get("refrestoken", ""),
+            "client_id": data.get("client_id", user.get("client_id", "")),
+            "client_name": data.get("client_name", "ProjectForce"),
+            "user_id": str(user.get("customer_id", "")),
+            "user_name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+            "user_phone": "",
+            "user_email": "",
+            "customer_id": str(user.get("customer_id", "")),
+            "timezone": data.get("timezone", "US/Eastern"),
+            "exp": data.get("exp", 0),
+            "updated_at": datetime.now(UTC).isoformat(),
+            "support_number": data.get("support_number", ""),
+            "support_email": data.get("support_email_1", ""),
+        }
+
+        _store_credentials(cache_key, credentials)
+        logger.info(
+            "Store login success: tenant=***%s lookup=%s:%s user=%s",
+            tenant_phone[-4:] if tenant_phone else "none",
+            lookup_type,
+            lookup_value,
+            credentials.get("user_id", "?"),
+        )
+        return credentials
+
+    except httpx.HTTPError as exc:
+        logger.exception("Store login API request error")
+        raise AuthenticationError(f"Store authentication request failed: {exc}") from exc

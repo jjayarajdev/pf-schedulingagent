@@ -256,18 +256,18 @@
             background: white;
         }
         .date-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
-        .date-card.weather-good { border-color: #42a5f5; }
+        .date-card.weather-good { border-color: #1565c0; }
         .date-card.weather-warn { border-color: #ff9800; }
-        .date-card.weather-bad { border-color: #ef5350; background: #fafafa; }
-        .date-card.weather-bad.severe { background: #42a5f5; color: white; border-color: #1e88e5; }
-        .date-card .day-name { font-size: 11px; font-weight: 600; color: #5a6577; text-transform: uppercase; }
-        .date-card .day-date { font-size: 14px; font-weight: 700; color: #1a1a2e; margin: 4px 0; }
-        .date-card .day-temp { font-size: 13px; font-weight: 600; color: #333; }
-        .date-card .day-condition { font-size: 10px; color: #777; margin-top: 2px; }
-        .date-card.weather-bad.severe .day-name,
-        .date-card.weather-bad.severe .day-date,
-        .date-card.weather-bad.severe .day-temp,
-        .date-card.weather-bad.severe .day-condition { color: white; }
+        .date-card.weather-bad { border-color: #d32f2f; }
+        .date-card.severe { background: #1565c0; color: white; border-color: #1565c0; }
+        .date-card .day-name { font-size: 12px; font-weight: 600; color: #555; }
+        .date-card .day-date { font-size: 15px; font-weight: 800; color: #1565c0; margin: 4px 0; }
+        .date-card .day-temp { font-size: 12px; color: #444; }
+        .date-card .day-condition { font-size: 11px; color: #777; margin-top: 2px; }
+        .date-card.severe .day-name,
+        .date-card.severe .day-date,
+        .date-card.severe .day-temp,
+        .date-card.severe .day-condition { color: white; }
 
         /* Time Slots */
         .timeslots-container {
@@ -1450,7 +1450,7 @@
     function formatAgentContent(content) {
         if (!content || typeof content !== 'string') return '<p>No response</p>';
 
-        // Extract JSON blocks
+        // Extract JSON blocks (closed ```json ... ``` OR unclosed ```json ... EOF)
         const segments = [];
         const jsonBlockRegex = /```json\s*([\s\S]*?)```/g;
         let lastIndex = 0;
@@ -1463,7 +1463,28 @@
             lastIndex = match.index + match[0].length;
         }
         const textAfter = content.substring(lastIndex).trim();
-        if (textAfter) segments.push({ type: 'text', content: textAfter });
+
+        // Handle unclosed ```json block (LLM response truncated before closing ```)
+        if (segments.length === 0 && textAfter) {
+            const unclosedMatch = textAfter.match(/```json\s*([\s\S]+)$/);
+            if (unclosedMatch) {
+                const beforeIdx = content.indexOf('```json');
+                const textBefore = content.substring(0, beforeIdx).trim();
+                if (textBefore) segments.push({ type: 'text', content: textBefore });
+                segments.push({ type: 'json', content: unclosedMatch[1] });
+            }
+        } else if (textAfter) {
+            // Check if remaining text has an unclosed json block
+            const unclosedMatch = textAfter.match(/```json\s*([\s\S]+)$/);
+            if (unclosedMatch) {
+                const beforeIdx = textAfter.indexOf('```json');
+                const textBetween = textAfter.substring(0, beforeIdx).trim();
+                if (textBetween) segments.push({ type: 'text', content: textBetween });
+                segments.push({ type: 'json', content: unclosedMatch[1] });
+            } else {
+                segments.push({ type: 'text', content: textAfter });
+            }
+        }
 
         // Try embedded JSON objects
         if (segments.length === 0) {
@@ -1485,14 +1506,83 @@
                 html += formatMarkdown(seg.content);
             } else {
                 try {
-                    html += renderRichData(JSON.parse(seg.content));
+                    // Try to repair truncated JSON before parsing
+                    let jsonStr = seg.content.trim();
+                    const parsed = _tryParseJson(jsonStr);
+                    if (parsed) {
+                        html += renderRichData(parsed);
+                    } else {
+                        // Don't show raw JSON — just skip the broken block
+                        console.warn('Could not parse JSON block:', jsonStr.substring(0, 200));
+                    }
                 } catch (e) {
-                    html += '<pre style="background:#f0f4f8;padding:10px;border-radius:8px;overflow-x:auto;font-size:11px;">'
-                        + escapeHtml(seg.content) + '</pre>';
+                    console.warn('JSON render error:', e);
                 }
             }
         }
-        return html;
+        return html || formatMarkdown(content);
+    }
+
+    function _tryParseJson(str) {
+        // Try direct parse first
+        try { return JSON.parse(str); } catch (e) {}
+
+        // JSON may be truncated — try to repair by closing open structures
+        let repaired = str;
+        // Count open/close braces and brackets
+        let braces = 0, brackets = 0, inString = false, escape = false;
+        for (let i = 0; i < repaired.length; i++) {
+            const c = repaired[i];
+            if (escape) { escape = false; continue; }
+            if (c === '\\') { escape = true; continue; }
+            if (c === '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c === '{') braces++;
+            else if (c === '}') braces--;
+            else if (c === '[') brackets++;
+            else if (c === ']') brackets--;
+        }
+
+        // Trim trailing incomplete value (e.g., truncated string or number)
+        if (inString) {
+            // Close the open string
+            repaired += '"';
+        }
+        // Remove trailing comma or colon with incomplete value
+        repaired = repaired.replace(/,\s*$/, '').replace(/:\s*$/, ': null');
+        // Remove trailing incomplete key-value pair (key without value)
+        repaired = repaired.replace(/,\s*"[^"]*"\s*$/, '');
+        repaired = repaired.replace(/,\s*"[^"]*"\s*:\s*$/, '');
+
+        // Close open brackets and braces
+        while (brackets > 0) { repaired += ']'; brackets--; }
+        while (braces > 0) { repaired += '}'; braces--; }
+
+        try { return JSON.parse(repaired); } catch (e) {}
+
+        // More aggressive: try to find the last valid array/object boundary
+        // Strip from the last complete object in an array
+        const lastCompleteObj = repaired.lastIndexOf('},');
+        if (lastCompleteObj > 0) {
+            const trimmed = repaired.substring(0, lastCompleteObj + 1);
+            // Re-close
+            let b2 = 0, k2 = 0, inS2 = false, esc2 = false;
+            for (let i = 0; i < trimmed.length; i++) {
+                const c = trimmed[i];
+                if (esc2) { esc2 = false; continue; }
+                if (c === '\\') { esc2 = true; continue; }
+                if (c === '"') { inS2 = !inS2; continue; }
+                if (inS2) continue;
+                if (c === '{') b2++; else if (c === '}') b2--;
+                if (c === '[') k2++; else if (c === ']') k2--;
+            }
+            let fixed = trimmed;
+            while (k2 > 0) { fixed += ']'; k2--; }
+            while (b2 > 0) { fixed += '}'; b2--; }
+            try { return JSON.parse(fixed); } catch (e) {}
+        }
+
+        return null;
     }
 
     function renderRichData(data) {
@@ -1536,31 +1626,34 @@
         // ── Time Slots ───────────────────────────────────────
         if (data.time_slots || data.timeSlots || data.available_times) {
             const slots = data.time_slots || data.timeSlots || data.available_times;
+            const slotCount = Array.isArray(slots) ? slots.length : 0;
+
             html += '<div class="rich-component">';
-            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F552;</span> '
-                + escapeHtml(data.message || 'Available Time Slots') + '</div>';
+            html += '<p style="color:#555;margin:0 0 8px 0;">&#x2139;&#xFE0F;Please click on the below time slot to make your selection</p>';
             html += '<div class="timeslots-container">';
+            html += '<div style="font-size:15px;font-weight:700;color:#1a1a2e;margin-bottom:10px;">Available Time Slots (' + slotCount + ')</div>';
 
             if (Array.isArray(slots)) {
-                // Group by period if slots have period info
+                // Group by period
                 const groups = { 'Morning': [], 'Afternoon': [], 'Evening': [] };
-                let hasGroups = false;
                 for (const s of slots) {
                     const time = typeof s === 'string' ? s : (s.time || s.label || '');
                     const period = typeof s === 'object' ? (s.period || '') : '';
-                    if (period && groups[period]) { groups[period].push(time); hasGroups = true; }
+                    if (period && groups[period]) { groups[period].push(time); }
                     else {
-                        // Auto-classify
+                        // Auto-classify by hour
                         const h = parseInt(time);
-                        if (h < 12) groups['Morning'].push(time);
-                        else if (h < 17 || time.includes('PM') && h < 5) groups['Afternoon'].push(time);
-                        else groups['Evening'].push(time);
+                        const isPM = time.toUpperCase().includes('PM');
+                        if (isPM && h !== 12) groups['Afternoon'].push(time);
+                        else if (h < 12 || h === 12 && !isPM) groups['Morning'].push(time);
+                        else groups['Afternoon'].push(time);
                     }
                 }
 
                 for (const [period, times] of Object.entries(groups)) {
                     if (times.length === 0) continue;
-                    html += '<div class="timeslot-group"><div class="timeslot-label">' + period + '</div>';
+                    html += '<div class="timeslot-group"><div class="timeslot-label">'
+                        + escapeHtml(period) + ' - ' + times.length + ' slots</div>';
                     html += '<div class="timeslot-buttons">';
                     for (const t of times) {
                         html += '<button class="timeslot-btn" onclick="quickAction(\'' + escapeHtml(t) + '\')">' + escapeHtml(t) + '</button>';
@@ -1574,47 +1667,72 @@
 
         // ── Available Dates ──────────────────────────────────
         if (data.dates || data.available_dates || data.dates_with_weather) {
-            html += '<div class="rich-component">';
-            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4C5;</span> '
-                + escapeHtml(data.message || 'Available Dates') + '</div>';
-
             const dates = data.dates_with_weather || data.dates || data.available_dates;
-            if (dates && dates.length > 0) {
+            const count = dates ? dates.length : 0;
+
+            html += '<div class="rich-component">';
+            html += '<p style="color:#555;margin:0 0 8px 0;">&#x2139;&#xFE0F;Please click on the below date to make your selection</p>';
+            html += '<div style="background:#f5f7fa;border-radius:12px;padding:14px;">';
+            html += '<div style="font-size:15px;font-weight:700;color:#1a1a2e;margin-bottom:10px;">Available Dates (' + count + ')</div>';
+
+            if (dates && count > 0) {
                 html += '<div class="dates-grid">';
                 for (const d of dates) {
                     if (typeof d === 'object') {
                         const indicator = (d.weatherIndicator || d.indicator || '').trim();
                         const temp = d.highTemp || d.high_temp || d.temperature || '';
-                        const day = d.dayName || d.day_name || '';
-                        const monthDay = d.monthDay || d.month_day || d.date || '';
+                        const day = (d.dayName || d.day_name || '').slice(0, 3);
+                        const displayDate = d.display_date || d.displayDate || d.monthDay || d.month_day || '';
                         const condition = (d.weatherCondition || d.condition || '').toLowerCase();
                         const warnings = d.weatherWarnings || d.warnings || [];
+                        const precip = d.precipitation || 0;
+
+                        // Format date for display: prefer display_date (MM/DD/YYYY), fallback to raw date
+                        let dateLabel = displayDate;
+                        if (!dateLabel && d.date) {
+                            const parts = d.date.split('-');
+                            if (parts.length === 3) dateLabel = parts[1] + '/' + parts[2] + '/' + parts[0];
+                            else dateLabel = d.date;
+                        }
 
                         let cls = 'date-card';
-                        if (condition.includes('snow') || condition.includes('storm') || condition.includes('blizzard')) {
-                            cls += ' weather-bad severe';
-                        } else if (warnings.length > 0 || condition.includes('rain') || condition.includes('wind')) {
+                        if (condition.includes('snow') || condition.includes('storm') || condition.includes('blizzard') || condition.includes('hail')) {
+                            cls += ' weather-bad';
+                        } else if (warnings.length > 0 || condition.includes('rain') || condition.includes('drizzle') || precip > 30) {
                             cls += ' weather-warn';
-                        } else if (indicator.includes('\u2600') || condition.includes('clear') || condition.includes('sunny') || condition.includes('partly')) {
+                        } else {
                             cls += ' weather-good';
                         }
 
-                        const dateStr = monthDay || d.date || '';
-                        html += '<div class="' + cls + '" onclick="quickAction(\'schedule for ' + escapeHtml(dateStr) + '\')">';
+                        // Sunday = blue background (weekend highlight)
+                        const fullDay = (d.dayName || d.day_name || '').toLowerCase();
+                        if (fullDay === 'sunday') cls += ' severe';
+
+                        const rawDate = d.date || displayDate;
+                        html += '<div class="' + cls + '" onclick="quickAction(\'schedule for ' + escapeHtml(rawDate) + '\')">';
                         html += '<div class="day-name">' + escapeHtml(day) + '</div>';
-                        html += '<div class="day-date">' + escapeHtml(dateStr) + '</div>';
-                        if (temp) html += '<div class="day-temp">' + escapeHtml(String(temp)) + '&deg;F</div>';
+                        html += '<div class="day-date">' + escapeHtml(dateLabel) + '</div>';
+                        if (temp) html += '<div class="day-temp">' + escapeHtml(String(Math.round(Number(temp)))) + '&deg;F</div>';
                         if (d.weatherCondition || d.condition) html += '<div class="day-condition">' + escapeHtml(d.weatherCondition || d.condition) + '</div>';
                         html += '</div>';
                     } else {
+                        // Plain date string — format as MM/DD/YYYY
+                        let dateLabel = String(d);
+                        const parts = dateLabel.split('-');
+                        if (parts.length === 3) dateLabel = parts[1] + '/' + parts[2] + '/' + parts[0];
+                        // Get day name
+                        let dayAbbr = '';
+                        try { dayAbbr = new Date(d + 'T12:00:00').toLocaleDateString('en-US', {weekday: 'short'}); } catch(e) {}
+
                         html += '<div class="date-card" onclick="quickAction(\'schedule for ' + escapeHtml(String(d)) + '\')">';
-                        html += '<div class="day-date">' + escapeHtml(String(d)) + '</div>';
+                        if (dayAbbr) html += '<div class="day-name">' + escapeHtml(dayAbbr) + '</div>';
+                        html += '<div class="day-date">' + escapeHtml(dateLabel) + '</div>';
                         html += '</div>';
                     }
                 }
                 html += '</div>';
             }
-            html += '</div>';
+            html += '</div></div>';
             return html;
         }
 
@@ -1703,22 +1821,39 @@
 
         // ── Weather ──────────────────────────────────────────
         if (data.weather || data.current || data.forecast) {
+            const loc = data.location || '';
             html += '<div class="rich-component">';
             html += '<div class="rich-header"><span class="rich-header-icon">&#x2600;</span> '
-                + escapeHtml(data.message || 'Weather Outlook') + '</div>';
+                + escapeHtml('Weather outlook' + (loc ? ' \u00B7 ' + loc : '')) + '</div>';
             html += '<div class="weather-grid">';
 
             const current = data.current || data.weather || {};
             if (current.temperature || current.temp) {
                 html += '<div class="weather-card">';
-                html += '<div class="weather-card-title">Current Conditions</div>';
+                html += '<div class="weather-card-title">Current conditions</div>';
                 html += '<div class="weather-temp">' + escapeHtml(String(current.temperature || current.temp || '')) + '&deg;F</div>';
                 if (current.condition) html += '<div class="weather-condition">' + escapeHtml(current.condition) + '</div>';
                 html += '</div>';
             }
 
+            // Forecast: array of days or single object
             const forecast = data.forecast || {};
-            if (forecast.high || forecast.low) {
+            if (Array.isArray(forecast) && forecast.length > 0) {
+                // Multi-day forecast — show each day
+                for (const day of forecast) {
+                    html += '<div class="weather-card">';
+                    html += '<div class="weather-card-title">'
+                        + escapeHtml((day.day_name || day.dayName || '').slice(0, 3) + ' ' + (day.date || '')) + '</div>';
+                    html += '<div class="weather-detail">';
+                    if (day.high != null) html += '<span class="weather-badge high">High ' + escapeHtml(String(Math.round(day.high))) + '&deg;</span> ';
+                    if (day.low != null) html += '<span class="weather-badge low">Low ' + escapeHtml(String(Math.round(day.low))) + '&deg;</span>';
+                    html += '</div>';
+                    if (day.precipitation) html += '<div style="margin-top:4px;"><span class="weather-badge precip">' + escapeHtml(String(day.precipitation)) + ' in</span></div>';
+                    if (day.condition) html += '<div class="weather-condition" style="margin-top:4px;">' + escapeHtml(day.condition) + '</div>';
+                    html += '</div>';
+                }
+            } else if (forecast.high || forecast.low) {
+                // Single forecast object (backward compat)
                 html += '<div class="weather-card">';
                 html += '<div class="weather-card-title">Forecast</div>';
                 html += '<div class="weather-detail">';

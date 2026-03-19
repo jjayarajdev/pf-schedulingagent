@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -62,6 +63,146 @@ def _setup_request_context(
     )
     RequestContext.set(session_id=session_id, user_id=user_id)
     return session_id, user_id
+
+
+def _repair_json_blocks(text: str) -> str:
+    """Ensure all ```json blocks in the response are properly closed.
+
+    The LLM sometimes truncates output before emitting the closing ```,
+    leaving the frontend unable to parse the JSON block.  This repairs
+    truncated JSON by closing open structures and appending ```.
+    """
+    # Fast path: no JSON blocks at all
+    if "```json" not in text:
+        return text
+
+    # Check if all opened blocks are closed
+    opens = [m.start() for m in re.finditer(r"```json", text)]
+    closes = [m.start() for m in re.finditer(r"```(?!json)", text)]
+    # Remove closes that appear before any open
+    if opens and closes:
+        closes = [c for c in closes if c > opens[0]]
+
+    if len(opens) <= len(closes):
+        return text  # All blocks properly closed
+
+    # Find the unclosed block (last open without a matching close)
+    last_open = opens[-1]
+    json_start = text.index("\n", last_open) + 1 if "\n" in text[last_open:] else last_open + 7
+    json_body = text[json_start:]
+
+    # Try to repair the truncated JSON
+    repaired = _close_truncated_json(json_body)
+    if repaired:
+        return text[:json_start] + repaired + "\n```"
+
+    # Fallback: just close the block as-is
+    return text + "\n```"
+
+
+def _close_truncated_json(json_str: str) -> str | None:
+    """Attempt to close truncated JSON by balancing braces/brackets."""
+    # Count open/close structures
+    braces = 0
+    brackets = 0
+    in_string = False
+    escape = False
+
+    for c in json_str:
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            braces += 1
+        elif c == "}":
+            braces -= 1
+        elif c == "[":
+            brackets += 1
+        elif c == "]":
+            brackets -= 1
+
+    if braces == 0 and brackets == 0 and not in_string:
+        return json_str  # Already valid
+
+    result = json_str
+
+    # Close open string
+    if in_string:
+        result += '"'
+
+    # Remove trailing incomplete tokens
+    result = re.sub(r',\s*$', '', result)
+    result = re.sub(r':\s*$', ': null', result)
+    result = re.sub(r',\s*"[^"]*"\s*$', '', result)
+    result = re.sub(r',\s*"[^"]*"\s*:\s*$', '', result)
+
+    # Close brackets and braces
+    # Re-count after repairs
+    braces = 0
+    brackets = 0
+    in_string = False
+    escape = False
+    for c in result:
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            braces += 1
+        elif c == "}":
+            braces -= 1
+        elif c == "[":
+            brackets += 1
+        elif c == "]":
+            brackets -= 1
+
+    while brackets > 0:
+        result += "]"
+        brackets -= 1
+    while braces > 0:
+        result += "}"
+        braces -= 1
+
+    # Verify it parses
+    try:
+        json.loads(result)
+        return result
+    except json.JSONDecodeError:
+        # Try trimming to last complete object in array
+        last_obj = result.rfind("},")
+        if last_obj > 0:
+            trimmed = result[:last_obj + 1]
+            # Re-close
+            b2 = sum(1 for c in trimmed if c == "{") - sum(1 for c in trimmed if c == "}")
+            k2 = sum(1 for c in trimmed if c == "[") - sum(1 for c in trimmed if c == "]")
+            while k2 > 0:
+                trimmed += "]"
+                k2 -= 1
+            while b2 > 0:
+                trimmed += "}"
+                b2 -= 1
+            try:
+                json.loads(trimmed)
+                return trimmed
+            except json.JSONDecodeError:
+                pass
+
+    return None
 
 
 def _detect_response_signals(response_text: str) -> dict:
@@ -202,6 +343,7 @@ async def chat(request: ChatRequest, raw_request: Request):
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
     response_text = extract_response_text(response.output)
+    response_text = _repair_json_blocks(response_text)
     agent_name = response.metadata.agent_name
 
     logger.info(

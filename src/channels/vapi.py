@@ -20,7 +20,13 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from auth.context import AuthContext
-from auth.phone_auth import get_or_authenticate, get_support_info, normalize_phone
+from auth.phone_auth import (
+    AuthenticationError,
+    authenticate_store,
+    get_or_authenticate,
+    get_support_info,
+    normalize_phone,
+)
 from channels.conversation_log import log_conversation
 from channels.formatters import format_for_voice
 from channels.vapi_config import get_phone_for_assistant
@@ -28,6 +34,7 @@ from config import get_secrets, get_settings
 from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
+from tools.pii_filter import scrub_pii
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +48,10 @@ _FALLBACK_MESSAGE = (
     "I'm having trouble looking that up right now. "
     "Let me connect you with our support team."
 )
+
+# Store caller sessions: call_id → {to_phone, creds, authenticated}
+# Tracks auth state across tool calls within one Vapi call.
+_store_sessions: dict[str, dict] = {}
 
 
 # ── Auth dependency ──────────────────────────────────────────────────────
@@ -106,6 +117,10 @@ async def _handle_assistant_request(body: dict) -> dict:
     (no fixed assistantId).  We authenticate the caller by phone number to get
     their name, then return the complete assistant configuration with a
     ``firstMessage`` that includes the caller's first name.
+
+    If phone-call-login fails (non-200), the caller is treated as a store caller
+    and gets a store-specific assistant config that asks for a PO/project lookup
+    value before proceeding.
     """
     message = body.get("message", {})
     call_data = message.get("call", body.get("call", {}))
@@ -116,7 +131,11 @@ async def _handle_assistant_request(body: dict) -> dict:
 
     logger.info("Vapi assistant-request: call_id=%s from=***%s", call_id, from_phone[-4:] if from_phone else "none")
 
+    webhook_secret = get_secrets().vapi_api_key
+    session_key = f"vapi-{call_id}"
+
     # Authenticate caller to get their name
+    is_store_caller = False
     first_name = ""
     client_name = "ProjectsForce"
     if from_phone:
@@ -125,8 +144,18 @@ async def _handle_assistant_request(body: dict) -> dict:
             user_name = creds.get("user_name", "")
             first_name = user_name.split()[0] if user_name and user_name.strip() else ""
             client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
+        except AuthenticationError:
+            # Auth failure = potential store caller
+            logger.info("Store caller detected (call_id=%s)", call_id)
+            is_store_caller = True
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
+
+    if is_store_caller:
+        _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False}
+        greeting = _generate_store_greeting()
+        logger.info("Vapi store greeting: call_id=%s", call_id)
+        return {"assistant": _build_store_assistant_config(greeting, webhook_secret)}
 
     greeting = _generate_dynamic_greeting(first_name, client_name)
     logger.info(
@@ -136,8 +165,6 @@ async def _handle_assistant_request(body: dict) -> dict:
         client_name,
     )
 
-    # Include webhook secret so Vapi sends x-vapi-secret on subsequent tool calls
-    webhook_secret = get_secrets().vapi_api_key
     return {"assistant": _build_assistant_config(greeting, webhook_secret)}
 
 
@@ -306,6 +333,163 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
     }
 
 
+def _generate_store_greeting() -> str:
+    """Build an SSML greeting for store callers."""
+    return (
+        '<break time="3000ms"/> Welcome to ProjectsForce. '
+        '<break time="300ms"/> '
+        "I can help you look up project information and schedule appointments. "
+        '<break time="500ms"/> '
+        "Do you have a PO number, project number, or customer name?"
+    )
+
+
+def _build_store_assistant_config(first_message: str, server_secret: str = "") -> dict:
+    """Build the Vapi assistant config for store callers.
+
+    Uses ``ask_store_bot`` tool instead of ``ask_scheduling_bot``.
+    The LLM first collects a lookup value, then routes all queries through
+    the same orchestrator with store-specific auth.
+    """
+    server_config: dict = {
+        "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "timeoutSeconds": 30,
+    }
+    if server_secret:
+        server_config["secret"] = server_secret
+    return {
+        "name": "ProjectsForce Store Bot",
+        "voice": {
+            "model": "sonic-3",
+            "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
+            "provider": "cartesia",
+        },
+        "model": {
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "temperature": 0.3,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are J, a friendly phone assistant for ProjectsForce "
+                        "— a home improvement scheduling service.\n\n"
+                        "The caller is from a STORE (not a customer).\n\n"
+                        "CRITICAL RULES:\n"
+                        "1. First, ask for a PO number, project number, or customer name "
+                        "to look up the account.\n"
+                        "2. Call ask_store_bot with the lookup info. On the first call you "
+                        "MUST include lookup_type and lookup_value.\n"
+                        "3. Once authenticated, use ask_store_bot for ALL scheduling queries "
+                        "(projects, dates, appointments, etc.). You do NOT need to pass "
+                        "lookup_type/lookup_value again after the first call.\n"
+                        "4. Pass the user's EXACT words in the \"question\" field. Do NOT "
+                        "rephrase, summarize, or add your own questions.\n"
+                        "5. NEVER share customer phone numbers, email addresses, or "
+                        "street addresses with the store caller.\n"
+                        "6. NEVER ask clarifying questions before calling the tool. Let the "
+                        "scheduling bot handle clarification.\n"
+                        "7. When the tool returns a response, speak it naturally. "
+                        "Keep it conversational — you are on a phone call.\n"
+                        "8. For multi-step flows (scheduling, rescheduling), call "
+                        "ask_store_bot for EVERY step.\n"
+                        "9. Keep your spoken responses concise — no bullet points, "
+                        "no markdown.\n"
+                        "10. Use natural filler phrases while waiting: "
+                        '"Let me check that for you", "One moment please".'
+                    ),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_store_bot",
+                        "description": (
+                            "REQUIRED for ALL requests. On first call, include lookup_type "
+                            "and lookup_value to authenticate. After that, only question is "
+                            "needed for scheduling queries."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": ["question"],
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": (
+                                        "The user's EXACT words. Pass verbatim what they said."
+                                    ),
+                                },
+                                "lookup_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "project_number",
+                                        "po_number",
+                                        "customer_name",
+                                    ],
+                                    "description": (
+                                        "Type of lookup value. Required on first call."
+                                    ),
+                                },
+                                "lookup_value": {
+                                    "type": "string",
+                                    "description": (
+                                        "The PO number, project number, or customer name. "
+                                        "Required on first call."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                    "messages": [
+                        {"type": "request-start", "content": "Let me look that up for you."},
+                        {
+                            "type": "request-response-delayed",
+                            "content": "Still working on that.",
+                            "timingMilliseconds": 3000,
+                        },
+                        {
+                            "type": "request-response-delayed",
+                            "content": "Almost there.",
+                            "timingMilliseconds": 5000,
+                        },
+                        {
+                            "type": "request-failed",
+                            "content": "I had some trouble with that. Could you try again?",
+                        },
+                    ],
+                }
+            ],
+        },
+        "transcriber": {
+            "model": "nova-3",
+            "language": "en",
+            "provider": "deepgram",
+            "endpointing": 150,
+        },
+        "firstMessage": first_message,
+        "endCallMessage": (
+            "Thank you for calling ProjectsForce. Have a great day!"
+        ),
+        "endCallPhrases": [
+            "goodbye", "bye", "bye bye", "bye now",
+            "talk to you later", "have a great day",
+            "have a good day", "that's all",
+        ],
+        "endCallFunctionEnabled": True,
+        "silenceTimeoutSeconds": 30,
+        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.4,
+            "smartEndpointingEnabled": True,
+        },
+        "hipaaEnabled": False,
+        "server": server_config,
+        "serverUrl": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+    }
+
+
 # ── Tool calls handler (current Vapi format) ────────────────────────────
 
 
@@ -426,6 +610,8 @@ def _handle_server_event(body: dict) -> dict:
             cost,
             summary[:200] if summary else "",
         )
+        # Clean up store session if present
+        _store_sessions.pop(f"vapi-{call_id}", None)
     elif event_type == "status-update":
         status = message.get("status", "unknown")
         logger.info("Vapi status-update: call_id=%s status=%s", call_id, status)
@@ -492,12 +678,144 @@ async def _process_tool(
         task.add_done_callback(_background_tasks.discard)
         return _build_tool_result(voice_text, tool_call_id)
 
+    if tool_name == "ask_store_bot":
+        return await _handle_store_bot(
+            tool_params, user_id, session_id, call_id, tool_call_id,
+        )
+
     logger.warning("Unknown tool: %s (call_id=%s)", tool_name, call_id)
     return _build_tool_result(f"Unknown tool: {tool_name}", tool_call_id)
 
 
+async def _handle_store_bot(
+    tool_params: dict,
+    user_id: str,
+    session_id: str,
+    call_id: str,
+    tool_call_id: str,
+) -> dict:
+    """Handle ``ask_store_bot`` tool — authenticate store caller and route queries."""
+    question = tool_params.get("question", "")
+    lookup_type = tool_params.get("lookup_type", "")
+    lookup_value = tool_params.get("lookup_value", "")
+
+    session_key = f"vapi-{call_id}"
+    store_session = _store_sessions.get(session_key, {})
+
+    # Step 1: Authenticate if not already
+    if not store_session.get("authenticated"):
+        if not lookup_type or not lookup_value:
+            return _build_tool_result(
+                "I need a PO number, project number, or customer name to look you up. "
+                "Which one do you have?",
+                tool_call_id,
+            )
+        to_phone = store_session.get("to_phone", "")
+        tenant_phone = normalize_phone(to_phone) if to_phone else ""
+        try:
+            creds = await authenticate_store(tenant_phone, lookup_type, lookup_value)
+        except AuthenticationError as exc:
+            logger.warning(
+                "Store auth failed: call_id=%s lookup=%s:%s error=%s",
+                call_id, lookup_type, lookup_value, exc,
+            )
+            return _build_tool_result(
+                "I couldn't find an account with that information. "
+                "Could you double-check and try again?",
+                tool_call_id,
+            )
+        store_session["creds"] = creds
+        store_session["authenticated"] = True
+        _store_sessions[session_key] = store_session
+
+    if not question:
+        return _build_tool_result(
+            "You're verified! How can I help you? "
+            "I can look up projects, check dates, or schedule appointments.",
+            tool_call_id,
+        )
+
+    # Step 2: Set AuthContext from cached store creds
+    creds = store_session["creds"]
+    AuthContext.set(
+        auth_token=creds.get("bearer_token", ""),
+        client_id=creds.get("client_id", ""),
+        customer_id=creds.get("customer_id", creds.get("user_id", "")),
+        user_id=creds.get("user_id", ""),
+        user_name=creds.get("user_name", ""),
+        caller_type="store",
+        tenant_phone=normalize_phone(store_session.get("to_phone", "")),
+    )
+
+    # Step 3: Route through orchestrator (same as ask_scheduling_bot)
+    agent_name = ""
+    start_time = time.monotonic()
+    try:
+        orchestrator = get_orchestrator()
+        response = await orchestrator.route_request(
+            user_input=question,
+            user_id=user_id,
+            session_id=session_id,
+            additional_params={"channel": "vapi"},
+        )
+        response_text = extract_response_text(response.output)
+        agent_name = response.metadata.agent_name if response.metadata else ""
+    except Exception:
+        logger.exception("Orchestrator error during store call (call_id=%s)", call_id)
+        response_text = _FALLBACK_MESSAGE
+    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+    # Step 4: PII scrub + voice format
+    voice_text = format_for_voice(scrub_pii(response_text))
+
+    logger.info(
+        "Vapi store tool result: call_id=%s chars=%d elapsed_ms=%d",
+        call_id, len(voice_text), elapsed_ms,
+    )
+    task = asyncio.create_task(
+        log_conversation(
+            session_id=session_id,
+            user_id=user_id,
+            user_message=question,
+            bot_response=voice_text,
+            agent_name=agent_name,
+            channel="vapi",
+            response_time_ms=elapsed_ms,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return _build_tool_result(voice_text, tool_call_id)
+
+
 async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None:
-    """Authenticate the caller via phone number and populate AuthContext."""
+    """Authenticate the caller via phone number and populate AuthContext.
+
+    For store callers (tracked in ``_store_sessions``), uses cached store
+    credentials instead of calling phone-call-login (which would fail again).
+    """
+    call_id = call_data.get("id", "")
+    session_key = f"vapi-{call_id}"
+
+    # If this is an authenticated store session, use cached creds
+    store_session = _store_sessions.get(session_key)
+    if store_session and store_session.get("authenticated"):
+        creds = store_session["creds"]
+        AuthContext.set(
+            auth_token=creds.get("bearer_token", ""),
+            client_id=creds.get("client_id", ""),
+            customer_id=creds.get("customer_id", creds.get("user_id", "")),
+            user_id=creds.get("user_id", ""),
+            user_name=creds.get("user_name", ""),
+            caller_type="store",
+            tenant_phone=normalize_phone(store_session.get("to_phone", "")),
+        )
+        return
+
+    # If this is an unauthenticated store session, skip (ask_store_bot will handle it)
+    if store_session:
+        return
+
     from_phone = _extract_phone_number(call_data)
     to_phone = _resolve_to_phone(call_data)
 

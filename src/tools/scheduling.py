@@ -103,20 +103,43 @@ def _safe_get(obj: Any, *keys, default=None) -> Any:
 
 
 def _extract_project_minimal(item: dict) -> dict[str, Any]:
-    """Extract key fields from a raw project API response."""
+    """Extract key fields from a raw project API response.
+
+    Store callers only see: status, scheduled date/time, and technician name.
+    All other fields (address, category, projectType, store info) are excluded.
+    """
     project_type = (
         _safe_get(item, "project_type_project_type", default="")
         or _safe_get(item, "project_type", default="")
         or _safe_get(item, "projectType", default="")
         or _safe_get(item, "work_type", default="")
     )
-    project = {
+
+    is_store = AuthContext.get_caller_type() == "store"
+
+    project: dict[str, Any] = {
         "id": str(_safe_get(item, "project_project_id", default="")),
         "projectNumber": _safe_get(item, "project_project_number", default=""),
         "status": _safe_get(item, "status_info_status", default=""),
-        "category": _safe_get(item, "project_category_category", default=""),
-        "projectType": project_type,
     }
+
+    # Store callers: only status, scheduled date/time, technician name
+    if is_store:
+        scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
+        if scheduled_date:
+            project["scheduledDate"] = scheduled_date
+            project["scheduledEndDate"] = _safe_get(item, "convertedProjectEndScheduledDate", default="")
+
+        installer_name = _safe_get(item, "user_idata_first_name")
+        if installer_name:
+            installer_last = _safe_get(item, "user_idata_last_name", default="")
+            project["installer"] = {"name": f"{installer_name} {installer_last}".strip()}
+
+        return project
+
+    # Customer callers: full project data
+    project["category"] = _safe_get(item, "project_category_category", default="")
+    project["projectType"] = project_type
 
     scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
     if scheduled_date:
@@ -138,6 +161,21 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
         "zipcode": _safe_get(item, "installation_address_zipcode", default=""),
     }
     project["address"] = {k: v for k, v in address.items() if v}
+
+    # Debug: log address extraction for weather troubleshooting
+    if not project["address"]:
+        addr_keys = [k for k in item if "address" in k.lower()]
+        if addr_keys:
+            logger.warning(
+                "Project %s has address-like keys but none matched: %s",
+                project.get("projectNumber", project["id"]),
+                {k: item[k] for k in addr_keys},
+            )
+        else:
+            logger.info(
+                "Project %s has no address fields in API response",
+                project.get("projectNumber", project["id"]),
+            )
 
     project["store"] = {
         "storeName": _safe_get(item, "store_info_store_name", default=""),
@@ -238,6 +276,25 @@ def _get_cached_project(project_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _resolve_project_id(project_id: str) -> str:
+    """Resolve a project identifier to the canonical project_id for API calls.
+
+    The LLM may pass either ``project_id`` (e.g. "90000149") or
+    ``project_number`` (e.g. "74356_1").  The PF scheduler API requires
+    ``project_id``.  This function looks up the cache and returns the
+    correct ``project_id`` regardless of which identifier was provided.
+    """
+    project = _get_cached_project(project_id)
+    if project and project["id"] != str(project_id):
+        logger.info(
+            "Resolved project_number %s → project_id %s",
+            project_id,
+            project["id"],
+        )
+        return project["id"]
+    return str(project_id)
+
+
 def _invalidate_projects() -> None:
     """Invalidate the project cache for the current customer.
 
@@ -269,6 +326,9 @@ _ON_HOLD_STATUSES = {
     "paused - waiting on product", "waiting for permit",
     "needs permit", "product ordered", "pending",
 }
+
+# Combined terminal statuses — excluded from list_projects by default
+_TERMINAL_STATUSES = _COMPLETED_STATUSES | _CANCELLED_STATUSES | {"closed", "archived"}
 
 
 def _build_intelligent_fallback(all_projects: list[dict[str, Any]]) -> str:
@@ -369,12 +429,11 @@ async def list_projects(
         return "No projects found."
 
     # Exclude terminal statuses by default (unless a specific status filter asks for them)
-    excluded = {"closed", "cancelled", "completed", "work complete", "done", "archived"}
-    if status and status.lower() in excluded:
+    if status and status.lower() in _TERMINAL_STATUSES:
         # If user explicitly asks for a terminal status, don't exclude it
         filtered = list(projects)
     else:
-        filtered = [p for p in projects if p.get("status", "").lower() not in excluded]
+        filtered = [p for p in projects if p.get("status", "").lower() not in _TERMINAL_STATUSES]
 
     # Apply filters
     if status:
@@ -440,6 +499,7 @@ async def get_project_details(project_id: str) -> str:
     Reads from the project cache.  If not found, forces a cache refresh
     and retries once.
     """
+    project_id = _resolve_project_id(project_id)
     customer_id = AuthContext.get_customer_id()
     if not customer_id:
         return "Error: No customer ID available. Please ensure you're authenticated."
@@ -454,11 +514,16 @@ async def get_project_details(project_id: str) -> str:
     if not project:
         return f"Project {project_id} not found. Please check the project ID and try again."
 
-    return json.dumps(project, indent=2, default=str)
+    result = {
+        "project": project,
+        "message": f"Project #{project.get('projectNumber') or project.get('id', '')} Details",
+    }
+    return json.dumps(result, indent=2, default=str)
 
 
 async def get_available_dates(project_id: str, start_date: str = "", end_date: str = "") -> str:
     """Get available scheduling dates. Returns dates + request_id (critical for downstream calls)."""
+    project_id = _resolve_project_id(project_id)
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
 
@@ -546,11 +611,14 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             except Exception:
                 logger.exception("Weather enrichment failed (non-fatal)")
 
+    # Sort dates chronologically
+    sorted_dates = sorted(dates)
+
     result: dict[str, Any] = {
         "project_id": project_id,
-        "available_dates": dates,
+        "available_dates": sorted_dates,
         "date_range": {"start": start_date, "end": end_date},
-        "message": f"Found {len(dates)} available date(s) for project {project_id}.",
+        "message": f"Found {len(sorted_dates)} available date(s) for project {project_id}.",
     }
 
     if api_request_id:
@@ -558,7 +626,8 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
         _request_id_by_project[project_id] = api_request_id
 
     if weather_dates:
-        result["dates_with_weather"] = weather_dates
+        # Sort weather dates chronologically too
+        result["dates_with_weather"] = sorted(weather_dates, key=lambda d: d.get("date", ""))
         good = sum(1 for d in weather_dates if d.get("suitable", True))
         bad = len(weather_dates) - good
         result["has_weather_concerns"] = bad > 0
@@ -574,6 +643,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
 
 async def get_time_slots(project_id: str, date: str) -> str:
     """Get available time slots for a specific date."""
+    project_id = _resolve_project_id(project_id)
     # Fix common LLM date errors: wrong year
     try:
         date_obj = datetime.strptime(date, "%Y-%m-%d")
@@ -633,6 +703,7 @@ async def confirm_appointment(
     project_id: str, date: str, time: str, confirmed: bool = False
 ) -> str:
     """Confirm/schedule an appointment. Requires explicit user confirmation."""
+    project_id = _resolve_project_id(project_id)
     if not confirmed:
         return (
             f"Please confirm: Schedule appointment for project {project_id} "
@@ -723,6 +794,7 @@ async def reschedule_appointment(project_id: str) -> str:
     Uses the dedicated ``get-reschedule-slotsChatBot`` API endpoint which
     ignores current appointment status and returns alternative availability.
     """
+    project_id = _resolve_project_id(project_id)
     # Read from cache (no extra API call)
     project = _get_cached_project(project_id)
     if not project:
@@ -837,6 +909,7 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
 
 async def cancel_appointment(project_id: str) -> str:
     """Cancel an existing appointment."""
+    project_id = _resolve_project_id(project_id)
     # Validate from cache (no extra API call)
     project = _get_cached_project(project_id)
     if project:
@@ -870,6 +943,7 @@ async def cancel_appointment(project_id: str) -> str:
 
 async def add_note(project_id: str, note_text: str) -> str:
     """Add a note to a project."""
+    project_id = _resolve_project_id(project_id)
     client_id = AuthContext.get_client_id()
     customer_id = AuthContext.get_customer_id()
     url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note"
@@ -891,6 +965,7 @@ async def add_note(project_id: str, note_text: str) -> str:
 
 async def list_notes(project_id: str) -> str:
     """List notes for a project."""
+    project_id = _resolve_project_id(project_id)
     client_id = AuthContext.get_client_id()
     customer_id = AuthContext.get_customer_id()
     url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/notes"
@@ -992,6 +1067,14 @@ async def get_project_weather(project_id: str = "") -> str:
     logger.info("Weather for project %s at %s", target["id"], location)
     result = await get_weather(location)
 
-    # Prepend project context
-    project_label = target.get("category", target.get("projectType", "Project"))
-    return f"Weather for {project_label} at {location}:\n\n{result}"
+    # Merge project context into weather JSON
+    try:
+        weather_data = json.loads(result)
+        project_label = target.get("category", target.get("projectType", "Project"))
+        weather_data["project"] = project_label
+        weather_data["project_id"] = target["id"]
+        weather_data["message"] = f"Weather for {project_label} at {location}"
+        return json.dumps(weather_data, indent=2)
+    except (json.JSONDecodeError, TypeError):
+        # Fallback for non-JSON weather responses (error messages)
+        return result

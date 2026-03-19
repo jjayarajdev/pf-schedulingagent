@@ -210,6 +210,35 @@ class TestListProjects:
         assert data["projects"][0]["id"] == "1"
 
 
+    async def test_filters_all_terminal_statuses(self, mock_httpx_client, mock_httpx_response):
+        """Completed variants like 'Project Completed', 'Work Order Completed' must be excluded."""
+        response = mock_httpx_response(
+            200,
+            {
+                "data": [
+                    {"project_project_id": "1", "status_info_status": "Project Completed",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                    {"project_project_id": "2", "status_info_status": "Work Order Completed",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                    {"project_project_id": "3", "status_info_status": "Cancelled/Surge",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                    {"project_project_id": "4", "status_info_status": "Completed-Archived",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                    {"project_project_id": "5", "status_info_status": "Scheduled",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                    {"project_project_id": "6", "status_info_status": "Ready To Schedule",
+                     "store_info_store_name": "", "store_info_store_number": ""},
+                ]
+            },
+        )
+        with mock_httpx_client(response=response):
+            result = await list_projects()
+        data = json.loads(result)
+        assert len(data["projects"]) == 2
+        ids = {p["id"] for p in data["projects"]}
+        assert ids == {"5", "6"}
+
+
 class TestGetProjectDetails:
     async def test_returns_details(self, mock_httpx_client, mock_httpx_response):
         """get_project_details calls the dashboard endpoint and filters by project_id."""
@@ -237,8 +266,9 @@ class TestGetProjectDetails:
         with mock_httpx_client(response=response):
             result = await get_project_details("123")
         data = json.loads(result)
-        assert data["id"] == "123"
-        assert data["status"] == "New"
+        assert data["project"]["id"] == "123"
+        assert data["project"]["status"] == "New"
+        assert "message" in data
 
     async def test_project_not_found(self, mock_httpx_client, mock_httpx_response):
         response = mock_httpx_response(200, {"data": [{"project_project_id": "999", "status_info_status": "New", "store_info_store_name": "", "store_info_store_number": ""}]})
