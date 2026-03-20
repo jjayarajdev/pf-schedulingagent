@@ -431,9 +431,11 @@ async def list_projects(
     # Exclude terminal statuses by default (unless a specific status filter asks for them)
     if status and status.lower() in _TERMINAL_STATUSES:
         # If user explicitly asks for a terminal status, don't exclude it
-        filtered = list(projects)
+        active_projects = list(projects)
     else:
-        filtered = [p for p in projects if p.get("status", "").lower() not in _TERMINAL_STATUSES]
+        active_projects = [p for p in projects if p.get("status", "").lower() not in _TERMINAL_STATUSES]
+
+    filtered = list(active_projects)
 
     # Apply filters
     if status:
@@ -469,8 +471,8 @@ async def list_projects(
         ]
 
     if not filtered:
-        # Intelligent fallback — explain why no projects match
-        return _build_intelligent_fallback(projects)
+        # Intelligent fallback — only reference active projects, never completed/cancelled
+        return _build_intelligent_fallback(active_projects)
 
     return json.dumps({"message": f"Found {len(filtered)} project(s):", "projects": filtered}, indent=2)
 

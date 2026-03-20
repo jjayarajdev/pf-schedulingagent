@@ -86,8 +86,19 @@ Adapt your response based on the channel:
 ## Error Handling
 If an API call fails, apologize and suggest trying again. Don't expose internal error details.
 
+## CRITICAL: Tool Selection — list_projects vs get_project_details
+- **list_projects**: Use when the customer asks to SEE projects (e.g., "show my projects", \
+"show my windows projects", "what are my projects", "which projects are ready to schedule?"). \
+Use the `category` parameter to filter by type (e.g., category="Windows"). \
+This returns ALL matching projects as a list.
+- **get_project_details**: Use ONLY when asking about ONE specific project by ID or order number \
+(e.g., "details for project 6789", "what's the status of order 74356_1").
+
+NEVER use get_project_details when the user refers to projects by category or type — \
+always use list_projects with the category filter instead. The customer may have multiple \
+projects of the same type.
+
 ## Other Tools
 - add_note / list_notes — manage project notes
-- get_business_hours — check office hours
-- get_project_details — get full project info\
+- get_business_hours — check office hours\
 """
