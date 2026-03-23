@@ -239,7 +239,15 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
                         "9. Use natural filler phrases while waiting: "
                         '"Let me check that for you", "One moment please".\n'
                         "10. If the tool call fails, say: "
-                        '"I\'m having trouble looking that up. Let me try again." and retry once.'
+                        '"I\'m having trouble looking that up. Let me try again." and retry once.\n'
+                        "11. CRITICAL — CONFIRMATION COMPLETES THE BOOKING: When the scheduling bot "
+                        'asks the user to confirm (e.g., "Should I go ahead?", "Shall I book this?"), '
+                        "the user's reply (yes, sure, go ahead, confirm, etc.) MUST be passed back "
+                        "to ask_scheduling_bot. The booking is NOT complete until the bot processes "
+                        "the confirmation. NEVER end the call or assume the appointment is booked — "
+                        "only the scheduling bot can finalize it.\n"
+                        "12. Do NOT end the call until the scheduling bot has confirmed the booking "
+                        "is complete OR the user explicitly says goodbye/bye/that's all I need."
                     ),
                 }
             ],
@@ -313,7 +321,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
         "endCallPhrases": [
             "goodbye", "bye", "bye bye", "bye now",
             "talk to you later", "have a great day",
-            "have a good day", "that's all",
+            "have a good day",
         ],
         "endCallFunctionEnabled": True,
         "voicemailMessage": (
@@ -396,7 +404,15 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
                         "9. Keep your spoken responses concise — no bullet points, "
                         "no markdown.\n"
                         "10. Use natural filler phrases while waiting: "
-                        '"Let me check that for you", "One moment please".'
+                        '"Let me check that for you", "One moment please".\n'
+                        "11. CRITICAL — CONFIRMATION COMPLETES THE BOOKING: When the scheduling bot "
+                        'asks the user to confirm (e.g., "Should I go ahead?", "Shall I book this?"), '
+                        "the user's reply (yes, sure, go ahead, confirm, etc.) MUST be passed back "
+                        "to ask_store_bot. The booking is NOT complete until the bot processes "
+                        "the confirmation. NEVER end the call or assume the appointment is booked — "
+                        "only the scheduling bot can finalize it.\n"
+                        "12. Do NOT end the call until the scheduling bot has confirmed the booking "
+                        "is complete OR the user explicitly says goodbye/bye."
                     ),
                 }
             ],
@@ -474,7 +490,7 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
         "endCallPhrases": [
             "goodbye", "bye", "bye bye", "bye now",
             "talk to you later", "have a great day",
-            "have a good day", "that's all",
+            "have a good day",
         ],
         "endCallFunctionEnabled": True,
         "silenceTimeoutSeconds": 30,
