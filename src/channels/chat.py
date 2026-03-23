@@ -219,11 +219,37 @@ _BOOKING_CONFIRMATION_PATTERNS = [
     "booking confirmed",
 ]
 
+# Patterns that indicate the LLM fabricated a scheduling failure instead of calling the tool
+_FABRICATED_FAILURE_PATTERNS = [
+    "system issue",
+    "scheduling conflict",
+    "unable to process",
+    "unable to schedule",
+    "couldn't process the scheduling",
+    "couldn't complete the scheduling",
+    "status conflict",
+    "project status",
+]
+
+# Short affirmative messages that likely mean "confirm the appointment"
+_AFFIRMATIVE_PATTERNS = re.compile(
+    r"^(yes|yeah|yep|yup|sure|confirm|go ahead|do it|ok|okay|absolutely|please|book it)\b",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_booking_confirmation(text: str) -> bool:
     """Check if the response text claims a booking was made."""
     lower = text.lower()
     return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
+
+
+def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
+    """Check if the LLM fabricated a scheduling failure after a user confirmation."""
+    if not _AFFIRMATIVE_PATTERNS.match(user_message.strip()):
+        return False
+    lower = text.lower()
+    return any(p in lower for p in _FABRICATED_FAILURE_PATTERNS)
 
 
 def _detect_response_signals(response_text: str) -> dict:
@@ -366,17 +392,25 @@ async def chat(request: ChatRequest, raw_request: Request):
 
     response_text = extract_response_text(response.output)
 
-    # Guardrail: detect hallucinated booking confirmations
+    # Guardrail: detect hallucinated booking confirmations or fabricated failures
     # If the LLM claims a booking was made but confirm_appointment was never called,
-    # re-route with explicit instruction to call the tool.
+    # OR fabricated a "system issue" when the user said "yes", re-route.
+    should_retry = False
     if not was_confirm_called() and _looks_like_booking_confirmation(response_text):
         logger.warning("Hallucinated booking detected — retrying with forced tool call")
+        should_retry = True
+    elif not was_confirm_called() and _looks_like_fabricated_failure(response_text, request.message):
+        logger.warning("Fabricated scheduling failure detected — retrying with forced tool call")
+        should_retry = True
+
+    if should_retry:
         reset_confirm_flag()
         try:
             response = await orchestrator.route_request(
                 user_input=(
                     "The customer confirmed. You MUST call the confirm_appointment tool NOW "
-                    "to actually book the appointment. Do NOT respond without calling the tool."
+                    "to actually book the appointment. Do NOT respond without calling the tool. "
+                    "Do NOT check or worry about the project status — just call the tool."
                 ),
                 user_id=user_id,
                 session_id=session_id,

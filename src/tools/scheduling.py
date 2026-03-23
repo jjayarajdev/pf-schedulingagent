@@ -669,12 +669,37 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
     # Sort dates chronologically
     sorted_dates = sorted(dates)
 
+    # Include available time slots from the API response.
+    # The slotsChatbot endpoint returns the valid time slots alongside dates.
+    # Including them here prevents the LLM from fabricating slots.
+    raw_slots = data.get("slots", [])
+    formatted_slots = []
+    for s in raw_slots:
+        try:
+            h, m, *_ = s.split(":")
+            hour = int(h)
+            minute = m
+            period = "AM" if hour < 12 else "PM"
+            display_hour = hour if hour <= 12 else hour - 12
+            if display_hour == 0:
+                display_hour = 12
+            formatted_slots.append(f"{display_hour}:{minute} {period}")
+        except (ValueError, IndexError):
+            formatted_slots.append(s)
+
     result: dict[str, Any] = {
         "project_id": project_id,
         "available_dates": sorted_dates,
         "date_range": {"start": start_date, "end": end_date},
         "message": f"Found {len(sorted_dates)} available date(s) for project {project_id}.",
     }
+
+    if formatted_slots:
+        result["available_time_slots"] = formatted_slots
+        result["message"] += (
+            f" Available time slots on each date: {', '.join(formatted_slots)}."
+            " These are the ONLY valid time slots — do not offer any other times."
+        )
 
     if api_request_id:
         result["request_id"] = api_request_id
@@ -938,15 +963,38 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
             except Exception:
                 logger.exception("Weather enrichment failed during reschedule (non-fatal)")
 
+    # Include time slots from the API response
+    raw_slots = data.get("slots", [])
+    formatted_slots = []
+    for s in raw_slots:
+        try:
+            h, m, *_ = s.split(":")
+            hour = int(h)
+            minute = m
+            period = "AM" if hour < 12 else "PM"
+            display_hour = hour if hour <= 12 else hour - 12
+            if display_hour == 0:
+                display_hour = 12
+            formatted_slots.append(f"{display_hour}:{minute} {period}")
+        except (ValueError, IndexError):
+            formatted_slots.append(s)
+
+    slots_msg = ""
+    if formatted_slots:
+        slots_msg = f" Available time slots on each date: {', '.join(formatted_slots)}. These are the ONLY valid time slots."
+
     result: dict[str, Any] = {
         "project_id": project_id,
         "is_reschedule": True,
         "available_dates": dates,
         "message": (
             f"The existing appointment has been cancelled. "
-            f"Found {len(dates)} new date(s) for project {project_id}."
+            f"Found {len(dates)} new date(s) for project {project_id}.{slots_msg}"
         ),
     }
+
+    if formatted_slots:
+        result["available_time_slots"] = formatted_slots
 
     if weather_dates:
         result["dates_with_weather"] = weather_dates

@@ -44,6 +44,12 @@ The appointment is NOT booked until the tool returns success. \
 Similarly, NEVER say a cancellation or reschedule succeeded without calling the respective tool. \
 If you skip the tool call, the appointment will NOT be booked and the customer will be misled.
 
+## CRITICAL: Time Slots — ONLY Use What Tools Return
+The get_available_dates tool returns `available_time_slots` — these are the ONLY valid time slots. \
+NEVER fabricate, guess, or infer time slots. Do NOT generate 30-minute intervals or typical business hours. \
+If the tool says the slots are "8:00 AM" and "1:00 PM", those are the ONLY two options — present exactly those. \
+If you need time slot details and don't have them, call get_time_slots — NEVER make them up.
+
 ## Reschedule Flow
 1. reschedule_appointment — cancels the existing appointment
 2. get_available_dates — find new dates
