@@ -85,19 +85,27 @@ def create_scheduling_agent() -> BedrockLLMAgent:
         ),
         AgentTool(
             name="confirm_appointment",
-            description="Confirm and schedule an appointment. Requires explicit user confirmation.",
+            description=(
+                "REQUIRED to book an appointment. You MUST call this tool to actually schedule — "
+                "the appointment is NOT booked until this tool returns success. "
+                "Never tell the user the appointment is confirmed without calling this tool first. "
+                "Pass confirmed=true after the user says yes."
+            ),
             properties={
                 "project_id": {"type": "string", "description": "The project ID"},
                 "date": {"type": "string", "description": "The date (YYYY-MM-DD)"},
-                "time": {"type": "string", "description": "The time slot"},
-                "confirmed": {"type": "boolean", "description": "Set to true only after user confirms"},
+                "time": {"type": "string", "description": "The time slot (e.g. '08:00:00')"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "MUST be true to actually book. Set to true after user confirms.",
+                },
             },
-            required=["project_id", "date", "time"],
+            required=["project_id", "date", "time", "confirmed"],
             func=confirm_appointment,
         ),
         AgentTool(
             name="reschedule_appointment",
-            description="Start rescheduling — cancels existing appointment and prepares for new scheduling.",
+            description="REQUIRED to reschedule. Cancels existing appointment and prepares for new scheduling. You MUST call this tool — never tell the user it's done without calling it.",
             properties={
                 "project_id": {"type": "string", "description": "The project ID"},
             },
@@ -106,7 +114,7 @@ def create_scheduling_agent() -> BedrockLLMAgent:
         ),
         AgentTool(
             name="cancel_appointment",
-            description="Cancel an existing appointment.",
+            description="REQUIRED to cancel. You MUST call this tool to cancel — never tell the user it's cancelled without calling it.",
             properties={
                 "project_id": {"type": "string", "description": "The project ID"},
             },
