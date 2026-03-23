@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -77,6 +78,23 @@ def get_session_projects(session_id: str) -> dict[str, list[str]]:
 def clear_session_projects(session_id: str) -> None:
     """Remove tracking data for a completed session."""
     _session_projects.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+#  Request-scoped confirm_appointment tracking (hallucination guardrail)
+# ---------------------------------------------------------------------------
+
+_confirm_called_in_request: ContextVar[bool] = ContextVar("confirm_called", default=False)
+
+
+def reset_confirm_flag() -> None:
+    """Reset before each orchestrator call."""
+    _confirm_called_in_request.set(False)
+
+
+def was_confirm_called() -> bool:
+    """Check if confirm_appointment was actually called in this request."""
+    return _confirm_called_in_request.get()
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +757,7 @@ async def get_time_slots(project_id: str, date: str) -> str:
 
 async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -> str:
     """Schedule an appointment. Only call AFTER the customer has confirmed."""
+    _confirm_called_in_request.set(True)
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "confirm_appointment")
 

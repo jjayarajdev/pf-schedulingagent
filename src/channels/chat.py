@@ -20,6 +20,7 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from orchestrator.welcome import handle_welcome
+from tools.scheduling import reset_confirm_flag, was_confirm_called
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,26 @@ def _close_truncated_json(json_str: str) -> str | None:
     return None
 
 
+_BOOKING_CONFIRMATION_PATTERNS = [
+    "appointment confirmed",
+    "appointment is now confirmed",
+    "is now scheduled",
+    "has been scheduled",
+    "has been successfully scheduled",
+    "successfully scheduled",
+    "appointment has been booked",
+    "you're all set",
+    "your appointment is confirmed",
+    "booking confirmed",
+]
+
+
+def _looks_like_booking_confirmation(text: str) -> bool:
+    """Check if the response text claims a booking was made."""
+    lower = text.lower()
+    return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
+
+
 def _detect_response_signals(response_text: str) -> dict:
     """Detect confirmation requests, actions, and PF API errors from response text.
 
@@ -328,6 +349,7 @@ async def chat(request: ChatRequest, raw_request: Request):
 
     orchestrator = get_orchestrator()
     start_time = time.monotonic()
+    reset_confirm_flag()
     try:
         response = await orchestrator.route_request(
             user_input=request.message,
@@ -343,6 +365,33 @@ async def chat(request: ChatRequest, raw_request: Request):
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
     response_text = extract_response_text(response.output)
+
+    # Guardrail: detect hallucinated booking confirmations
+    # If the LLM claims a booking was made but confirm_appointment was never called,
+    # re-route with explicit instruction to call the tool.
+    if not was_confirm_called() and _looks_like_booking_confirmation(response_text):
+        logger.warning("Hallucinated booking detected — retrying with forced tool call")
+        reset_confirm_flag()
+        try:
+            response = await orchestrator.route_request(
+                user_input=(
+                    "The customer confirmed. You MUST call the confirm_appointment tool NOW "
+                    "to actually book the appointment. Do NOT respond without calling the tool."
+                ),
+                user_id=user_id,
+                session_id=session_id,
+                additional_params={"channel": "chat"},
+            )
+            retry_text = extract_response_text(response.output)
+            if was_confirm_called():
+                response_text = retry_text
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                logger.info("Retry succeeded — confirm_appointment was called")
+            else:
+                logger.warning("Retry also failed to call confirm_appointment")
+        except Exception:
+            logger.exception("Retry failed")
+
     response_text = _repair_json_blocks(response_text)
     agent_name = response.metadata.agent_name
 
