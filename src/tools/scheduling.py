@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from auth.context import AuthContext
+from observability.logging import RequestContext
 from tools.api_client import build_headers, get_pf_api_base, log_curl, log_response
 from tools.date_utils import convert_natural_date, extract_date_range
 from tools.project_rules import ProjectStatusRules
@@ -44,6 +45,38 @@ _request_id_by_project: dict[str, int] = {}
 
 # Lock to prevent concurrent API fetches for the same customer
 _load_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+#  Per-session project tracking (for end-of-call notes)
+# ---------------------------------------------------------------------------
+
+# session_id → {project_id: [action_names]}
+_session_projects: dict[str, dict[str, list[str]]] = {}
+
+
+def _track_project_action(project_id: str, action: str) -> None:
+    """Record that a project was accessed by a tool in the current session."""
+    session_id = RequestContext.get_session_id()
+    if not session_id:
+        return
+    if session_id not in _session_projects:
+        _session_projects[session_id] = {}
+    projects = _session_projects[session_id]
+    if project_id not in projects:
+        projects[project_id] = []
+    if action not in projects[project_id]:
+        projects[project_id].append(action)
+
+
+def get_session_projects(session_id: str) -> dict[str, list[str]]:
+    """Return {project_id: [actions]} for a session. Used by end-of-call handler."""
+    return _session_projects.get(session_id, {})
+
+
+def clear_session_projects(session_id: str) -> None:
+    """Remove tracking data for a completed session."""
+    _session_projects.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +535,7 @@ async def get_project_details(project_id: str) -> str:
     and retries once.
     """
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "get_project_details")
     customer_id = AuthContext.get_customer_id()
     if not customer_id:
         return "Error: No customer ID available. Please ensure you're authenticated."
@@ -526,6 +560,7 @@ async def get_project_details(project_id: str) -> str:
 async def get_available_dates(project_id: str, start_date: str = "", end_date: str = "") -> str:
     """Get available scheduling dates. Returns dates + request_id (critical for downstream calls)."""
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "get_available_dates")
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
 
@@ -646,6 +681,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
 async def get_time_slots(project_id: str, date: str) -> str:
     """Get available time slots for a specific date."""
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "get_time_slots")
     # Fix common LLM date errors: wrong year
     try:
         date_obj = datetime.strptime(date, "%Y-%m-%d")
@@ -706,6 +742,7 @@ async def confirm_appointment(
 ) -> str:
     """Confirm/schedule an appointment. Requires explicit user confirmation."""
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "confirm_appointment")
     if not confirmed:
         return (
             f"Please confirm: Schedule appointment for project {project_id} "
@@ -797,6 +834,7 @@ async def reschedule_appointment(project_id: str) -> str:
     ignores current appointment status and returns alternative availability.
     """
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "reschedule_appointment")
     # Read from cache (no extra API call)
     project = _get_cached_project(project_id)
     if not project:
@@ -912,6 +950,7 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
 async def cancel_appointment(project_id: str) -> str:
     """Cancel an existing appointment."""
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "cancel_appointment")
     # Validate from cache (no extra API call)
     project = _get_cached_project(project_id)
     if project:
@@ -946,6 +985,7 @@ async def cancel_appointment(project_id: str) -> str:
 async def add_note(project_id: str, note_text: str) -> str:
     """Add a note to a project."""
     project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "add_note")
     client_id = AuthContext.get_client_id()
     customer_id = AuthContext.get_customer_id()
     url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note"
@@ -989,6 +1029,72 @@ async def list_notes(project_id: str) -> str:
         return f"No notes found for project {project_id}."
 
     return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
+
+
+async def post_call_summary_notes(
+    *,
+    session_id: str,
+    bearer_token: str,
+    client_id: str,
+    customer_id: str,
+    summary: str,
+    duration_seconds: float = 0,
+) -> None:
+    """Post call summary as a note to each project discussed during the session.
+
+    Called from the Vapi end-of-call handler. Uses explicit auth params since
+    AuthContext is not available outside the request lifecycle.
+    """
+    projects_discussed = get_session_projects(session_id)
+    if not projects_discussed:
+        logger.info("No projects discussed in session %s — skipping call notes", session_id)
+        clear_session_projects(session_id)
+        return
+
+    # Format duration
+    minutes = int(duration_seconds // 60)
+    seconds = int(duration_seconds % 60)
+    duration_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+    call_time = datetime.now(timezone.utc).strftime("%b %d, %Y at %I:%M %p UTC")
+    base_url = get_pf_api_base()
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "client_id": client_id,
+    }
+
+    truncated_summary = (summary[:200] + "...") if len(summary) > 200 else summary
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for project_id, actions in projects_discussed.items():
+            action_list = ", ".join(actions) if actions else "general inquiry"
+            note_text = (
+                f"Customer called on {call_time} via AI Scheduling Assistant (J). "
+                f"Duration: {duration_str}. Actions: {action_list}."
+            )
+            if truncated_summary:
+                note_text += f" Summary: {truncated_summary}"
+
+            url = (
+                f"{base_url}/communication/client/{client_id}"
+                f"/customer/{customer_id}/project/{project_id}/note"
+            )
+            payload = {"note": note_text}
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                logger.info(
+                    "Call note posted: project=%s status=%d session=%s",
+                    project_id, resp.status_code, session_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to post call note for project %s (session=%s)",
+                    project_id, session_id,
+                )
+
+    clear_session_projects(session_id)
 
 
 async def get_business_hours() -> str:

@@ -23,6 +23,7 @@ from auth.context import AuthContext
 from auth.phone_auth import (
     AuthenticationError,
     authenticate_store,
+    get_cached_auth,
     get_or_authenticate,
     get_support_info,
     normalize_phone,
@@ -35,6 +36,7 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
+from tools.scheduling import clear_session_projects, post_call_summary_notes
 
 logger = logging.getLogger(__name__)
 
@@ -619,13 +621,43 @@ def _handle_server_event(body: dict) -> dict:
         reason = message.get("endedReason", "unknown")
         summary = message.get("summary", "")
         cost = message.get("cost", 0)
+        duration = message.get("durationSeconds", 0)
         logger.info(
-            "Vapi end-of-call: call_id=%s reason=%s cost=%s summary=%s",
+            "Vapi end-of-call: call_id=%s reason=%s cost=%s duration=%ss summary=%s",
             call_id,
             reason,
             cost,
+            duration,
             summary[:200] if summary else "",
         )
+
+        # Post call summary notes to discussed projects (fire-and-forget)
+        session_id = f"vapi-{call_id}"
+        phone_number = _extract_phone_number(call_data)
+        if phone_number and summary:
+            creds = get_cached_auth(normalize_phone(phone_number))
+            if creds and creds.get("bearer_token"):
+                task = asyncio.create_task(
+                    post_call_summary_notes(
+                        session_id=session_id,
+                        bearer_token=creds["bearer_token"],
+                        client_id=creds["client_id"],
+                        customer_id=creds["customer_id"],
+                        summary=summary,
+                        duration_seconds=duration,
+                    )
+                )
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
+            else:
+                logger.warning(
+                    "No cached creds for call notes (call_id=%s phone=***%s)",
+                    call_id, phone_number[-4:] if phone_number else "none",
+                )
+                clear_session_projects(session_id)
+        else:
+            clear_session_projects(f"vapi-{call_id}")
+
         # Clean up store session if present
         _store_sessions.pop(f"vapi-{call_id}", None)
     elif event_type == "status-update":

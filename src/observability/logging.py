@@ -40,6 +40,10 @@ class RequestContext:
         return _request_id.get()
 
     @staticmethod
+    def get_session_id() -> str:
+        return _session_id.get()
+
+    @staticmethod
     def new_request_id() -> str:
         rid = str(uuid.uuid4())
         _request_id.set(rid)

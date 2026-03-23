@@ -751,3 +751,180 @@ class TestBuildToolResult:
 
         result = _build_tool_result("Hello", "")
         assert "toolCallId" not in result["results"][0]
+
+
+class TestCallSummaryNotes:
+    """End-of-call summary notes posted to PF project notes API."""
+
+    @patch("channels.vapi.get_cached_auth")
+    @patch("channels.vapi.post_call_summary_notes", new_callable=AsyncMock)
+    @patch("channels.vapi.clear_session_projects")
+    def test_end_of_call_posts_notes_when_creds_available(
+        self, mock_clear, mock_post_notes, mock_get_auth, client,
+    ):
+        """End-of-call with summary + phone + creds triggers note posting."""
+        mock_get_auth.return_value = {
+            "bearer_token": "tok-123",
+            "client_id": "CL1",
+            "customer_id": "CUST1",
+        }
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "end-of-call-report",
+                    "endedReason": "customer-ended-call",
+                    "summary": "Scheduled fence installation for March 20.",
+                    "cost": 0.25,
+                    "durationSeconds": 120,
+                    "call": {
+                        "id": "call-notes-1",
+                        "customer": {"number": "+15551234567"},
+                    },
+                },
+            },
+            headers=_vapi_headers(),
+        )
+        assert resp.status_code == 200
+        # post_call_summary_notes should have been scheduled as a background task
+        # (via asyncio.create_task, so the mock may or may not have been awaited
+        # depending on event loop timing in sync TestClient)
+        mock_get_auth.assert_called_once()
+
+    @patch("channels.vapi.get_cached_auth", return_value=None)
+    @patch("channels.vapi.clear_session_projects")
+    def test_end_of_call_clears_session_when_no_creds(
+        self, mock_clear, mock_get_auth, client,
+    ):
+        """When no cached creds, session projects are cleaned up."""
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "end-of-call-report",
+                    "endedReason": "customer-ended-call",
+                    "summary": "Customer asked about scheduling.",
+                    "durationSeconds": 30,
+                    "call": {
+                        "id": "call-notes-2",
+                        "customer": {"number": "+15559876543"},
+                    },
+                },
+            },
+            headers=_vapi_headers(),
+        )
+        assert resp.status_code == 200
+        mock_clear.assert_called_with("vapi-call-notes-2")
+
+    @patch("channels.vapi.clear_session_projects")
+    def test_end_of_call_no_summary_clears_session(self, mock_clear, client):
+        """No summary → no note posting, just cleanup."""
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "end-of-call-report",
+                    "endedReason": "customer-ended-call",
+                    "summary": "",
+                    "call": {"id": "call-notes-3"},
+                },
+            },
+            headers=_vapi_headers(),
+        )
+        assert resp.status_code == 200
+        mock_clear.assert_called_with("vapi-call-notes-3")
+
+
+class TestProjectTracking:
+    """Per-session project action tracking in scheduling tools."""
+
+    def test_track_and_retrieve(self):
+        from tools.scheduling import (
+            _session_projects,
+            _track_project_action,
+            clear_session_projects,
+            get_session_projects,
+        )
+
+        # Simulate tracking with a patched session_id
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = "vapi-test-call"
+            _track_project_action("90000149", "get_available_dates")
+            _track_project_action("90000149", "get_time_slots")
+            _track_project_action("90000116", "get_project_details")
+            # Duplicate should not be added
+            _track_project_action("90000149", "get_available_dates")
+
+        result = get_session_projects("vapi-test-call")
+        assert result == {
+            "90000149": ["get_available_dates", "get_time_slots"],
+            "90000116": ["get_project_details"],
+        }
+
+        clear_session_projects("vapi-test-call")
+        assert get_session_projects("vapi-test-call") == {}
+
+    def test_no_session_id_skips_tracking(self):
+        from tools.scheduling import _track_project_action, get_session_projects
+
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = ""
+            _track_project_action("90000149", "confirm_appointment")
+
+        # Nothing should be tracked
+        assert get_session_projects("") == {}
+
+
+class TestPostCallSummaryNotes:
+    """Integration test for post_call_summary_notes."""
+
+    @pytest.mark.asyncio
+    async def test_posts_note_per_project(self):
+        from tools.scheduling import (
+            clear_session_projects,
+            get_session_projects,
+            post_call_summary_notes,
+        )
+
+        # Pre-populate session projects
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = "vapi-test-notes"
+            from tools.scheduling import _track_project_action
+            _track_project_action("PROJ1", "get_available_dates")
+            _track_project_action("PROJ1", "confirm_appointment")
+            _track_project_action("PROJ2", "get_project_details")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await post_call_summary_notes(
+                session_id="vapi-test-notes",
+                bearer_token="tok-abc",
+                client_id="CL1",
+                customer_id="CUST1",
+                summary="Customer scheduled fence installation.",
+                duration_seconds=165,
+            )
+
+            # Should have posted to 2 projects
+            assert mock_client.post.call_count == 2
+
+            # Verify note content for first call
+            first_call_args = mock_client.post.call_args_list[0]
+            url = first_call_args[0][0] if first_call_args[0] else first_call_args[1].get("url", "")
+            payload = first_call_args[1].get("json", {})
+            note = payload.get("note", "")
+            assert "AI Scheduling Assistant (J)" in note
+            assert "2m 45s" in note
+            assert "Customer scheduled fence installation." in note
+            assert "PROJ1" in url or "PROJ2" in url
+
+        # Session should be cleaned up
+        assert get_session_projects("vapi-test-notes") == {}

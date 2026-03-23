@@ -110,6 +110,22 @@ def get_support_info(phone: str) -> dict:
     return {"support_number": "", "support_email": "", "client_name": "ProjectsForce"}
 
 
+def get_cached_auth(phone: str) -> dict | None:
+    """Return cached auth credentials for end-of-call note posting.
+
+    Returns dict with ``bearer_token``, ``client_id``, ``customer_id``
+    or None if not cached / expired.
+    """
+    cached = _get_cached_creds(phone)
+    if not cached:
+        return None
+    return {
+        "bearer_token": cached.get("bearer_token", ""),
+        "client_id": cached.get("client_id", ""),
+        "customer_id": cached.get("customer_id", cached.get("user_id", "")),
+    }
+
+
 # ── Phone normalization ───────────────────────────────────────────────────
 
 
