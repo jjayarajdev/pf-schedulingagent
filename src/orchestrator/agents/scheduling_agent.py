@@ -86,21 +86,17 @@ def create_scheduling_agent() -> BedrockLLMAgent:
         AgentTool(
             name="confirm_appointment",
             description=(
-                "REQUIRED to book an appointment. You MUST call this tool to actually schedule — "
+                "BOOKS the appointment in the system. You MUST call this tool to schedule — "
                 "the appointment is NOT booked until this tool returns success. "
-                "Never tell the user the appointment is confirmed without calling this tool first. "
-                "Pass confirmed=true after the user says yes."
+                "NEVER tell the user the appointment is confirmed without calling this tool first. "
+                "Ask the user to confirm BEFORE calling this tool. Once they say yes, call it immediately."
             ),
             properties={
                 "project_id": {"type": "string", "description": "The project ID"},
                 "date": {"type": "string", "description": "The date (YYYY-MM-DD)"},
                 "time": {"type": "string", "description": "The time slot (e.g. '08:00:00')"},
-                "confirmed": {
-                    "type": "boolean",
-                    "description": "MUST be true to actually book. Set to true after user confirms.",
-                },
             },
-            required=["project_id", "date", "time", "confirmed"],
+            required=["project_id", "date", "time"],
             func=confirm_appointment,
         ),
         AgentTool(

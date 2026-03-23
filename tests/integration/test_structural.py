@@ -285,13 +285,8 @@ class TestScheduleCancelFlow:
 
         logger.info("SCHEDULE: project=%s date=%s time=%s", pid, first_date, first_slot)
 
-        # Confirm without confirmed=True -> ask
-        ask_result = await confirm_appointment(pid, first_date, first_slot, confirmed=False)
-        assert "please confirm" in ask_result.lower()
-        logger.info("Confirmation prompt: %s", ask_result[:150])
-
-        # Confirm with confirmed=True -> schedule
-        confirm_result = await confirm_appointment(pid, first_date, first_slot, confirmed=True)
+        # Confirm -> schedule
+        confirm_result = await confirm_appointment(pid, first_date, first_slot)
         logger.info("Schedule result: %s", confirm_result[:200])
         assert "confirmed" in confirm_result.lower() or "scheduled" in confirm_result.lower()
 
@@ -342,7 +337,7 @@ class TestRescheduleFlow:
             if isinstance(first_slot, dict):
                 first_slot = first_slot.get("time", first_slot.get("startTime", ""))
 
-            confirm_result = await confirm_appointment(pid, first_date, first_slot, confirmed=True)
+            confirm_result = await confirm_appointment(pid, first_date, first_slot)
             if "confirmed" in confirm_result.lower() or "scheduled" in confirm_result.lower():
                 return {"id": pid, "date": first_date, "time": first_slot}
         return None

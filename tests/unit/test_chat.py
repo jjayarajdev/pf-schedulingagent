@@ -125,30 +125,6 @@ class TestChat:
         assert body["agenticscheduler_http_status_code"] == 500
 
     @patch("channels.chat.get_orchestrator")
-    def test_confirmation_detected(self, mock_get_orch, client):
-        """Confirmation prompt from tool is detected and surfaced as structured fields."""
-        confirm_text = (
-            "Please confirm: Schedule appointment for project 12345 "
-            "on 2026-03-20 at 9:00 AM? "
-            "(Call this tool again with confirmed=true to proceed)"
-        )
-        mock_response = MagicMock()
-        mock_response.output = confirm_text
-        mock_response.metadata = MagicMock()
-        mock_response.metadata.agent_name = "Scheduling Agent"
-
-        mock_orch = AsyncMock()
-        mock_orch.route_request = AsyncMock(return_value=mock_response)
-        mock_get_orch.return_value = mock_orch
-
-        resp = client.post("/chat", json={"message": "Yes schedule it"})
-        body = resp.json()
-        assert body["confirmation_required"] is True
-        assert body["pending_action"]["project_id"] == "12345"
-        assert body["pending_action"]["date"] == "2026-03-20"
-        assert body["pending_action"]["time"] == "9:00 AM"
-
-    @patch("channels.chat.get_orchestrator")
     def test_auth_expired_detected(self, mock_get_orch, client):
         """401 from PF API detected in response text → pf_http_status_code=401."""
         mock_response = MagicMock()

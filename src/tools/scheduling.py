@@ -737,17 +737,10 @@ async def get_time_slots(project_id: str, date: str) -> str:
     return json.dumps(result, indent=2)
 
 
-async def confirm_appointment(
-    project_id: str, date: str, time: str, confirmed: bool = False
-) -> str:
-    """Confirm/schedule an appointment. Requires explicit user confirmation."""
+async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -> str:
+    """Schedule an appointment. Only call AFTER the customer has confirmed."""
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "confirm_appointment")
-    if not confirmed:
-        return (
-            f"Please confirm: Schedule appointment for project {project_id} "
-            f"on {date} at {time}? (Call this tool again with confirmed=true to proceed)"
-        )
 
     # Validate status from cache (no extra API call)
     project = _get_cached_project(project_id)

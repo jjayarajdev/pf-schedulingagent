@@ -349,18 +349,14 @@ class TestGetTimeSlots:
 
 
 class TestConfirmAppointment:
-    async def test_requires_confirmation(self):
-        result = await confirm_appointment("123", "2026-03-15", "9:00 AM", confirmed=False)
-        assert "confirm" in result.lower()
-
-    async def test_confirmed_schedules(self, mock_httpx_client, mock_httpx_response):
+    async def test_confirm_schedules(self, mock_httpx_client, mock_httpx_response):
         details_resp = mock_httpx_response(
             200,
             {"data": [{"project_project_id": "123", "status_info_status": "New", "store_info_store_name": "", "store_info_store_number": ""}]},
         )
         schedule_resp = mock_httpx_response(200, {"confirmationNumber": "CONF-789"})
         with mock_httpx_client(responses=[details_resp, schedule_resp]):
-            result = await confirm_appointment("123", "2026-03-15", "9:00 AM", confirmed=True)
+            result = await confirm_appointment("123", "2026-03-15", "9:00 AM")
         assert "confirmed" in result.lower()
         assert "123" in result
 

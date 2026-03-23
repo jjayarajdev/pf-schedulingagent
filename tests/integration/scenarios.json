@@ -176,10 +176,10 @@
     "id": "schedule_confirm_prompt",
     "question": "Schedule project {schedulable_project_id} for {first_available_date} at {first_time_slot} please",
     "tool": "confirm_appointment",
-    "params": {"project_id": "{schedulable_project_id}", "date": "{first_available_date}", "time": "{first_time_slot}", "confirmed": false},
+    "params": {"project_id": "{schedulable_project_id}", "date": "{first_available_date}", "time": "{first_time_slot}"},
     "depends_on": "time_slots",
     "expect_json": false,
-    "expect_contains": "confirm"
+    "expect_contains": "confirmed"
   },
   {
     "id": "all_info_incorrect",
