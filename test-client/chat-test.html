@@ -399,6 +399,40 @@
             color: #333;
         }
         .address-pin { color: #ef5350; font-size: 18px; }
+        .address-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #e0e0e0;
+        }
+        .address-card-street {
+            font-size: 15px;
+            font-weight: 600;
+            color: #1a1a2e;
+            margin-top: 4px;
+        }
+        .address-card-city {
+            font-size: 13px;
+            color: #555;
+            margin-top: 2px;
+        }
+        .address-card-project {
+            font-size: 11px;
+            color: #888;
+            margin-top: 8px;
+        }
+        .address-updated {
+            border-left: 3px solid #43a047;
+        }
+        .address-old {
+            text-decoration: line-through;
+            color: #999;
+            font-size: 13px;
+        }
+        .address-new {
+            color: #2e7d32;
+            font-weight: 600;
+        }
 
         /* Weather Cards */
         .weather-grid {
@@ -1865,6 +1899,48 @@
                 html += '</div>';
             }
 
+            html += '</div></div>';
+            return html;
+        }
+
+        // ── Installation Address ─────────────────────────────
+        if (data.address && (data.address.address1 || data.address.city)) {
+            const a = data.address;
+            const street = a.address1 || '';
+            const cityLine = [a.city, a.state, a.zipcode].filter(Boolean).join(', ');
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CD;</span> Installation Address</div>';
+            html += '<div class="address-card">';
+            if (street) html += '<div class="address-card-street">' + escapeHtml(street) + '</div>';
+            if (cityLine) html += '<div class="address-card-city">' + escapeHtml(cityLine) + '</div>';
+            if (data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_id)) + '</div>';
+            html += '</div></div>';
+            return html;
+        }
+        if ((data.address1 || data.city) && data.project_id) {
+            const street = data.address1 || '';
+            const cityLine = [data.city, data.state, data.zipcode].filter(Boolean).join(', ');
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CD;</span> Installation Address</div>';
+            html += '<div class="address-card">';
+            if (street) html += '<div class="address-card-street">' + escapeHtml(street) + '</div>';
+            if (cityLine) html += '<div class="address-card-city">' + escapeHtml(cityLine) + '</div>';
+            html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_id)) + '</div>';
+            html += '</div></div>';
+            return html;
+        }
+
+        // ── Updated Address ─────────────────────────────────
+        if (data.updated_address) {
+            const a = data.updated_address;
+            const street = a.address1 || '';
+            const cityLine = [a.city, a.state, a.zipcode].filter(Boolean).join(', ');
+            html += '<div class="rich-component">';
+            html += '<div class="rich-header"><span class="rich-header-icon">&#x2705;</span> Address Updated</div>';
+            html += '<div class="address-card address-updated">';
+            if (street) html += '<div class="address-card-street address-new">' + escapeHtml(street) + '</div>';
+            if (cityLine) html += '<div class="address-card-city address-new">' + escapeHtml(cityLine) + '</div>';
+            if (data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_id)) + '</div>';
             html += '</div></div>';
             return html;
         }

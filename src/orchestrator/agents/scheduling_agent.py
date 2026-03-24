@@ -13,17 +13,19 @@ from tools.scheduling import (
     confirm_appointment,
     get_available_dates,
     get_business_hours,
+    get_installation_address,
     get_project_details,
     get_project_weather,
     get_time_slots,
     list_notes,
     list_projects,
     reschedule_appointment,
+    update_installation_address,
 )
 
 
 def create_scheduling_agent() -> BedrockLLMAgent:
-    """Create the Scheduling Agent with 10 tool bindings."""
+    """Create the Scheduling Agent with 12 tool bindings."""
     settings = get_settings()
 
     tools = [
@@ -158,6 +160,33 @@ def create_scheduling_agent() -> BedrockLLMAgent:
             },
             required=[],
             func=get_project_weather,
+        ),
+        AgentTool(
+            name="get_installation_address",
+            description="Get the installation address for a project. Returns address1, city, state, zipcode.",
+            properties={
+                "project_id": {"type": "string", "description": "The project ID"},
+            },
+            required=["project_id"],
+            func=get_installation_address,
+        ),
+        AgentTool(
+            name="update_installation_address",
+            description=(
+                "Update the installation address for a project. "
+                "This feature is not yet available — the tool will return instructions "
+                "to call the office. Always call this tool when the user asks to update "
+                "their address so they get the office phone number."
+            ),
+            properties={
+                "project_id": {"type": "string", "description": "The project ID"},
+                "address1": {"type": "string", "description": "Street address"},
+                "city": {"type": "string", "description": "City"},
+                "state": {"type": "string", "description": "State abbreviation"},
+                "zipcode": {"type": "string", "description": "ZIP code"},
+            },
+            required=["project_id", "address1", "city"],
+            func=update_installation_address,
         ),
     ]
 

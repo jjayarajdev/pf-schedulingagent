@@ -7,6 +7,7 @@ import pytest
 
 from tools.scheduling import (
     _build_intelligent_fallback,
+    _extract_project_minimal,
     _get_reschedule_slots,
     _match_scheduled_date,
     _match_scheduled_month,
@@ -15,11 +16,13 @@ from tools.scheduling import (
     confirm_appointment,
     get_available_dates,
     get_business_hours,
+    get_installation_address,
     get_project_details,
     get_time_slots,
     list_notes,
     list_projects,
     reschedule_appointment,
+    update_installation_address,
 )
 
 
@@ -514,3 +517,101 @@ class TestMatchScheduledDate:
 
     def test_with_extra_time_info(self):
         assert _match_scheduled_date("2026-03-15T08:00:00", "2026-03-15") is True
+
+
+class TestExtractProjectMinimalAddressId:
+    def test_address_id_extracted(self):
+        """address_id should be included in extracted project address."""
+        item = {
+            "project_project_id": "123",
+            "project_project_number": "P-001",
+            "status_info_status": "New",
+            "project_installation_address_id": "777",
+            "installation_address_address1": "123 Main St",
+            "installation_address_city": "Springfield",
+            "installation_address_state": "IL",
+            "installation_address_zipcode": "62701",
+            "store_info_store_name": "",
+            "store_info_store_number": "",
+        }
+        result = _extract_project_minimal(item)
+        assert result["address"]["address_id"] == "777"
+        assert result["address"]["address1"] == "123 Main St"
+
+    def test_address_id_missing(self):
+        """When project_installation_address_id is absent, address_id is omitted."""
+        item = {
+            "project_project_id": "123",
+            "status_info_status": "New",
+            "installation_address_city": "Denver",
+            "store_info_store_name": "",
+            "store_info_store_number": "",
+        }
+        result = _extract_project_minimal(item)
+        assert "address_id" not in result["address"]
+        assert result["address"]["city"] == "Denver"
+
+
+class TestGetInstallationAddress:
+    async def test_returns_cached_address(self):
+        """Returns address from project cache."""
+        from datetime import datetime, timezone
+        from tools.scheduling import _projects_cache
+
+        _projects_cache["test-customer-456"] = {
+            "projects": [
+                {
+                    "id": "123",
+                    "status": "New",
+                    "address": {"address_id": "777", "address1": "456 Oak Ave", "city": "Denver", "state": "CO", "zipcode": "80202"},
+                }
+            ],
+            "loaded_at": datetime.now(timezone.utc),
+        }
+
+        result = await get_installation_address("123")
+        data = json.loads(result)
+        assert data["project_id"] == "123"
+        assert data["address"]["city"] == "Denver"
+        assert data["address"]["address_id"] == "777"
+
+    async def test_cache_without_address(self):
+        """Project in cache but no address returns error."""
+        from datetime import datetime, timezone
+        from tools.scheduling import _projects_cache
+
+        _projects_cache["test-customer-456"] = {
+            "projects": [
+                {"id": "123", "status": "New", "address": {}},
+            ],
+            "loaded_at": datetime.now(timezone.utc),
+        }
+
+        result = await get_installation_address("123")
+        assert "Could not retrieve" in result
+
+    async def test_no_cache(self):
+        """No cached project returns error string."""
+        result = await get_installation_address("999")
+        assert "Could not retrieve" in result
+
+
+class TestUpdateInstallationAddress:
+    async def test_returns_feature_unavailable(self):
+        """Update returns feature unavailable message directing user to call office."""
+        result = await update_installation_address(
+            "123", address1="123 New St", city="New City",
+        )
+        data = json.loads(result)
+        assert data["project_id"] == "123"
+        assert data["feature_unavailable"] is True
+        assert "not available" in data["message"].lower()
+        assert "call" in data["message"].lower()
+
+    async def test_sets_confirm_flag(self):
+        """update_installation_address sets the confirm flag for guardrail."""
+        from tools.scheduling import was_confirm_called, reset_confirm_flag
+
+        reset_confirm_flag()
+        await update_installation_address("123", address1="Test", city="City")
+        assert was_confirm_called() is True

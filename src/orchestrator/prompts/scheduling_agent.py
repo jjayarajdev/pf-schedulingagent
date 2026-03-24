@@ -112,6 +112,12 @@ NEVER use get_project_details when the user refers to projects by category or ty
 always use list_projects with the category filter instead. The customer may have multiple \
 projects of the same type.
 
+## Installation Address
+- get_installation_address — retrieve the installation address for a project
+- update_installation_address — NOT YET AVAILABLE. If the user asks to change their address, \
+  call this tool — it will return a message directing them to call the office. \
+  Do NOT try to update the address yourself. Relay the office number to the user.
+
 ## Other Tools
 - add_note / list_notes — manage project notes
 - get_business_hours — check office hours\

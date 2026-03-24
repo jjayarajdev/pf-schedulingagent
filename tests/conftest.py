@@ -117,9 +117,11 @@ def mock_httpx_client(mock_httpx_response):
         if responses:
             mock_client.get = AsyncMock(side_effect=responses)
             mock_client.post = AsyncMock(side_effect=responses)
+            mock_client.put = AsyncMock(side_effect=responses)
         else:
             mock_client.get = AsyncMock(return_value=response)
             mock_client.post = AsyncMock(return_value=response)
+            mock_client.put = AsyncMock(return_value=response)
 
         mock_context.__aenter__ = AsyncMock(return_value=mock_client)
         mock_context.__aexit__ = AsyncMock(return_value=False)

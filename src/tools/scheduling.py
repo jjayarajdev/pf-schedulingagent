@@ -206,6 +206,7 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
         }
 
     address = {
+        "address_id": _safe_get(item, "project_installation_address_id", default=""),
         "address1": _safe_get(item, "installation_address_address1", default=""),
         "city": _safe_get(item, "installation_address_city", default=""),
         "state": _safe_get(item, "installation_address_state", default=""),
@@ -1246,3 +1247,207 @@ async def get_project_weather(project_id: str = "") -> str:
     except (json.JSONDecodeError, TypeError):
         # Fallback for non-JSON weather responses (error messages)
         return result
+
+
+# ---------------------------------------------------------------------------
+#  Installation address tools
+# ---------------------------------------------------------------------------
+
+async def get_installation_address(project_id: str, **kwargs) -> str:
+    """Get the installation address for a project.
+
+    Returns address details including ``address_id`` (needed for updates).
+    Currently uses cached address from the dashboard API.
+
+    TODO: uncomment API call when /authentication/get-installation-address is ready.
+    """
+    project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "get_installation_address")
+
+    # --- API call commented out for now ---
+    # client_id = AuthContext.get_client_id()
+    # base_url = get_pf_api_base()
+    # url = f"{base_url}/authentication/get-installation-address"
+    # headers = build_headers()
+    # body = {"client_id": client_id, "project_ids": [int(project_id)]}
+    #
+    # try:
+    #     async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+    #         log_curl("POST", url, headers, body)
+    #         resp = await client.post(url, headers=headers, json=body)
+    #         log_response(resp, "get-installation-address")
+    #         resp.raise_for_status()
+    #
+    #         data = resp.json()
+    #         # API returns list of addresses; find the one for our project
+    #         addresses = data if isinstance(data, list) else data.get("data", [data])
+    #         addr_entry = None
+    #         for entry in addresses:
+    #             if str(entry.get("project_id", "")) == str(project_id):
+    #                 addr_entry = entry
+    #                 break
+    #         if not addr_entry and addresses:
+    #             addr_entry = addresses[0]
+    #
+    #         if addr_entry:
+    #             # API nests address fields under an "address" key
+    #             addr_data = addr_entry.get("address", addr_entry)
+    #             address = {
+    #                 "address_id": str(
+    #                     addr_data.get("address_id", "")
+    #                     or addr_data.get("id", "")
+    #                     or addr_entry.get("id", "")
+    #                 ),
+    #                 "address1": addr_data.get("address1", ""),
+    #                 "city": addr_data.get("city", ""),
+    #                 "state": addr_data.get("state", ""),
+    #                 "zipcode": addr_data.get("zipcode", ""),
+    #             }
+    #             # Cache address_id on the project for subsequent update calls
+    #             cached = _get_cached_project(project_id)
+    #             if cached and cached.get("address"):
+    #                 cached["address"]["address_id"] = address["address_id"]
+    #
+    #             return json.dumps({
+    #                 "project_id": project_id,
+    #                 "address": {k: v for k, v in address.items() if v},
+    #                 "message": f"Installation address for project {project_id}",
+    #             })
+    #
+    #         # No matching address in response — fall through to cache
+    #         logger.warning("No address in API response for project %s", project_id)
+    #
+    # except Exception:
+    #     logger.exception("get-installation-address API failed for project %s", project_id)
+
+    # Use cached address from dashboard
+    cached = _get_cached_project(project_id)
+    if cached and cached.get("address"):
+        return json.dumps({
+            "project_id": project_id,
+            "address": cached["address"],
+            "message": f"Installation address for project {project_id}",
+        })
+
+    return f"Could not retrieve the installation address for project {project_id}."
+
+
+async def update_installation_address(
+    project_id: str,
+    address1: str,
+    city: str,
+    state: str = "",
+    zipcode: str = "",
+    **kwargs,
+) -> str:
+    """Update the installation address for a project.
+
+    Currently returns a simulated success response.
+
+    TODO: uncomment API call when /authentication/update-installation-address is ready.
+    """
+    _confirm_called_in_request.set(True)
+    project_id = _resolve_project_id(project_id)
+    _track_project_action(project_id, "update_installation_address")
+
+    # --- API call commented out for now ---
+    # # Get address_id from cache
+    # cached = _get_cached_project(project_id)
+    # address_id = ""
+    # if cached and cached.get("address"):
+    #     address_id = str(cached["address"].get("address_id", ""))
+    #
+    # # If no address_id cached, fetch it via the get API
+    # if not address_id:
+    #     logger.info("No cached address_id for project %s — fetching", project_id)
+    #     get_result = await get_installation_address(project_id)
+    #     try:
+    #         get_data = json.loads(get_result)
+    #         address_id = str(get_data.get("address", {}).get("address_id", ""))
+    #     except (json.JSONDecodeError, TypeError):
+    #         pass
+    #
+    # if not address_id:
+    #     return (
+    #         f"Cannot update address for project {project_id}: "
+    #         "no address_id found. The project may not have an address on file."
+    #     )
+    #
+    # client_id = AuthContext.get_client_id()
+    # base_url = get_pf_api_base()
+    # url = f"{base_url}/authentication/update-installation-address"
+    # headers = build_headers()
+    # body: dict[str, Any] = {
+    #     "address_id": int(address_id),
+    #     "client_id": client_id,
+    #     "address1": address1,
+    #     "city": city,
+    # }
+    # if state:
+    #     body["state"] = state
+    # if zipcode:
+    #     body["zipcode"] = zipcode
+    #
+    # try:
+    #     async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+    #         log_curl("PUT", url, headers, body)
+    #         resp = await client.put(url, headers=headers, json=body)
+    #         log_response(resp, "update-installation-address")
+    #         resp.raise_for_status()
+    #
+    #         _invalidate_projects()
+    #         updated_address = {
+    #             "address1": address1,
+    #             "city": city,
+    #             "state": state,
+    #             "zipcode": zipcode,
+    #         }
+    #         return json.dumps({
+    #             "project_id": project_id,
+    #             "updated_address": {k: v for k, v in updated_address.items() if v},
+    #             "message": f"Installation address updated for project {project_id}.",
+    #         })
+    # except httpx.HTTPStatusError as exc:
+    #     logger.error(
+    #         "update-installation-address failed: %d %s",
+    #         exc.response.status_code,
+    #         exc.response.text[:500],
+    #     )
+    #     return (
+    #         f"Failed to update the address for project {project_id}. "
+    #         "Please try again or contact support."
+    #     )
+    # except Exception:
+    #     logger.exception("update-installation-address error for project %s", project_id)
+    #     return (
+    #         f"Failed to update the address for project {project_id}. "
+    #         "Please try again or contact support."
+    #     )
+
+    # Feature not yet available — direct user to call the office
+    logger.info("update_installation_address (not available) for project %s", project_id)
+
+    # Try to get support number from phone auth cache (Vapi channel)
+    support_number = ""
+    try:
+        from auth.phone_auth import get_support_info
+        tenant_phone = AuthContext.get_tenant_phone()
+        if tenant_phone:
+            info = get_support_info(tenant_phone)
+            support_number = info.get("support_number", "")
+    except Exception:
+        pass
+
+    if support_number:
+        contact_msg = f"Please call the office at {support_number} to update your address."
+    else:
+        contact_msg = "Please contact your local office to update your address."
+
+    return json.dumps({
+        "project_id": project_id,
+        "feature_unavailable": True,
+        "message": (
+            "Updating the installation address through the bot is not available yet. "
+            + contact_msg
+        ),
+    })

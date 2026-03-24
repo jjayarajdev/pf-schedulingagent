@@ -217,6 +217,10 @@ _BOOKING_CONFIRMATION_PATTERNS = [
     "you're all set",
     "your appointment is confirmed",
     "booking confirmed",
+    "address has been updated",
+    "address updated successfully",
+    "address has been changed",
+    "installation address has been updated",
 ]
 
 # Patterns that indicate the LLM fabricated a scheduling failure instead of calling the tool
