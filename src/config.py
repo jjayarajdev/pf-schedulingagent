@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 _PF_API_URLS = {
-    "dev": "https://api-cx-portal.apps.projectsforce.com",
+    "dev": "https://api-cx-portal.dev.projectsforce.com",
     "staging": "https://api-cx-portal.staging.projectsforce.com",
     "prod": "https://api-cx-portal.apps.projectsforce.com",
 }
