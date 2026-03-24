@@ -25,7 +25,6 @@ from auth.phone_auth import (
     authenticate_store,
     get_cached_auth,
     get_or_authenticate,
-    get_support_info,
     normalize_phone,
 )
 from channels.conversation_log import log_conversation
@@ -140,12 +139,14 @@ async def _handle_assistant_request(body: dict) -> dict:
     is_store_caller = False
     first_name = ""
     client_name = "ProjectsForce"
+    support_number = ""
     if from_phone:
         try:
             creds = await get_or_authenticate(from_phone, to_phone)
             user_name = creds.get("user_name", "")
             first_name = user_name.split()[0] if user_name and user_name.strip() else ""
             client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
+            support_number = creds.get("support_number", "")
         except AuthenticationError:
             # Auth failure = potential store caller
             logger.info("Store caller detected (call_id=%s)", call_id)
@@ -167,7 +168,7 @@ async def _handle_assistant_request(body: dict) -> dict:
         client_name,
     )
 
-    return {"assistant": _build_assistant_config(greeting, webhook_secret)}
+    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number)}
 
 
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
@@ -191,7 +192,60 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
     )
 
 
-def _build_assistant_config(first_message: str, server_secret: str = "") -> dict:
+def _transfer_call_tool(support_number: str) -> list[dict]:
+    """Build a Vapi ``transferCall`` tool definition for warm transfer with summary.
+
+    Returns a list with one tool dict if ``support_number`` is provided,
+    or an empty list (so it can be unpacked with ``*`` into the tools array).
+    """
+    if not support_number:
+        return []
+
+    # Normalize to E.164: strip non-digits, add +1 if 10-digit US number
+    digits = re.sub(r"\D", "", support_number)
+    if len(digits) == 10:
+        e164 = f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        e164 = f"+{digits}"
+    else:
+        e164 = f"+{digits}"
+
+    return [
+        {
+            "type": "transferCall",
+            "destinations": [
+                {
+                    "type": "number",
+                    "number": e164,
+                    "message": "I'm transferring you to our support team now. Please stay on the line.",
+                    "transferPlan": {
+                        "mode": "warm-transfer-with-summary",
+                        "summaryPlan": {
+                            "enabled": True,
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Summarize the caller's conversation so far. Include: "
+                                        "who they are (name if known), what projects they discussed, "
+                                        "what they were trying to do, and why they need a human. "
+                                        "Keep it under 30 seconds of spoken text."
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "Transcript:\n\n{{transcript}}",
+                                },
+                            ],
+                        },
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def _build_assistant_config(first_message: str, server_secret: str = "", support_number: str = "") -> dict:
     """Build the full Vapi assistant config returned on ``assistant-request``.
 
     This mirrors the assistant settings previously stored in Vapi's dashboard
@@ -232,8 +286,8 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
                         "Keep it conversational — you are on a phone call.\n"
                         "5. For multi-step flows (scheduling, rescheduling), call ask_scheduling_bot "
                         "for EVERY step. The bot maintains conversation context.\n"
-                        '6. If the user asks for a support number or to speak to someone, '
-                        'call ask_scheduling_bot with action="send_support_sms".\n'
+                        "6. If the user asks to speak to a person, transfer the call, or wants human support, "
+                        "use the transferCall tool to connect them. Do NOT read out a phone number.\n"
                         "7. Only handle basic greetings and goodbyes yourself. "
                         "Everything else goes through ask_scheduling_bot.\n"
                         "8. Keep your spoken responses concise — this is a phone call, not a text chat. "
@@ -277,15 +331,6 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
                                         "— do not rephrase or add context."
                                     ),
                                 },
-                                "action": {
-                                    "type": "string",
-                                    "enum": ["ask", "send_support_sms"],
-                                    "description": (
-                                        'Use "ask" for all normal questions (default). '
-                                        'Use "send_support_sms" only when user explicitly asks '
-                                        "for the office phone number or to speak to a human."
-                                    ),
-                                },
                             },
                         },
                     },
@@ -306,7 +351,8 @@ def _build_assistant_config(first_message: str, server_secret: str = "") -> dict
                             "content": "I had some trouble with that. Could you try asking again?",
                         },
                     ],
-                }
+                },
+                *(_transfer_call_tool(support_number)),
             ],
         },
         "transcriber": {
@@ -682,11 +728,6 @@ async def _process_tool(
 ) -> dict:
     """Route a tool invocation to the orchestrator and return a Vapi result."""
     if tool_name == "ask_scheduling_bot":
-        # Handle support number request directly — no need for orchestrator
-        action = tool_params.get("action", "")
-        if action == "send_support_sms":
-            return _handle_support_request(user_id, tool_call_id)
-
         question = tool_params.get("question", "")
         if not question:
             logger.warning("Empty question in %s (call_id=%s)", tool_name, call_id)
@@ -922,54 +963,6 @@ def _resolve_to_phone(call_data: dict) -> str:
 
     # 3. Legacy env var fallback
     return get_settings().vapi_phone_number
-
-
-def _handle_support_request(user_id: str, tool_call_id: str) -> dict:
-    """Return the tenant's support phone number from cached credentials."""
-    phone = normalize_phone(user_id)
-    info = get_support_info(phone)
-    support_number = info.get("support_number", "")
-    support_email = info.get("support_email", "")
-    client_name = info.get("client_name", "ProjectsForce")
-
-    if support_number:
-        # Format phone number for voice readout (digit by digit with pauses)
-        digits = "".join(ch for ch in support_number if ch.isdigit())
-        if len(digits) == 10:
-            voice_number = (
-                f"{_digit_word(digits[0])}, {_digit_word(digits[1])}, {_digit_word(digits[2])}... "
-                f"{_digit_word(digits[3])}, {_digit_word(digits[4])}, {_digit_word(digits[5])}... "
-                f"{_digit_word(digits[6])}, {_digit_word(digits[7])}, {_digit_word(digits[8])}, {_digit_word(digits[9])}"
-            )
-        elif len(digits) == 11 and digits.startswith("1"):
-            d = digits[1:]
-            voice_number = (
-                f"{_digit_word(d[0])}, {_digit_word(d[1])}, {_digit_word(d[2])}... "
-                f"{_digit_word(d[3])}, {_digit_word(d[4])}, {_digit_word(d[5])}... "
-                f"{_digit_word(d[6])}, {_digit_word(d[7])}, {_digit_word(d[8])}, {_digit_word(d[9])}"
-            )
-        else:
-            voice_number = support_number
-
-        msg = f"You can reach {client_name} at {voice_number}."
-        if support_email:
-            msg += f" You can also email them at {support_email}."
-    else:
-        msg = (
-            "I don't have the office number on file right now. "
-            "Please check your project documents or the ProjectsForce app for contact information."
-        )
-
-    logger.info("Support request: number=%s email=%s", support_number[-4:] if support_number else "none", support_email or "none")
-    return _build_tool_result(msg, tool_call_id)
-
-
-_DIGIT_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
-
-
-def _digit_word(d: str) -> str:
-    """Convert a single digit character to its word form."""
-    return _DIGIT_WORDS[int(d)] if d.isdigit() else d
 
 
 def _build_tool_result(text: str, tool_call_id: str = "") -> dict:

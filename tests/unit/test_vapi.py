@@ -928,3 +928,84 @@ class TestPostCallSummaryNotes:
 
         # Session should be cleaned up
         assert get_session_projects("vapi-test-notes") == {}
+
+
+class TestTransferCallTool:
+    """transferCall tool injection for warm transfer with summary."""
+
+    def test_transfer_tool_with_10_digit_number(self):
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("5106269299")
+        assert len(result) == 1
+        tool = result[0]
+        assert tool["type"] == "transferCall"
+        dest = tool["destinations"][0]
+        assert dest["type"] == "number"
+        assert dest["number"] == "+15106269299"
+        assert dest["transferPlan"]["mode"] == "warm-transfer-with-summary"
+        assert dest["transferPlan"]["summaryPlan"]["enabled"] is True
+
+    def test_transfer_tool_with_formatted_number(self):
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("(510) 626-9299")
+        dest = result[0]["destinations"][0]
+        assert dest["number"] == "+15106269299"
+
+    def test_transfer_tool_with_11_digit_number(self):
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("15106269299")
+        dest = result[0]["destinations"][0]
+        assert dest["number"] == "+15106269299"
+
+    def test_transfer_tool_empty_number_returns_empty(self):
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("")
+        assert result == []
+
+    def test_transfer_tool_summary_prompt_content(self):
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("5106269299")
+        messages = result[0]["destinations"][0]["transferPlan"]["summaryPlan"]["messages"]
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert "Summarize" in messages[0]["content"]
+        assert messages[1]["role"] == "user"
+        assert "{{transcript}}" in messages[1]["content"]
+
+    def test_assistant_config_includes_transfer_tool(self):
+        from channels.vapi import _build_assistant_config
+
+        config = _build_assistant_config("Hello!", "secret", "3157613122")
+        tools = config["model"]["tools"]
+        transfer_tools = [t for t in tools if t.get("type") == "transferCall"]
+        assert len(transfer_tools) == 1
+        assert transfer_tools[0]["destinations"][0]["number"] == "+13157613122"
+
+    def test_assistant_config_no_transfer_without_number(self):
+        from channels.vapi import _build_assistant_config
+
+        config = _build_assistant_config("Hello!", "secret", "")
+        tools = config["model"]["tools"]
+        transfer_tools = [t for t in tools if t.get("type") == "transferCall"]
+        assert len(transfer_tools) == 0
+
+    def test_send_support_sms_action_removed(self):
+        from channels.vapi import _build_assistant_config
+
+        config = _build_assistant_config("Hello!", "secret", "5551234567")
+        ask_tool = config["model"]["tools"][0]
+        props = ask_tool["function"]["parameters"]["properties"]
+        assert "action" not in props
+
+    def test_system_prompt_uses_transfer_call(self):
+        from channels.vapi import _build_assistant_config
+
+        config = _build_assistant_config("Hello!", "secret", "5551234567")
+        prompt = config["model"]["messages"][0]["content"]
+        assert "transferCall" in prompt
+        assert "send_support_sms" not in prompt
