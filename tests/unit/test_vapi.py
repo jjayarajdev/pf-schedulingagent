@@ -930,8 +930,27 @@ class TestPostCallSummaryNotes:
         assert get_session_projects("vapi-test-notes") == {}
 
 
+class TestNormalizeE164:
+    """E.164 phone number normalization."""
+
+    def test_10_digit_number(self):
+        from channels.vapi import _normalize_e164
+
+        assert _normalize_e164("5106269299") == "+15106269299"
+
+    def test_formatted_number(self):
+        from channels.vapi import _normalize_e164
+
+        assert _normalize_e164("(510) 626-9299") == "+15106269299"
+
+    def test_11_digit_with_leading_1(self):
+        from channels.vapi import _normalize_e164
+
+        assert _normalize_e164("15106269299") == "+15106269299"
+
+
 class TestTransferCallTool:
-    """transferCall tool injection for warm transfer with summary."""
+    """transferCall tool injection for warm transfer (experimental mode)."""
 
     def test_transfer_tool_with_10_digit_number(self):
         from channels.vapi import _transfer_call_tool
@@ -943,8 +962,8 @@ class TestTransferCallTool:
         dest = tool["destinations"][0]
         assert dest["type"] == "number"
         assert dest["number"] == "+15106269299"
-        assert dest["transferPlan"]["mode"] == "warm-transfer-with-summary"
-        assert dest["transferPlan"]["summaryPlan"]["enabled"] is True
+        assert dest["transferPlan"]["mode"] == "warm-transfer-experimental"
+        assert "transferAssistant" in dest["transferPlan"]
 
     def test_transfer_tool_with_formatted_number(self):
         from channels.vapi import _transfer_call_tool
@@ -966,16 +985,36 @@ class TestTransferCallTool:
         result = _transfer_call_tool("")
         assert result == []
 
-    def test_transfer_tool_summary_prompt_content(self):
+    def test_transfer_assistant_config(self):
+        """Transfer assistant should have system prompt, tools, and settings."""
         from channels.vapi import _transfer_call_tool
 
         result = _transfer_call_tool("5106269299")
-        messages = result[0]["destinations"][0]["transferPlan"]["summaryPlan"]["messages"]
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert "Summarize" in messages[0]["content"]
-        assert messages[1]["role"] == "user"
-        assert "{{transcript}}" in messages[1]["content"]
+        assistant = result[0]["destinations"][0]["transferPlan"]["transferAssistant"]
+        assert assistant["firstMessageMode"] == "assistant-speaks-first"
+        assert assistant["maxDurationSeconds"] == 120
+        assert "ProjectsForce" in assistant["firstMessage"]
+
+        # System prompt instructs the assistant to summarize
+        model = assistant["model"]
+        system_msg = model["messages"][0]
+        assert system_msg["role"] == "system"
+        assert "summarize" in system_msg["content"].lower()
+
+        # Has transferSuccessful and transferCancel tools
+        tool_types = {t["type"] for t in model["tools"]}
+        assert "transferSuccessful" in tool_types
+        assert "transferCancel" in tool_types
+
+    def test_transfer_tool_caller_messages(self):
+        """Caller should hear request-start and request-failed messages."""
+        from channels.vapi import _transfer_call_tool
+
+        result = _transfer_call_tool("5106269299")
+        messages = result[0]["messages"]
+        msg_types = {m["type"] for m in messages}
+        assert "request-start" in msg_types
+        assert "request-failed" in msg_types
 
     def test_assistant_config_includes_transfer_tool(self):
         from channels.vapi import _build_assistant_config

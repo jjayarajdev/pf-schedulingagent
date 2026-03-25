@@ -192,8 +192,23 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
     )
 
 
+def _normalize_e164(phone: str) -> str:
+    """Normalize a phone number to E.164 format (+1XXXXXXXXXX)."""
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+
 def _transfer_call_tool(support_number: str) -> list[dict]:
-    """Build a Vapi ``transferCall`` tool definition for warm transfer with summary.
+    """Build a Vapi ``transferCall`` tool for warm transfer (experimental mode).
+
+    Uses ``warm-transfer-experimental`` with a dedicated transfer assistant
+    that speaks a conversation summary to the support agent before connecting
+    the caller.  This mode supports Vapi-native phone numbers (no Twilio
+    requirement).
 
     Returns a list with one tool dict if ``support_number`` is provided,
     or an empty list (so it can be unpacked with ``*`` into the tools array).
@@ -201,42 +216,93 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
     if not support_number:
         return []
 
-    # Normalize to E.164: strip non-digits, add +1 if 10-digit US number
-    digits = re.sub(r"\D", "", support_number)
-    if len(digits) == 10:
-        e164 = f"+1{digits}"
-    elif len(digits) == 11 and digits.startswith("1"):
-        e164 = f"+{digits}"
-    else:
-        e164 = f"+{digits}"
+    e164 = _normalize_e164(support_number)
 
     return [
         {
             "type": "transferCall",
+            "messages": [
+                {
+                    "type": "request-start",
+                    "content": "I'm transferring you to our support team now. Please stay on the line.",
+                },
+                {
+                    "type": "request-failed",
+                    "content": (
+                        "I wasn't able to reach our support team right now. "
+                        "Is there anything else I can help you with?"
+                    ),
+                },
+            ],
             "destinations": [
                 {
                     "type": "number",
                     "number": e164,
-                    "message": "I'm transferring you to our support team now. Please stay on the line.",
                     "transferPlan": {
-                        "mode": "warm-transfer-with-summary",
-                        "summaryPlan": {
-                            "enabled": True,
-                            "messages": [
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "Summarize the caller's conversation so far. Include: "
-                                        "who they are (name if known), what projects they discussed, "
-                                        "what they were trying to do, and why they need a human. "
-                                        "Keep it under 30 seconds of spoken text."
-                                    ),
-                                },
-                                {
-                                    "role": "user",
-                                    "content": "Transcript:\n\n{{transcript}}",
-                                },
-                            ],
+                        "mode": "warm-transfer-experimental",
+                        "transferAssistant": {
+                            "firstMessage": (
+                                "Hi, this is J, the AI assistant from ProjectsForce. "
+                                "I have a customer on the line who needs help. "
+                                "Let me give you a quick summary."
+                            ),
+                            "firstMessageMode": "assistant-speaks-first",
+                            "maxDurationSeconds": 120,
+                            "silenceTimeoutSeconds": 30,
+                            "model": {
+                                "provider": "openai",
+                                "model": "gpt-4o-mini",
+                                "messages": [
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a transfer assistant for ProjectsForce. "
+                                            "Your job is to brief the support agent on the "
+                                            "caller's conversation before connecting them.\n\n"
+                                            "1. After your greeting, immediately summarize the "
+                                            "conversation: who the caller is (name if known), "
+                                            "what projects they discussed, what they were trying "
+                                            "to do, and why they need a human.\n"
+                                            "2. Keep the summary under 30 seconds of spoken text.\n"
+                                            "3. After the summary, ask: 'Are you ready for me to "
+                                            "connect the customer?'\n"
+                                            "4. If the agent says yes, call the transferSuccessful "
+                                            "tool to merge the calls.\n"
+                                            "5. If the agent says no or is unavailable, call the "
+                                            "transferCancel tool.\n"
+                                            "6. Be concise and professional — the customer is on hold."
+                                        ),
+                                    },
+                                ],
+                                "tools": [
+                                    {
+                                        "type": "transferSuccessful",
+                                        "function": {
+                                            "name": "transferSuccessful",
+                                            "description": "Connect the customer when the agent is ready.",
+                                        },
+                                        "messages": [
+                                            {
+                                                "type": "request-start",
+                                                "content": "Connecting the customer now.",
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "type": "transferCancel",
+                                        "function": {
+                                            "name": "transferCancel",
+                                            "description": "Cancel the transfer if the agent is unavailable.",
+                                        },
+                                        "messages": [
+                                            {
+                                                "type": "request-complete",
+                                                "content": "I'll let the customer know.",
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
                         },
                     },
                 }
