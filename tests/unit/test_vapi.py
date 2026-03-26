@@ -992,14 +992,14 @@ class TestTransferCallTool:
         result = _transfer_call_tool("5106269299")
         assistant = result[0]["destinations"][0]["transferPlan"]["transferAssistant"]
         assert assistant["firstMessageMode"] == "assistant-speaks-first"
-        assert assistant["maxDurationSeconds"] == 120
+        assert assistant["maxDurationSeconds"] == 60
         assert "ProjectsForce" in assistant["firstMessage"]
 
         # System prompt instructs the assistant to summarize
         model = assistant["model"]
         system_msg = model["messages"][0]
         assert system_msg["role"] == "system"
-        assert "summarize" in system_msg["content"].lower()
+        assert "summary" in system_msg["content"].lower()
 
         # Has transferSuccessful and transferCancel tools
         tool_types = {t["type"] for t in model["tools"]}
@@ -1007,14 +1007,18 @@ class TestTransferCallTool:
         assert "transferCancel" in tool_types
 
     def test_transfer_tool_caller_messages(self):
-        """Caller should hear request-start and request-failed messages."""
+        """Caller should hear request-start, hold music, and request-failed messages."""
         from channels.vapi import _transfer_call_tool
 
         result = _transfer_call_tool("5106269299")
         messages = result[0]["messages"]
         msg_types = {m["type"] for m in messages}
         assert "request-start" in msg_types
+        assert "request-complete" in msg_types
         assert "request-failed" in msg_types
+        # Hold music should be an audio URL
+        hold_msg = next(m for m in messages if m["type"] == "request-complete")
+        assert hold_msg["content"].endswith(".mp3")
 
     def test_assistant_config_includes_transfer_tool(self):
         from channels.vapi import _build_assistant_config

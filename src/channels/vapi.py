@@ -224,7 +224,14 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
             "messages": [
                 {
                     "type": "request-start",
-                    "content": "I'm transferring you to our support team now. Please stay on the line.",
+                    "content": (
+                        "I'm transferring you to our support team now. "
+                        "Please hold while I connect you."
+                    ),
+                },
+                {
+                    "type": "request-complete",
+                    "content": "https://desert-horse-9859.twil.io/assets/soothing-sound.mp3",
                 },
                 {
                     "type": "request-failed",
@@ -242,13 +249,12 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
                         "mode": "warm-transfer-experimental",
                         "transferAssistant": {
                             "firstMessage": (
-                                "Hi, this is J, the AI assistant from ProjectsForce. "
-                                "I have a customer on the line who needs help. "
-                                "Let me give you a quick summary."
+                                "Hi, this is J from ProjectsForce. "
+                                "I have a customer on hold. Quick brief."
                             ),
                             "firstMessageMode": "assistant-speaks-first",
-                            "maxDurationSeconds": 120,
-                            "silenceTimeoutSeconds": 30,
+                            "maxDurationSeconds": 60,
+                            "silenceTimeoutSeconds": 15,
                             "model": {
                                 "provider": "openai",
                                 "model": "gpt-4o-mini",
@@ -256,21 +262,16 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
                                     {
                                         "role": "system",
                                         "content": (
-                                            "You are a transfer assistant for ProjectsForce. "
-                                            "Your job is to brief the support agent on the "
-                                            "caller's conversation before connecting them.\n\n"
-                                            "1. After your greeting, immediately summarize the "
-                                            "conversation: who the caller is (name if known), "
-                                            "what projects they discussed, what they were trying "
-                                            "to do, and why they need a human.\n"
-                                            "2. Keep the summary under 30 seconds of spoken text.\n"
-                                            "3. After the summary, ask: 'Are you ready for me to "
-                                            "connect the customer?'\n"
-                                            "4. If the agent says yes, call the transferSuccessful "
-                                            "tool to merge the calls.\n"
-                                            "5. If the agent says no or is unavailable, call the "
-                                            "transferCancel tool.\n"
-                                            "6. Be concise and professional — the customer is on hold."
+                                            "You are a call transfer assistant. Be VERY brief.\n\n"
+                                            "After your greeting, give a 2-3 sentence summary:\n"
+                                            "- Caller name\n"
+                                            "- What they need (one line)\n"
+                                            "- Then ask: 'Ready to connect?'\n\n"
+                                            "Do NOT retell the whole conversation. "
+                                            "Do NOT list every project detail. "
+                                            "Just the essentials — the customer is waiting.\n\n"
+                                            "If agent says yes → call transferSuccessful.\n"
+                                            "If agent says no → call transferCancel."
                                         ),
                                     },
                                 ],
