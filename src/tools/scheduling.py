@@ -1158,6 +1158,71 @@ async def post_call_summary_notes(
     clear_session_projects(session_id)
 
 
+async def post_store_call_notes(
+    *,
+    session_id: str,
+    bearer_token: str,
+    client_id: str,
+    summary: str,
+    duration_seconds: float = 0,
+) -> None:
+    """Post call summary as a note for store calls via /authentication/add-note.
+
+    Store callers don't have customer-level auth, so we use the separate
+    add-note endpoint that only requires client_id + project_id.
+    Called from the Vapi end-of-call handler for store sessions.
+    """
+    projects_discussed = get_session_projects(session_id)
+    if not projects_discussed:
+        logger.info("No projects discussed in store session %s — skipping call notes", session_id)
+        clear_session_projects(session_id)
+        return
+
+    minutes = int(duration_seconds // 60)
+    seconds = int(duration_seconds % 60)
+    duration_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+    call_time = datetime.now(timezone.utc).strftime("%b %d, %Y at %I:%M %p UTC")
+    base_url = get_pf_api_base()
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+    }
+
+    truncated_summary = (summary[:200] + "...") if len(summary) > 200 else summary
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for project_id, actions in projects_discussed.items():
+            action_list = ", ".join(actions) if actions else "general inquiry"
+            note_text = (
+                f"Store called on {call_time} via AI Scheduling Assistant (J). "
+                f"Duration: {duration_str}. Actions: {action_list}."
+            )
+            if truncated_summary:
+                note_text += f" Summary: {truncated_summary}"
+
+            url = f"{base_url}/authentication/add-note"
+            payload = {
+                "client_id": client_id,
+                "project_id": int(project_id),
+                "note_text": note_text,
+            }
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                logger.info(
+                    "Store call note posted: project=%s status=%d session=%s",
+                    project_id, resp.status_code, session_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to post store call note for project %s (session=%s)",
+                    project_id, session_id,
+                )
+
+    clear_session_projects(session_id)
+
+
 async def get_business_hours() -> str:
     """Get business hours for the client."""
     client_id = AuthContext.get_client_id()

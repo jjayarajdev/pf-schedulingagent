@@ -930,6 +930,152 @@ class TestPostCallSummaryNotes:
         assert get_session_projects("vapi-test-notes") == {}
 
 
+class TestPostStoreCallNotes:
+    """Store call notes use /authentication/add-note endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_posts_note_per_project(self):
+        from tools.scheduling import (
+            get_session_projects,
+            post_store_call_notes,
+        )
+
+        # Track projects in a store session
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = "vapi-store-test"
+            from tools.scheduling import _track_project_action
+            _track_project_action("7751742", "get_available_dates")
+            _track_project_action("7751743", "get_project_details")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await post_store_call_notes(
+                session_id="vapi-store-test",
+                bearer_token="tok-store",
+                client_id="09PF05VD",
+                summary="Store confirmed delivery schedule.",
+                duration_seconds=90,
+            )
+
+            assert mock_client.post.call_count == 2
+
+            # Verify it uses /authentication/add-note endpoint
+            first_call = mock_client.post.call_args_list[0]
+            url = first_call[0][0] if first_call[0] else first_call[1].get("url", "")
+            assert "/authentication/add-note" in url
+
+            # Verify payload has client_id, project_id (int), note_text
+            payload = first_call[1].get("json", {})
+            assert payload["client_id"] == "09PF05VD"
+            assert isinstance(payload["project_id"], int)
+            assert "Store called" in payload["note_text"]
+            assert "1m 30s" in payload["note_text"]
+            assert "Store confirmed delivery schedule." in payload["note_text"]
+
+        assert get_session_projects("vapi-store-test") == {}
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_projects(self):
+        from tools.scheduling import post_store_call_notes
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_client_cls:
+            await post_store_call_notes(
+                session_id="vapi-no-projects",
+                bearer_token="tok",
+                client_id="CL1",
+                summary="Some summary",
+            )
+            mock_client_cls.assert_not_called()
+
+
+class TestStoreEndOfCallNotes:
+    """End-of-call handler routes store calls to /authentication/add-note."""
+
+    def test_store_call_uses_store_notes(self, client):
+        """Store session end-of-call uses post_store_call_notes."""
+        from channels.vapi import _store_sessions
+
+        _store_sessions["vapi-store-eoc"] = {
+            "to_phone": "+19566699322",
+            "authenticated": True,
+            "creds": {
+                "bearer_token": "store-tok",
+                "client_id": "09PF05VD",
+                "customer_id": "123",
+                "user_id": "456",
+                "user_name": "Store Person",
+            },
+        }
+
+        with patch("channels.vapi.post_store_call_notes") as mock_store_notes, \
+             patch("channels.vapi.post_call_summary_notes") as mock_customer_notes:
+            response = client.post(
+                "/vapi/webhook",
+                headers=_vapi_headers(),
+                json={
+                    "message": {
+                        "type": "end-of-call-report",
+                        "call": {"id": "store-eoc"},
+                        "endedReason": "hangup",
+                        "summary": "Store scheduled an appointment",
+                        "cost": 0.05,
+                        "durationSeconds": 60,
+                    }
+                },
+            )
+
+            assert response.status_code == 200
+            mock_store_notes.assert_called_once()
+            mock_customer_notes.assert_not_called()
+
+            call_kwargs = mock_store_notes.call_args[1]
+            assert call_kwargs["client_id"] == "09PF05VD"
+            assert call_kwargs["bearer_token"] == "store-tok"
+
+        _store_sessions.pop("vapi-store-eoc", None)
+
+    def test_customer_call_uses_customer_notes(self, client):
+        """Non-store end-of-call still uses post_call_summary_notes."""
+        with patch("channels.vapi.post_call_summary_notes") as mock_customer_notes, \
+             patch("channels.vapi.post_store_call_notes") as mock_store_notes, \
+             patch("channels.vapi.get_cached_auth") as mock_auth:
+            mock_auth.return_value = {
+                "bearer_token": "cust-tok",
+                "client_id": "CL1",
+                "customer_id": "CUST1",
+            }
+
+            response = client.post(
+                "/vapi/webhook",
+                headers=_vapi_headers(),
+                json={
+                    "message": {
+                        "type": "end-of-call-report",
+                        "call": {
+                            "id": "cust-eoc",
+                            "customer": {"number": "+15551234567"},
+                        },
+                        "endedReason": "hangup",
+                        "summary": "Customer asked about project",
+                        "cost": 0.05,
+                        "durationSeconds": 60,
+                    }
+                },
+            )
+
+            assert response.status_code == 200
+            mock_store_notes.assert_not_called()
+            mock_customer_notes.assert_called_once()
+
+
 class TestNormalizeE164:
     """E.164 phone number normalization."""
 
