@@ -147,18 +147,21 @@ async def _handle_assistant_request(body: dict) -> dict:
             first_name = user_name.split()[0] if user_name and user_name.strip() else ""
             client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
             support_number = creds.get("support_number", "")
-        except AuthenticationError:
+        except AuthenticationError as exc:
             # Auth failure = potential store caller
             logger.info("Store caller detected (call_id=%s)", call_id)
             is_store_caller = True
+            # PF API may return client_name even on auth failure
+            if exc.client_name:
+                client_name = exc.client_name
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
 
     if is_store_caller:
         _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False}
-        greeting = _generate_store_greeting()
-        logger.info("Vapi store greeting: call_id=%s", call_id)
-        return {"assistant": _build_store_assistant_config(greeting, webhook_secret)}
+        greeting = _generate_store_greeting(client_name)
+        logger.info("Vapi store greeting: call_id=%s client=%s", call_id, client_name)
+        return {"assistant": _build_store_assistant_config(greeting, webhook_secret, client_name)}
 
     greeting = _generate_dynamic_greeting(first_name, client_name)
     logger.info(
@@ -168,7 +171,7 @@ async def _handle_assistant_request(body: dict) -> dict:
         client_name,
     )
 
-    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number)}
+    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number, client_name)}
 
 
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
@@ -202,7 +205,7 @@ def _normalize_e164(phone: str) -> str:
     return f"+{digits}"
 
 
-def _transfer_call_tool(support_number: str) -> list[dict]:
+def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce") -> list[dict]:
     """Build a Vapi ``transferCall`` tool for warm transfer (experimental mode).
 
     Uses ``warm-transfer-experimental`` with a dedicated transfer assistant
@@ -216,6 +219,7 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
     if not support_number:
         return []
 
+    name = client_name or "ProjectsForce"
     e164 = _normalize_e164(support_number)
 
     return [
@@ -249,7 +253,7 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
                         "mode": "warm-transfer-experimental",
                         "transferAssistant": {
                             "firstMessage": (
-                                "Hi, this is J from ProjectsForce. "
+                                f"Hi, this is J from {name}. "
                                 "I have a customer on hold. Quick brief."
                             ),
                             "firstMessageMode": "assistant-speaks-first",
@@ -312,12 +316,18 @@ def _transfer_call_tool(support_number: str) -> list[dict]:
     ]
 
 
-def _build_assistant_config(first_message: str, server_secret: str = "", support_number: str = "") -> dict:
+def _build_assistant_config(
+    first_message: str,
+    server_secret: str = "",
+    support_number: str = "",
+    client_name: str = "ProjectsForce",
+) -> dict:
     """Build the full Vapi assistant config returned on ``assistant-request``.
 
     This mirrors the assistant settings previously stored in Vapi's dashboard
     but with a dynamic ``firstMessage``.
     """
+    name = client_name or "ProjectsForce"
     server_config: dict = {
         "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
         "timeoutSeconds": 30,
@@ -325,7 +335,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
     if server_secret:
         server_config["secret"] = server_secret
     return {
-        "name": "ProjectsForce Scheduling Bot",
+        "name": f"{name} Scheduling Bot",
         "voice": {
             "model": "sonic-3",
             "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
@@ -339,7 +349,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
                 {
                     "role": "system",
                     "content": (
-                        "You are J, a friendly phone assistant for ProjectsForce "
+                        f"You are J, a friendly phone assistant for {name} "
                         "— a home improvement scheduling service.\n\n"
                         "CRITICAL RULES:\n"
                         '1. You MUST call ask_scheduling_bot for EVERY user request — no exceptions. '
@@ -419,7 +429,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
                         },
                     ],
                 },
-                *(_transfer_call_tool(support_number)),
+                *(_transfer_call_tool(support_number, name)),
             ],
         },
         "transcriber": {
@@ -430,7 +440,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            "Thank you for calling ProjectsForce. "
+            f"Thank you for calling {name}. "
             "Your scheduling is all set. Have a wonderful day!"
         ),
         "endCallPhrases": [
@@ -440,7 +450,7 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
         ],
         "endCallFunctionEnabled": True,
         "voicemailMessage": (
-            "Hello, this is J from ProjectsForce. I'm calling about your "
+            f"Hello, this is J from {name}. I'm calling about your "
             "home improvement project. Please call us back at your earliest convenience."
         ),
         "silenceTimeoutSeconds": 30,
@@ -456,10 +466,11 @@ def _build_assistant_config(first_message: str, server_secret: str = "", support
     }
 
 
-def _generate_store_greeting() -> str:
+def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     """Build an SSML greeting for store callers."""
+    name = client_name or "ProjectsForce"
     return (
-        '<break time="3000ms"/> Welcome to ProjectsForce. '
+        f'<break time="3000ms"/> Welcome to {name}. '
         '<break time="300ms"/> '
         "I can help you check project status. "
         '<break time="500ms"/> '
@@ -467,13 +478,16 @@ def _generate_store_greeting() -> str:
     )
 
 
-def _build_store_assistant_config(first_message: str, server_secret: str = "") -> dict:
+def _build_store_assistant_config(
+    first_message: str, server_secret: str = "", client_name: str = "ProjectsForce",
+) -> dict:
     """Build the Vapi assistant config for store callers.
 
     Uses ``ask_store_bot`` tool instead of ``ask_scheduling_bot``.
     The LLM first collects a lookup value, then routes all queries through
     the same orchestrator with store-specific auth.
     """
+    name = client_name or "ProjectsForce"
     server_config: dict = {
         "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
         "timeoutSeconds": 30,
@@ -481,7 +495,7 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
     if server_secret:
         server_config["secret"] = server_secret
     return {
-        "name": "ProjectsForce Store Bot",
+        "name": f"{name} Store Bot",
         "voice": {
             "model": "sonic-3",
             "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
@@ -495,7 +509,7 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
                 {
                     "role": "system",
                     "content": (
-                        "You are J, a friendly phone assistant for ProjectsForce "
+                        f"You are J, a friendly phone assistant for {name} "
                         "— a home improvement scheduling service.\n\n"
                         "The caller is from a STORE (not a customer).\n\n"
                         "CRITICAL RULES:\n"
@@ -595,7 +609,7 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            "Thank you for calling ProjectsForce. Have a great day!"
+            f"Thank you for calling {name}. Have a great day!"
         ),
         "endCallPhrases": [
             "goodbye", "bye", "bye bye", "bye now",

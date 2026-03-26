@@ -396,7 +396,7 @@ class TestAssistantRequest:
         )
         assert resp.status_code == 200
         assistant = resp.json()["assistant"]
-        assert assistant["name"] == "ProjectsForce Scheduling Bot"
+        assert assistant["name"] == "TestCo Scheduling Bot"
         assert "Jane" in assistant["firstMessage"]
 
     @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
@@ -426,6 +426,58 @@ class TestAssistantRequest:
         # Verify ask_store_bot tool is configured
         tool_names = [t["function"]["name"] for t in assistant["model"]["tools"]]
         assert "ask_store_bot" in tool_names
+
+    @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
+    def test_store_caller_uses_client_name_from_error(self, mock_auth, client):
+        """Store caller gets dynamic client_name from AuthenticationError."""
+        from auth.phone_auth import AuthenticationError
+
+        mock_auth.side_effect = AuthenticationError(
+            "Not found", status_code=404, client_name="EQ Windows",
+        )
+
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "assistant-request",
+                    "call": {
+                        "id": "call-store-dyn",
+                        "customer": {"number": "+15559999999"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assistant = resp.json()["assistant"]
+        assert assistant["name"] == "EQ Windows Store Bot"
+        assert "EQ Windows" in assistant["firstMessage"]
+        assert "EQ Windows" in assistant["endCallMessage"]
+
+    @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
+    def test_customer_dynamic_end_call_message(self, mock_auth, client):
+        """Customer endCallMessage uses dynamic client_name."""
+        mock_auth.return_value = {
+            "user_name": "Jane Smith",
+            "client_name": "TestCo",
+            "bearer_token": "tok",
+        }
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "assistant-request",
+                    "call": {
+                        "id": "call-cust-dyn",
+                        "customer": {"number": "+14702832382"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assistant = resp.json()["assistant"]
+        assert "TestCo" in assistant["endCallMessage"]
+        assert "TestCo" in assistant["voicemailMessage"]
 
     @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
     def test_store_session_created(self, mock_auth, client):

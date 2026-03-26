@@ -32,9 +32,10 @@ MAX_CACHE_SECONDS = 900  # 15 minutes
 class AuthenticationError(Exception):
     """Raised when phone authentication fails."""
 
-    def __init__(self, message: str, status_code: int = 0):
+    def __init__(self, message: str, status_code: int = 0, client_name: str = ""):
         super().__init__(message)
         self.status_code = status_code
+        self.client_name = client_name
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -304,7 +305,10 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
         if "accesstoken" not in data:
             error_msg = data.get("message", "No access token in response")
             logger.error("Invalid phone auth response: %s", error_msg)
-            raise AuthenticationError(f"Authentication failed: {error_msg}")
+            raise AuthenticationError(
+                f"Authentication failed: {error_msg}",
+                client_name=data.get("client_name", ""),
+            )
 
         user = data.get("user", {})
 
