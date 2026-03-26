@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Refresh proactively if the token has fewer than this many seconds remaining.
 TOKEN_REFRESH_BUFFER_SECONDS = 30
 
+# Maximum cache duration (seconds). Re-authenticate after this even if token is
+# still valid, so stale phone→customer mappings don't persist too long.
+MAX_CACHE_SECONDS = 900  # 15 minutes
+
 
 class AuthenticationError(Exception):
     """Raised when phone authentication fails."""
@@ -190,6 +194,21 @@ def _get_cached_creds(phone: str) -> dict | None:
             )
             return None
 
+        # Enforce max cache age — re-authenticate if stored too long ago
+        updated_at = item.get("updated_at", "")
+        if updated_at:
+            try:
+                stored_ts = datetime.fromisoformat(updated_at).timestamp()
+                cache_age = now - stored_ts
+                if cache_age > MAX_CACHE_SECONDS:
+                    logger.info(
+                        "Cache expired for ***%s — age %.0fs > %ds",
+                        phone[-4:], cache_age, MAX_CACHE_SECONDS,
+                    )
+                    return None
+            except (ValueError, TypeError):
+                pass  # If updated_at is malformed, fall through to token-based check
+
         logger.info("Token valid for ***%s — %.0fs remaining", phone[-4:], remaining)
 
         return {
@@ -221,8 +240,8 @@ def _store_credentials(phone: str, credentials: dict) -> None:
         table = dynamodb.Table(settings.phone_creds_table)
 
         exp = credentials.get("exp", 0)
-        # TTL = token expiration + 1 hour buffer for DynamoDB cleanup
-        ttl = int(exp) + 3600 if exp else int(datetime.now(UTC).timestamp()) + 86400
+        # TTL = cache max age + 5 min buffer for DynamoDB cleanup
+        ttl = int(datetime.now(UTC).timestamp()) + MAX_CACHE_SECONDS + 300
 
         table.put_item(
             Item={
