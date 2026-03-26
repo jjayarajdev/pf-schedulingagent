@@ -526,11 +526,13 @@ async def list_projects(
         # Intelligent fallback — only reference active projects, never completed/cancelled
         return _build_intelligent_fallback(active_projects)
 
-    # Track all returned projects so end-of-call notes know which were discussed
-    for p in filtered:
-        pid = str(p.get("id", ""))
-        if pid:
-            _track_project_action(pid, "viewed_projects")
+    # Store callers: track all returned projects so end-of-call notes get posted.
+    # Customer callers: only track via specific tool calls (get_project_details, etc.)
+    if AuthContext.get_caller_type() == "store":
+        for p in filtered:
+            pid = str(p.get("id", ""))
+            if pid:
+                _track_project_action(pid, "viewed_projects")
 
     return json.dumps({"message": f"Found {len(filtered)} project(s):", "projects": filtered}, indent=2)
 
