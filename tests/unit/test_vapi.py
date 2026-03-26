@@ -547,6 +547,59 @@ class TestStoreToolCalls:
     @patch("channels.vapi._set_auth_context_from_phone", new_callable=AsyncMock)
     @patch("channels.vapi.authenticate_store", new_callable=AsyncMock)
     @patch("channels.vapi.get_orchestrator")
+    def test_lookup_value_spaces_stripped(
+        self, mock_get_orch, mock_store_auth, mock_phone_auth, client
+    ):
+        """STT-transcribed digits with spaces are stripped before API call."""
+        from channels.vapi import _store_sessions
+
+        mock_store_auth.return_value = {
+            "bearer_token": "tok", "client_id": "C1",
+            "customer_id": "1", "user_id": "1", "user_name": "Store",
+        }
+        mock_response = MagicMock()
+        mock_response.output = "Found project."
+        mock_response.metadata = MagicMock()
+        mock_response.metadata.agent_name = "SchedulingAgent"
+        mock_orch = AsyncMock()
+        mock_orch.route_request = AsyncMock(return_value=mock_response)
+        mock_get_orch.return_value = mock_orch
+
+        _store_sessions["vapi-call-store-sp"] = {
+            "to_phone": "+18001234567", "authenticated": False,
+        }
+        try:
+            resp = client.post(
+                "/vapi/webhook",
+                json={
+                    "message": {
+                        "type": "tool-calls",
+                        "toolCalls": [{
+                            "id": "tc-sp",
+                            "function": {
+                                "name": "ask_store_bot",
+                                "arguments": {
+                                    "question": "Show projects",
+                                    "lookup_type": "po_number",
+                                    "lookup_value": "5 2 3 8 2 4",
+                                },
+                            },
+                        }],
+                        "call": {"id": "call-store-sp"},
+                    },
+                },
+                headers=_vapi_headers(),
+            )
+            assert resp.status_code == 200
+            # Verify spaces were stripped before calling authenticate_store
+            call_args = mock_store_auth.call_args
+            assert call_args[0][2] == "523824"  # lookup_value arg
+        finally:
+            _store_sessions.pop("vapi-call-store-sp", None)
+
+    @patch("channels.vapi._set_auth_context_from_phone", new_callable=AsyncMock)
+    @patch("channels.vapi.authenticate_store", new_callable=AsyncMock)
+    @patch("channels.vapi.get_orchestrator")
     def test_first_call_authenticates_and_queries(
         self, mock_get_orch, mock_store_auth, mock_phone_auth, client
     ):

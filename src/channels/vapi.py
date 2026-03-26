@@ -883,6 +883,11 @@ async def _handle_store_bot(
     lookup_type = tool_params.get("lookup_type", "")
     lookup_value = tool_params.get("lookup_value", "")
 
+    # STT often transcribes dictated numbers with spaces ("5 2 3 8 2 4").
+    # Strip spaces for numeric lookup types so the PF API can match.
+    if lookup_value and lookup_type in ("po_number", "project_number"):
+        lookup_value = lookup_value.replace(" ", "")
+
     session_key = f"vapi-{call_id}"
     store_session = _store_sessions.get(session_key, {})
 
