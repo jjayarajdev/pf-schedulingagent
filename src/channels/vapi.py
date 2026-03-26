@@ -585,11 +585,6 @@ def _build_store_assistant_config(
                         {"type": "request-start", "content": "Let me look that up for you."},
                         {
                             "type": "request-response-delayed",
-                            "content": "Still working on that.",
-                            "timingMilliseconds": 3000,
-                        },
-                        {
-                            "type": "request-response-delayed",
                             "content": "Almost there.",
                             "timingMilliseconds": 5000,
                         },
