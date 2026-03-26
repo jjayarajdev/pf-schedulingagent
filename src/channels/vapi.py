@@ -461,7 +461,7 @@ def _generate_store_greeting() -> str:
     return (
         '<break time="3000ms"/> Welcome to ProjectsForce. '
         '<break time="300ms"/> '
-        "I can help you look up project information and schedule appointments. "
+        "I can help you check project status. "
         '<break time="500ms"/> '
         "Do you have a PO number, project number, or customer name?"
     )
@@ -503,31 +503,26 @@ def _build_store_assistant_config(first_message: str, server_secret: str = "") -
                         "to look up the account.\n"
                         "2. Call ask_store_bot with the lookup info. On the first call you "
                         "MUST include lookup_type and lookup_value.\n"
-                        "3. Once authenticated, use ask_store_bot for ALL scheduling queries "
-                        "(projects, dates, appointments, etc.). You do NOT need to pass "
-                        "lookup_type/lookup_value again after the first call.\n"
+                        "3. Once authenticated, use ask_store_bot for ALL queries. "
+                        "You do NOT need to pass lookup_type/lookup_value again after the first call.\n"
                         "4. Pass the user's EXACT words in the \"question\" field. Do NOT "
                         "rephrase, summarize, or add your own questions.\n"
-                        "5. NEVER share customer phone numbers, email addresses, or "
-                        "street addresses with the store caller.\n"
-                        "6. NEVER ask clarifying questions before calling the tool. Let the "
+                        "5. NEVER share customer names, technician names, phone numbers, "
+                        "email addresses, or street addresses with the store caller. "
+                        "Only share project status, project numbers, and PO numbers.\n"
+                        "6. NEVER offer to schedule, reschedule, or cancel appointments. "
+                        "Store callers can ONLY check project status. If they ask to schedule, "
+                        "say: 'Scheduling is not available for store calls. "
+                        "Please have the customer call us directly.'\n"
+                        "7. NEVER ask clarifying questions before calling the tool. Let the "
                         "scheduling bot handle clarification.\n"
-                        "7. When the tool returns a response, speak it naturally. "
-                        "Keep it conversational — you are on a phone call.\n"
-                        "8. For multi-step flows (scheduling, rescheduling), call "
-                        "ask_store_bot for EVERY step.\n"
+                        "8. When the tool returns a response, speak it naturally. "
+                        "Keep it conversational — you are on a phone call. "
+                        "Remove any customer names or technician names from the response.\n"
                         "9. Keep your spoken responses concise — no bullet points, "
                         "no markdown.\n"
                         "10. Use natural filler phrases while waiting: "
-                        '"Let me check that for you", "One moment please".\n'
-                        "11. CRITICAL — CONFIRMATION COMPLETES THE BOOKING: When the scheduling bot "
-                        'asks the user to confirm (e.g., "Should I go ahead?", "Shall I book this?"), '
-                        "the user's reply (yes, sure, go ahead, confirm, etc.) MUST be passed back "
-                        "to ask_store_bot. The booking is NOT complete until the bot processes "
-                        "the confirmation. NEVER end the call or assume the appointment is booked — "
-                        "only the scheduling bot can finalize it.\n"
-                        "12. Do NOT end the call until the scheduling bot has confirmed the booking "
-                        "is complete OR the user explicitly says goodbye/bye."
+                        '"Let me check that for you", "One moment please".'
                     ),
                 }
             ],
@@ -906,7 +901,7 @@ async def _handle_store_bot(
     if not question:
         return _build_tool_result(
             "You're verified! How can I help you? "
-            "I can look up projects, check dates, or schedule appointments.",
+            "I can look up project status and details.",
             tool_call_id,
         )
 
@@ -922,16 +917,21 @@ async def _handle_store_bot(
         tenant_phone=normalize_phone(store_session.get("to_phone", "")),
     )
 
-    # Step 3: Route through orchestrator (same as ask_scheduling_bot)
+    # Step 3: Route through orchestrator with store context
+    # Prepend store instruction so the scheduling agent restricts its response
+    store_question = (
+        "[STORE CALLER — status only, no scheduling, no customer/technician names] "
+        + question
+    )
     agent_name = ""
     start_time = time.monotonic()
     try:
         orchestrator = get_orchestrator()
         response = await orchestrator.route_request(
-            user_input=question,
+            user_input=store_question,
             user_id=user_id,
             session_id=session_id,
-            additional_params={"channel": "vapi"},
+            additional_params={"channel": "vapi", "caller_type": "store"},
         )
         response_text = extract_response_text(response.output)
         agent_name = response.metadata.agent_name if response.metadata else ""
