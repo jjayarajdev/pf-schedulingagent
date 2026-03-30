@@ -421,10 +421,13 @@ class TestAssistantRequest:
         )
         assert resp.status_code == 200
         assistant = resp.json()["assistant"]
-        assert assistant["name"] == "ProjectsForce Store Bot"
-        assert "PO number" in assistant["firstMessage"]
+        assert assistant["name"] == "ProjectsForce Assistant"
+        assert "How can I help you" in assistant["firstMessage"]
         # Verify ask_store_bot tool is configured
-        tool_names = [t["function"]["name"] for t in assistant["model"]["tools"]]
+        tool_names = [
+            t.get("function", {}).get("name", "") or t.get("type", "")
+            for t in assistant["model"]["tools"]
+        ]
         assert "ask_store_bot" in tool_names
 
     @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
@@ -450,7 +453,7 @@ class TestAssistantRequest:
         )
         assert resp.status_code == 200
         assistant = resp.json()["assistant"]
-        assert assistant["name"] == "EQ Windows Store Bot"
+        assert assistant["name"] == "EQ Windows Assistant"
         assert "EQ Windows" in assistant["firstMessage"]
         assert "EQ Windows" in assistant["endCallMessage"]
 
@@ -540,7 +543,7 @@ class TestStoreToolCalls:
             )
             assert resp.status_code == 200
             result = resp.json()["results"][0]["result"]
-            assert "PO number" in result or "customer name" in result
+            assert "project number" in result or "PO number" in result
         finally:
             _store_sessions.pop("vapi-call-store-tc1", None)
 

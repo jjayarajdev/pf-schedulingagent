@@ -48,19 +48,20 @@ def _setup_request_context(
     Returns ``(session_id, user_id)``.
     """
     session_id = request.session_id or str(uuid.uuid4())
-    user_id = request.user_id or "anonymous"
+    user_id = request.user_id or request.pf_user_id or "anonymous"
 
-    auth_token = request.auth_token
+    # Accept both canonical and pf_-prefixed field names from the PF web app
+    auth_token = request.auth_token or request.pf_token
     if not auth_token:
         auth_header = raw_request.headers.get("authorization", "")
         auth_token = auth_header.removeprefix("Bearer ").strip() if auth_header else ""
 
     AuthContext.set(
         auth_token=auth_token,
-        client_id=request.client_id or "",
+        client_id=request.client_id or request.pf_client_id or "",
         customer_id=request.customer_id or "",
         user_id=user_id,
-        user_name=request.user_name or "",
+        user_name=request.user_name or request.pf_user_name or "",
     )
     RequestContext.set(session_id=session_id, user_id=user_id)
     return session_id, user_id
@@ -557,6 +558,14 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
                 if isinstance(chunk, AgentStreamResponse) and chunk.text:
                     full_text += chunk.text
                     yield _sse("delta", {"text": chunk.text})
+
+        # Repair truncated JSON blocks — LLM may run out of tokens mid-JSON.
+        # Send a corrective delta with the closing characters if needed.
+        repaired = _repair_json_blocks(full_text)
+        if repaired != full_text:
+            suffix = repaired[len(full_text):]
+            yield _sse("delta", {"text": suffix})
+            full_text = repaired
 
         agent_name = response.metadata.agent_name if hasattr(response, "metadata") else ""
         signals = _detect_response_signals(full_text)

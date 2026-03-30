@@ -6,7 +6,12 @@ from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
-    """Incoming chat message."""
+    """Incoming chat message.
+
+    Accepts both canonical field names (``auth_token``, ``client_id``, etc.)
+    and the ``pf_``-prefixed names sent by the PF web app (``pf_token``,
+    ``pf_client_id``, ``pf_user_id``, ``pf_user_name``).
+    """
 
     message: str = Field(..., min_length=1, max_length=2000, description="User's question or message")
     session_id: str = Field(default="", description="Session ID for conversation continuity")
@@ -15,6 +20,14 @@ class ChatRequest(BaseModel):
     client_id: str = Field(default="", description="PF tenant client_id")
     customer_id: str = Field(default="", description="PF customer_id")
     user_name: str = Field(default="", description="Display name for personalized greetings")
+    client_name: str = Field(default="", description="PF tenant name (e.g. 'projectsforce-validation')")
+    stream: bool = Field(default=False, description="Whether to stream the response (ignored by non-stream endpoint)")
+
+    # PF web app sends pf_-prefixed field names
+    pf_token: str = Field(default="", description="Alias for auth_token (sent by PF web app)")
+    pf_client_id: str = Field(default="", description="Alias for client_id (sent by PF web app)")
+    pf_user_id: str = Field(default="", description="Alias for user_id (sent by PF web app)")
+    pf_user_name: str = Field(default="", description="Alias for user_name (sent by PF web app)")
 
 
 class ChatResponse(BaseModel):
