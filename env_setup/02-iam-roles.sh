@@ -6,19 +6,22 @@
 #   pf-syn-schedulingagents-bot-execution-role-{env}  — ECS execution role (ECR + logs)
 #
 # Usage:
-#   bash env_setup/02-iam-roles.sh
+#   bash env_setup/02-iam-roles.sh dev
+#   bash env_setup/02-iam-roles.sh qa
 
 set -euo pipefail
 
-PROFILE="${AWS_PROFILE:-pf-aws}"
-REGION="${AWS_REGION:-us-east-1}"
-ENV="${ENVIRONMENT:-dev}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Load environment config ──────────────────────────────────────────
+source "$SCRIPT_DIR/env-config.sh" "${1:-${ENVIRONMENT:-dev}}"
+
+PROFILE="${AWS_PROFILE}"
 ACCOUNT=$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)
 
-TASK_ROLE="pf-syn-schedulingagents-bot-task-role-${ENV}"
-EXEC_ROLE="pf-syn-schedulingagents-bot-execution-role-${ENV}"
-
-echo "Creating IAM roles (env=$ENV, account=$ACCOUNT)"
+echo "═══════════════════════════════════════════════════════════"
+echo "  PF Scheduling Bot — IAM Roles (env=${ENVIRONMENT})"
+echo "═══════════════════════════════════════════════════════════"
 echo ""
 
 # ── 1. ECS Task Role (application permissions) ───────────────────────
@@ -38,10 +41,10 @@ aws iam create-role \
   --profile "$PROFILE" \
   --role-name "$TASK_ROLE" \
   --assume-role-policy-document "$TRUST_POLICY" \
-  --tags Key=Project,Value=pf-schedulingagents-bot Key=Environment,Value="$ENV" \
+  --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
   2>/dev/null && echo "  ✓ Role created" || echo "  → Already exists"
 
-# Inline policy: Bedrock + DynamoDB + Secrets Manager + SMS
+# Inline policy: Bedrock + DynamoDB (all 4 tables) + Secrets Manager + SMS
 TASK_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -67,15 +70,17 @@ TASK_POLICY='{
         "dynamodb:DescribeTable"
       ],
       "Resource": [
-        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT"':table/pf-syn-schedulingagents-sessions-'"$ENV"'",
-        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT"':table/pf-syn-schedulingagents-phone-creds-'"$ENV"'"
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-sessions-'"$ENVIRONMENT"'",
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-phone-creds-'"$ENVIRONMENT"'",
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-conversations-'"$ENVIRONMENT"'",
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-vapi-assistants-'"$ENVIRONMENT"'"
       ]
     },
     {
       "Sid": "SecretsManager",
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT"':secret:vapi/api-key/'"$ENV"'*"
+      "Resource": "arn:aws:secretsmanager:'"$AWS_REGION"':'"$ACCOUNT"':secret:vapi/api-key/'"$ENVIRONMENT"'*"
     },
     {
       "Sid": "SMS",
@@ -91,7 +96,7 @@ aws iam put-role-policy \
   --role-name "$TASK_ROLE" \
   --policy-name "${TASK_ROLE}-policy" \
   --policy-document "$TASK_POLICY"
-echo "  ✓ Task policy attached"
+echo "  ✓ Task policy attached (Bedrock, DynamoDB x4, Secrets, SMS)"
 
 echo ""
 
@@ -102,7 +107,7 @@ aws iam create-role \
   --profile "$PROFILE" \
   --role-name "$EXEC_ROLE" \
   --assume-role-policy-document "$TRUST_POLICY" \
-  --tags Key=Project,Value=pf-schedulingagents-bot Key=Environment,Value="$ENV" \
+  --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
   2>/dev/null && echo "  ✓ Role created" || echo "  → Already exists"
 
 # Attach AWS managed policy for ECS task execution
@@ -116,3 +121,9 @@ echo ""
 echo "Done. Roles:"
 echo "  Task:      arn:aws:iam::${ACCOUNT}:role/${TASK_ROLE}"
 echo "  Execution: arn:aws:iam::${ACCOUNT}:role/${EXEC_ROLE}"
+echo ""
+echo "DynamoDB tables in policy:"
+echo "  - ${PROJECT_PREFIX}-sessions-${ENVIRONMENT}"
+echo "  - ${PROJECT_PREFIX}-phone-creds-${ENVIRONMENT}"
+echo "  - ${PROJECT_PREFIX}-conversations-${ENVIRONMENT}"
+echo "  - ${PROJECT_PREFIX}-vapi-assistants-${ENVIRONMENT}"

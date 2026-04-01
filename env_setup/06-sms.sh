@@ -1,37 +1,38 @@
 #!/bin/bash
 # Configure SMS (AWS End User Messaging) for the PF Scheduling Bot.
 #
-# This script sets up two-way SMS by subscribing the SNS topic
+# Sets up two-way SMS by subscribing the SNS topic
 # (which receives inbound SMS from Pinpoint) to the bot's webhook.
 #
 # Prerequisites:
 #   - Pinpoint/End User Messaging phone number already provisioned
-#     (v1.2.9 uses +18786789053)
 #   - ALB deployed and accessible (run 04-ecs-fargate.sh first)
 #
 # Usage:
-#   WEBHOOK_URL=https://your-alb-dns/sms/webhook bash env_setup/06-sms.sh
+#   bash env_setup/06-sms.sh dev
+#   WEBHOOK_URL=https://your-alb-dns/sms/webhook bash env_setup/06-sms.sh qa
 
 set -euo pipefail
 
-PROFILE="${AWS_PROFILE:-pf-aws}"
-REGION="${AWS_REGION:-us-east-1}"
-ENV="${ENVIRONMENT:-dev}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/env-config.sh" "${1:-${ENVIRONMENT:-dev}}"
+
+PROFILE="${AWS_PROFILE}"
 ACCOUNT=$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)
 
-SNS_TOPIC_NAME="pf-syn-schedulingagents-sms-inbound-${ENV}"
-SMS_CONFIG_SET="scheduling-agent-sms-config-${ENV}"
+SNS_TOPIC_NAME="${PROJECT_PREFIX}-sms-inbound-${ENVIRONMENT}"
+SMS_CONFIG_SET="scheduling-agent-sms-config-${ENVIRONMENT}"
 
-echo "SMS Setup (env=$ENV, region=$REGION)"
+echo "SMS Setup (env=$ENVIRONMENT, region=$AWS_REGION)"
 echo ""
 
 # ── 1. SNS Topic for inbound SMS ─────────────────────────────────────
 echo "▶ Creating SNS topic: $SNS_TOPIC_NAME"
 TOPIC_ARN=$(aws sns create-topic \
   --profile "$PROFILE" \
-  --region "$REGION" \
+  --region "$AWS_REGION" \
   --name "$SNS_TOPIC_NAME" \
-  --tags Key=Project,Value=pf-schedulingagents-bot Key=Environment,Value="$ENV" \
+  --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
   --query 'TopicArn' --output text)
 echo "  ✓ Topic ARN: $TOPIC_ARN"
 echo ""
@@ -41,7 +42,7 @@ if [ -n "${WEBHOOK_URL:-}" ]; then
   echo "▶ Subscribing webhook: $WEBHOOK_URL"
   SUB_ARN=$(aws sns subscribe \
     --profile "$PROFILE" \
-    --region "$REGION" \
+    --region "$AWS_REGION" \
     --topic-arn "$TOPIC_ARN" \
     --protocol https \
     --notification-endpoint "$WEBHOOK_URL" \
@@ -54,7 +55,7 @@ else
   echo "⚠ WEBHOOK_URL not set. Subscribe manually after ALB is deployed:"
   echo ""
   echo "  aws sns subscribe \\"
-  echo "    --profile $PROFILE --region $REGION \\"
+  echo "    --profile $PROFILE --region $AWS_REGION \\"
   echo "    --topic-arn $TOPIC_ARN \\"
   echo "    --protocol https \\"
   echo "    --notification-endpoint https://YOUR-ALB-DNS/sms/webhook"
@@ -65,7 +66,7 @@ echo ""
 echo "▶ Checking SMS configuration set: $SMS_CONFIG_SET"
 CONFIG_EXISTS=$(aws pinpoint-sms-voice-v2 describe-configuration-sets \
   --profile "$PROFILE" \
-  --region "$REGION" \
+  --region "$AWS_REGION" \
   --configuration-set-names "$SMS_CONFIG_SET" \
   --query 'ConfigurationSets[0].ConfigurationSetName' --output text 2>/dev/null || echo "")
 
@@ -75,9 +76,9 @@ else
   echo "  Creating configuration set..."
   aws pinpoint-sms-voice-v2 create-configuration-set \
     --profile "$PROFILE" \
-    --region "$REGION" \
+    --region "$AWS_REGION" \
     --configuration-set-name "$SMS_CONFIG_SET" \
-    --tags Key=Project,Value=pf-schedulingagents-bot Key=Environment,Value="$ENV" \
+    --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
     > /dev/null 2>&1 && echo "  ✓ Created" || echo "  → Check if it already exists under another name"
 fi
 

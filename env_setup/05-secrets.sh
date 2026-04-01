@@ -5,17 +5,18 @@
 # This script checks and creates it only if missing.
 #
 # Usage:
-#   bash env_setup/05-secrets.sh
+#   bash env_setup/05-secrets.sh dev
+#   bash env_setup/05-secrets.sh qa
 
 set -euo pipefail
 
-PROFILE="${AWS_PROFILE:-pf-aws}"
-REGION="${AWS_REGION:-us-east-1}"
-ENV="${ENVIRONMENT:-dev}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/env-config.sh" "${1:-${ENVIRONMENT:-dev}}"
 
-VAPI_SECRET_NAME="vapi/api-key/${ENV}"
+PROFILE="${AWS_PROFILE}"
+VAPI_SECRET_NAME="vapi/api-key/${ENVIRONMENT}"
 
-echo "Checking Secrets Manager (env=$ENV, region=$REGION)"
+echo "Checking Secrets Manager (env=$ENVIRONMENT, region=$AWS_REGION)"
 echo ""
 
 # ── Vapi API key ─────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ echo "▶ Checking secret: $VAPI_SECRET_NAME"
 
 SECRET_EXISTS=$(aws secretsmanager describe-secret \
   --profile "$PROFILE" \
-  --region "$REGION" \
+  --region "$AWS_REGION" \
   --secret-id "$VAPI_SECRET_NAME" \
   --query 'ARN' --output text 2>/dev/null || echo "")
 
@@ -36,18 +37,18 @@ else
   echo ""
   echo "  ⚠ You must update the secret value with your actual Vapi API key:"
   echo "    aws secretsmanager put-secret-value \\"
-  echo "      --profile $PROFILE --region $REGION \\"
+  echo "      --profile $PROFILE --region $AWS_REGION \\"
   echo "      --secret-id $VAPI_SECRET_NAME \\"
   echo "      --secret-string '{\"vapi_api_key\": \"YOUR_VAPI_API_KEY\"}'"
   echo ""
 
   ARN=$(aws secretsmanager create-secret \
     --profile "$PROFILE" \
-    --region "$REGION" \
+    --region "$AWS_REGION" \
     --name "$VAPI_SECRET_NAME" \
-    --description "Vapi API key for PF Scheduling Bot ($ENV)" \
+    --description "Vapi API key for PF Scheduling Bot ($ENVIRONMENT)" \
     --secret-string '{"vapi_api_key": "PLACEHOLDER_UPDATE_ME"}' \
-    --tags Key=Project,Value=pf-schedulingagents-bot Key=Environment,Value="$ENV" \
+    --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
     --query 'ARN' --output text)
   echo "  ✓ Created: $ARN"
 fi

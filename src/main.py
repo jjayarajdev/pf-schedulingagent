@@ -97,8 +97,8 @@ _startup_logger.info(
     settings.aws_region,
 )
 
-# Dev-only: login proxy + test client static files
-if settings.environment == "dev" or settings.dev_server:
+# Dev/QA: login proxy + test client static files
+if settings.environment in ("dev", "qa") or settings.dev_server:
     import logging
 
     import httpx
