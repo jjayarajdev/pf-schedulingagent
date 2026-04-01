@@ -20,6 +20,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from auth.context import AuthContext
+from auth.office_hours import check_office_hours
 from auth.phone_auth import (
     AuthenticationError,
     authenticate_store,
@@ -40,6 +41,29 @@ from tools.scheduling import clear_session_projects, post_call_summary_notes, po
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/vapi", tags=["vapi"])
+
+# Environment-aware webhook URL (Vapi sends tool calls back here)
+_WEBHOOK_URLS = {
+    "dev": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+    "qa": "https://schedulingagent.qa.projectsforce.com/vapi/webhook",
+    "staging": "https://schedulingagent.staging.projectsforce.com/vapi/webhook",
+    "prod": "https://schedulingagent.apps.projectsforce.com/vapi/webhook",
+}
+
+
+def _get_webhook_url() -> str:
+    env = get_settings().environment
+    return _WEBHOOK_URLS.get(env, _WEBHOOK_URLS["dev"])
+
+
+# Shared voice config — used by main assistant, store assistant, AND transfer assistant
+# so the caller hears a consistent voice throughout the entire call.
+_VOICE_CONFIG = {
+    "provider": "cartesia",
+    "model": "sonic-3",
+    "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
+    "speed": 1.0,
+}
 
 # Background tasks need a strong reference to avoid GC before completion
 _background_tasks: set[asyncio.Task] = set()
@@ -108,6 +132,37 @@ async def vapi_webhook(request: Request):
     return {"status": "ok"}
 
 
+# ── Office hours helper ──────────────────────────────────────────────────
+
+
+def _build_office_hours_context(office_hours: list[dict], timezone: str) -> dict:
+    """Build office hours context for the assistant prompt.
+
+    Returns a dict with ``is_open``, ``prompt_snippet`` (text to inject into
+    the system prompt), and the raw ``check_office_hours`` result.
+    """
+    info = check_office_hours(office_hours, timezone)
+    is_open = info["is_open"]
+
+    if is_open:
+        snippet = ""
+    else:
+        parts = [f"The office is currently CLOSED (timezone: {timezone})."]
+        if info["today_hours"]:
+            parts.append(f"Today's hours: {info['today_hours']['start']} – {info['today_hours']['end']}.")
+        if info["next_open"]:
+            parts.append(f"Next open: {info['next_open']}.")
+        parts.append(
+            "If the caller asks to speak to someone or transfer, say: "
+            "'Our office is currently closed. We're open again {next_open}. "
+            "Is there anything else I can help you with?' "
+            "Do NOT attempt the transfer.".format(next_open=info["next_open"] or "during business hours")
+        )
+        snippet = " ".join(parts)
+
+    return {"is_open": is_open, "prompt_snippet": snippet, **info}
+
+
 # ── Assistant request handler (dynamic greeting at call start) ───────────
 
 
@@ -140,6 +195,8 @@ async def _handle_assistant_request(body: dict) -> dict:
     first_name = ""
     client_name = "ProjectsForce"
     support_number = ""
+    office_hours: list[dict] = []
+    tenant_timezone = "US/Eastern"
     if from_phone:
         try:
             creds = await get_or_authenticate(from_phone, to_phone)
@@ -147,6 +204,8 @@ async def _handle_assistant_request(body: dict) -> dict:
             first_name = user_name.split()[0] if user_name and user_name.strip() else ""
             client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
             support_number = creds.get("support_number", "")
+            office_hours = creds.get("office_hours", [])
+            tenant_timezone = creds.get("timezone", "US/Eastern")
         except AuthenticationError as exc:
             # Auth failure = unknown caller (could be store/retailer or unrecognized customer)
             logger.info("Unknown caller detected (call_id=%s)", call_id)
@@ -159,23 +218,27 @@ async def _handle_assistant_request(body: dict) -> dict:
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
 
+    # Check office hours for transfer gating
+    hours_context = _build_office_hours_context(office_hours, tenant_timezone)
+
     if is_store_caller:
         _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False}
         greeting = _generate_store_greeting(client_name)
-        logger.info("Vapi unknown caller greeting: call_id=%s client=%s", call_id, client_name)
+        logger.info("Vapi unknown caller greeting: call_id=%s client=%s office_open=%s", call_id, client_name, hours_context.get("is_open"))
         return {"assistant": _build_store_assistant_config(
-            greeting, webhook_secret, client_name, support_number,
+            greeting, webhook_secret, client_name, support_number, hours_context,
         )}
 
     greeting = _generate_dynamic_greeting(first_name, client_name)
     logger.info(
-        "Vapi dynamic greeting: call_id=%s name=%s client=%s",
+        "Vapi dynamic greeting: call_id=%s name=%s client=%s office_open=%s",
         call_id,
         first_name or "(anonymous)",
         client_name,
+        hours_context.get("is_open"),
     )
 
-    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number, client_name)}
+    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number, client_name, hours_context)}
 
 
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
@@ -278,6 +341,7 @@ def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce")
                             "firstMessageMode": "assistant-speaks-first",
                             "maxDurationSeconds": 60,
                             "silenceTimeoutSeconds": 15,
+                            "voice": _VOICE_CONFIG,
                             "model": {
                                 "provider": "openai",
                                 "model": "gpt-4o-mini",
@@ -355,6 +419,7 @@ def _build_assistant_config(
     server_secret: str = "",
     support_number: str = "",
     client_name: str = "ProjectsForce",
+    hours_context: dict | None = None,
 ) -> dict:
     """Build the full Vapi assistant config returned on ``assistant-request``.
 
@@ -363,18 +428,14 @@ def _build_assistant_config(
     """
     name = client_name or "ProjectsForce"
     server_config: dict = {
-        "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "url": _get_webhook_url(),
         "timeoutSeconds": 30,
     }
     if server_secret:
         server_config["secret"] = server_secret
     return {
         "name": f"{name} Scheduling Bot",
-        "voice": {
-            "model": "sonic-3",
-            "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
-            "provider": "cartesia",
-        },
+        "voice": _VOICE_CONFIG,
         "model": {
             "model": "gpt-4o-mini",
             "provider": "openai",
@@ -424,6 +485,11 @@ def _build_assistant_config(
                         "only the scheduling bot can finalize it.\n"
                         "12. Do NOT end the call until the scheduling bot has confirmed the booking "
                         "is complete OR the user explicitly says goodbye/bye/that's all I need."
+                        + (
+                            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+                            if hours_context and hours_context.get("prompt_snippet")
+                            else ""
+                        )
                     ),
                 }
             ],
@@ -488,7 +554,7 @@ def _build_assistant_config(
         },
         "hipaaEnabled": False,
         "server": server_config,
-        "serverUrl": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "serverUrl": _get_webhook_url(),
     }
 
 
@@ -511,6 +577,7 @@ def _build_store_assistant_config(
     server_secret: str = "",
     client_name: str = "ProjectsForce",
     support_number: str = "",
+    hours_context: dict | None = None,
 ) -> dict:
     """Build the Vapi assistant config for unknown callers.
 
@@ -526,18 +593,14 @@ def _build_store_assistant_config(
     """
     name = client_name or "ProjectsForce"
     server_config: dict = {
-        "url": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "url": _get_webhook_url(),
         "timeoutSeconds": 30,
     }
     if server_secret:
         server_config["secret"] = server_secret
     return {
         "name": f"{name} Assistant",
-        "voice": {
-            "model": "sonic-3",
-            "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
-            "provider": "cartesia",
-        },
+        "voice": _VOICE_CONFIG,
         "model": {
             "model": "gpt-4o-mini",
             "provider": "openai",
@@ -596,6 +659,11 @@ def _build_store_assistant_config(
                         "'I'm transferring you now' and invoke the transfer.\n"
                         "- NEVER ask clarifying questions before calling the tool. "
                         "Let the scheduling bot handle clarification."
+                        + (
+                            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+                            if hours_context and hours_context.get("prompt_snippet")
+                            else ""
+                        )
                     ),
                 }
             ],
@@ -668,7 +736,7 @@ def _build_store_assistant_config(
         },
         "hipaaEnabled": False,
         "server": server_config,
-        "serverUrl": "https://schedulingagent.dev.projectsforce.com/vapi/webhook",
+        "serverUrl": _get_webhook_url(),
     }
 
 
@@ -1045,6 +1113,10 @@ async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None
             user_name=creds.get("user_name", ""),
             caller_type="store",
             tenant_phone=normalize_phone(store_session.get("to_phone", "")),
+            timezone=creds.get("timezone", "US/Eastern"),
+            support_number=creds.get("support_number", ""),
+            support_email=creds.get("support_email", ""),
+            office_hours=creds.get("office_hours", []),
         )
         return
 
@@ -1067,6 +1139,10 @@ async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None
             customer_id=creds.get("customer_id", creds.get("user_id", "")),
             user_id=creds.get("user_id", ""),
             user_name=creds.get("user_name", ""),
+            timezone=creds.get("timezone", "US/Eastern"),
+            support_number=creds.get("support_number", ""),
+            support_email=creds.get("support_email", ""),
+            office_hours=creds.get("office_hours", []),
         )
     except Exception:
         logger.exception("Phone auth failed for session %s", session_id)
