@@ -13,6 +13,10 @@ _user_id: ContextVar[str] = ContextVar("user_id", default="")
 _user_name: ContextVar[str] = ContextVar("user_name", default="")
 _caller_type: ContextVar[str] = ContextVar("caller_type", default="customer")
 _tenant_phone: ContextVar[str] = ContextVar("tenant_phone", default="")
+_timezone: ContextVar[str] = ContextVar("timezone", default="US/Eastern")
+_support_number: ContextVar[str] = ContextVar("support_number", default="")
+_support_email: ContextVar[str] = ContextVar("support_email", default="")
+_office_hours: ContextVar[list] = ContextVar("office_hours", default=[])
 
 
 class AuthContext:
@@ -28,6 +32,10 @@ class AuthContext:
         user_name: str | None = None,
         caller_type: str | None = None,
         tenant_phone: str | None = None,
+        timezone: str | None = None,
+        support_number: str | None = None,
+        support_email: str | None = None,
+        office_hours: list | None = None,
     ) -> None:
         if auth_token is not None:
             _auth_token.set(auth_token)
@@ -43,6 +51,14 @@ class AuthContext:
             _caller_type.set(caller_type)
         if tenant_phone is not None:
             _tenant_phone.set(tenant_phone)
+        if timezone is not None:
+            _timezone.set(timezone)
+        if support_number is not None:
+            _support_number.set(support_number)
+        if support_email is not None:
+            _support_email.set(support_email)
+        if office_hours is not None:
+            _office_hours.set(office_hours)
 
     @staticmethod
     def get_auth_token() -> str:
@@ -73,6 +89,22 @@ class AuthContext:
         return _tenant_phone.get()
 
     @staticmethod
+    def get_timezone() -> str:
+        return _timezone.get()
+
+    @staticmethod
+    def get_support_number() -> str:
+        return _support_number.get()
+
+    @staticmethod
+    def get_support_email() -> str:
+        return _support_email.get()
+
+    @staticmethod
+    def get_office_hours() -> list:
+        return _office_hours.get()
+
+    @staticmethod
     def clear() -> None:
         _auth_token.set("")
         _client_id.set("")
@@ -81,3 +113,7 @@ class AuthContext:
         _user_name.set("")
         _caller_type.set("customer")
         _tenant_phone.set("")
+        _timezone.set("US/Eastern")
+        _support_number.set("")
+        _support_email.set("")
+        _office_hours.set([])

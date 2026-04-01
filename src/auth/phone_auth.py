@@ -233,6 +233,7 @@ def _get_cached_creds(phone: str) -> dict | None:
             "exp": float(exp) if hasattr(exp, "__float__") else exp,
             "support_number": item.get("support_number", ""),
             "support_email": item.get("support_email", ""),
+            "office_hours": item.get("office_hours", []),
         }
 
     except Exception:
@@ -269,6 +270,7 @@ def _store_credentials(phone: str, credentials: dict) -> None:
                 "ttl": ttl,
                 "support_number": credentials.get("support_number", ""),
                 "support_email": credentials.get("support_email", ""),
+                "office_hours": credentials.get("office_hours", []),
             }
         )
         logger.info("Stored credentials for ***%s (TTL: %d)", phone[-4:], ttl)
@@ -335,6 +337,7 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
             "updated_at": datetime.now(UTC).isoformat(),
             "support_number": data.get("support_number", ""),
             "support_email": data.get("support_email_1", ""),
+            "office_hours": data.get("office_hours", []),
         }
 
     except httpx.HTTPError as exc:
@@ -415,6 +418,7 @@ async def authenticate_store(
             "updated_at": datetime.now(UTC).isoformat(),
             "support_number": data.get("support_number", ""),
             "support_email": data.get("support_email_1", ""),
+            "office_hours": data.get("office_hours", []),
         }
 
         _store_credentials(cache_key, credentials)

@@ -14,6 +14,7 @@ dependencies = [
     "pydantic-settings",
     "uvicorn>=0.40.0",
     "python-multipart>=0.0.22",
+    "tzdata>=2025.3",
 ]
 
 [tool.uv]
