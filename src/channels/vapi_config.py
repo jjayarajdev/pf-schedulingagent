@@ -22,8 +22,8 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache: assistant_id -> (phone_number, timestamp)
-_cache: dict[str, tuple[str, float]] = {}
+# In-memory cache: assistant_id -> {phone_number, support_number, ts}
+_cache: dict[str, dict] = {}
 _CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
@@ -33,23 +33,31 @@ def get_phone_for_assistant(assistant_id: str) -> str:
     Checks in-memory cache first, then DynamoDB.  Returns empty string
     if the assistant is not registered.
     """
+    info = get_assistant_info(assistant_id)
+    return info.get("phone_number", "")
+
+
+def get_assistant_info(assistant_id: str) -> dict:
+    """Return assistant config (phone_number, support_number, tenant_name).
+
+    Checks in-memory cache first, then DynamoDB.  Returns empty dict
+    if the assistant is not registered.
+    """
     if not assistant_id:
-        return ""
+        return {}
 
     # Check in-memory cache
     cached = _cache.get(assistant_id)
     if cached:
-        phone, ts = cached
-        if time.monotonic() - ts < _CACHE_TTL_SECONDS:
-            return phone
-        # Expired — fall through to DynamoDB
+        if time.monotonic() - cached["ts"] < _CACHE_TTL_SECONDS:
+            return cached
         del _cache[assistant_id]
 
     # DynamoDB lookup
     settings = get_settings()
     table_name = settings.vapi_assistants_table
     if not table_name:
-        return ""
+        return {}
 
     try:
         dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
@@ -58,27 +66,35 @@ def get_phone_for_assistant(assistant_id: str) -> str:
 
         if "Item" not in response:
             logger.warning("No Vapi config for assistant %s", assistant_id)
-            return ""
+            return {}
 
-        phone = response["Item"].get("phone_number", "")
-        if phone:
-            _cache[assistant_id] = (phone, time.monotonic())
+        item = response["Item"]
+        info = {
+            "phone_number": item.get("phone_number", ""),
+            "support_number": item.get("support_number", ""),
+            "tenant_name": item.get("tenant_name", ""),
+            "ts": time.monotonic(),
+        }
+        if info["phone_number"]:
+            _cache[assistant_id] = info
             logger.info(
-                "Resolved Vapi phone for assistant %s: ***%s",
+                "Resolved Vapi assistant %s: phone=***%s support=%s",
                 assistant_id[:8],
-                phone[-4:],
+                info["phone_number"][-4:],
+                info["support_number"] or "none",
             )
-        return phone
+        return info
 
     except Exception:
         logger.exception("Failed to look up Vapi assistant config: %s", assistant_id)
-        return ""
+        return {}
 
 
 def register_assistant(
     assistant_id: str,
     phone_number: str,
     tenant_name: str = "",
+    support_number: str = "",
 ) -> None:
     """Register or update a Vapi assistant → phone number mapping."""
     settings = get_settings()
@@ -96,18 +112,25 @@ def register_assistant(
             "assistant_id": assistant_id,
             "phone_number": phone_number,
             "tenant_name": tenant_name,
+            "support_number": support_number,
             "updated_at": now,
             "created_at": now,
         }
     )
 
     # Update cache
-    _cache[assistant_id] = (phone_number, time.monotonic())
+    _cache[assistant_id] = {
+        "phone_number": phone_number,
+        "support_number": support_number,
+        "tenant_name": tenant_name,
+        "ts": time.monotonic(),
+    }
     logger.info(
-        "Registered Vapi assistant %s → %s (tenant: %s)",
+        "Registered Vapi assistant %s → %s (tenant: %s, support: %s)",
         assistant_id[:8],
         phone_number,
         tenant_name or "—",
+        support_number or "—",
     )
 
 

@@ -81,7 +81,11 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
         return cached
 
     # Step 2: Call PF phone-call-login API
-    logger.info("Authenticating ***%s via PF API", phone[-4:])
+    logger.info(
+        "Authenticating ***%s via PF API (to_phone=%s)",
+        phone[-4:],
+        f"***{to_clean[-4:]}" if to_clean else "none",
+    )
     try:
         credentials = await _call_auth_api(phone, to_clean)
     except AuthenticationError:
@@ -239,6 +243,24 @@ def _get_cached_creds(phone: str) -> dict | None:
     except Exception:
         logger.exception("Error reading credentials from DynamoDB for ***%s", phone[-4:])
         return None
+
+
+def delete_cached_creds(phone: str) -> bool:
+    """Delete cached credentials for a phone number. Returns True if deleted."""
+    normalized = normalize_phone(phone) if phone else ""
+    if not normalized:
+        return False
+
+    settings = get_settings()
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.Table(settings.phone_creds_table)
+        table.delete_item(Key={"phone_number": normalized})
+        logger.info("Deleted cached credentials for ***%s", normalized[-4:])
+        return True
+    except Exception:
+        logger.exception("Failed to delete cached credentials for ***%s", normalized[-4:])
+        return False
 
 
 def _store_credentials(phone: str, credentials: dict) -> None:

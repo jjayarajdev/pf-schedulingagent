@@ -30,7 +30,7 @@ from auth.phone_auth import (
 )
 from channels.conversation_log import log_conversation
 from channels.formatters import format_for_voice
-from channels.vapi_config import get_phone_for_assistant
+from channels.vapi_config import get_assistant_info, get_phone_for_assistant
 from config import get_secrets, get_settings
 from observability.logging import RequestContext
 from orchestrator import get_orchestrator
@@ -62,7 +62,6 @@ _VOICE_CONFIG = {
     "provider": "cartesia",
     "model": "sonic-3",
     "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
-    "speed": 1.0,
 }
 
 # Background tasks need a strong reference to avoid GC before completion
@@ -91,6 +90,11 @@ async def verify_vapi_secret(request: Request) -> None:
 
     provided = request.headers.get("x-vapi-secret", "")
     if not provided or provided != expected:
+        logger.warning(
+            "Vapi secret mismatch: provided=%s expected=%s",
+            provided[:8] + "..." if provided else "(empty)",
+            expected[:8] + "..." if expected else "(empty)",
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -108,10 +112,20 @@ async def vapi_webhook(request: Request):
     """
     body = await request.json()
 
-    # Server URL event: nested "message" dict with "type"
-    if isinstance(body.get("message"), dict) and "type" in body["message"]:
-        event_type = body["message"].get("type", "")
+    # Log payload structure for debugging
+    msg = body.get("message")
+    has_message = isinstance(msg, dict)
+    event_type = msg.get("type", "") if has_message else ""
+    logger.info(
+        "Vapi webhook payload: keys=%s message_type=%s event=%s has_secret=%s",
+        list(body.keys()),
+        type(msg).__name__,
+        event_type or "(none)",
+        bool(request.headers.get("x-vapi-secret")),
+    )
 
+    # Server URL event: nested "message" dict with "type"
+    if has_message and event_type:
         # assistant-request arrives before Vapi knows the server secret —
         # skip auth here; the response includes server.secret for future calls
         if event_type == "assistant-request":
@@ -183,9 +197,17 @@ async def _handle_assistant_request(body: dict) -> dict:
     call_id = call_data.get("id", "unknown")
 
     from_phone = _extract_phone_number(call_data)
-    to_phone = _resolve_to_phone(call_data)
+    to_phone, tenant_support_number = _resolve_to_phone_and_support(call_data)
 
-    logger.info("Vapi assistant-request: call_id=%s from=***%s", call_id, from_phone[-4:] if from_phone else "none")
+    # Debug: log keys Vapi sends so we can see phoneNumber / assistantId presence
+    logger.info(
+        "Vapi assistant-request: call_id=%s from=***%s to=***%s assistantId=%s phoneNumber=%s",
+        call_id,
+        from_phone[-4:] if from_phone else "none",
+        to_phone[-4:] if to_phone else "none",
+        call_data.get("assistantId", "none"),
+        call_data.get("phoneNumber", "none"),
+    )
 
     webhook_secret = get_secrets().vapi_api_key
     session_key = f"vapi-{call_id}"
@@ -194,7 +216,7 @@ async def _handle_assistant_request(body: dict) -> dict:
     is_store_caller = False
     first_name = ""
     client_name = "ProjectsForce"
-    support_number = ""
+    support_number = tenant_support_number  # Pre-populated from vapi-assistants table
     office_hours: list[dict] = []
     tenant_timezone = "US/Eastern"
     if from_phone:
@@ -203,7 +225,7 @@ async def _handle_assistant_request(body: dict) -> dict:
             user_name = creds.get("user_name", "")
             first_name = user_name.split()[0] if user_name and user_name.strip() else ""
             client_name = creds.get("client_name", "ProjectsForce") or "ProjectsForce"
-            support_number = creds.get("support_number", "")
+            support_number = creds.get("support_number", "") or support_number
             office_hours = creds.get("office_hours", [])
             tenant_timezone = creds.get("timezone", "US/Eastern")
         except AuthenticationError as exc:
@@ -458,10 +480,16 @@ def _build_assistant_config(
                         "Keep it conversational — you are on a phone call.\n"
                         "5. For multi-step flows (scheduling, rescheduling), call ask_scheduling_bot "
                         "for EVERY step. The bot maintains conversation context.\n"
-                        "6. If the user asks to speak to a person, transfer the call, or wants human support, "
-                        "use the transferCall tool to connect them. Do NOT read out a phone number. "
-                        "Do NOT use filler phrases for transfers — just say "
-                        "'I\\'m transferring you now' and invoke the transfer immediately.\n"
+                        "6. If the user asks to speak to a person, transfer the call, or wants human support: "
+                        "use the transferCall tool if available. Do NOT use filler phrases — just say "
+                        "'I\\'m transferring you now' and invoke the transfer immediately. "
+                        "If transferCall is NOT available, say: "
+                        "'I\\'m sorry, I\\'m unable to transfer you right now. "
+                        "Please contact our support team directly for further assistance.'\n"
+                        "6b. Whenever you would read out a phone number, offer to transfer "
+                        "the caller instead: 'Would you like me to connect you directly?' "
+                        "If yes, use the transferCall tool. If transferCall is not available "
+                        "or the caller declines, read the number.\n"
                         "7. Only handle basic greetings and goodbyes yourself. "
                         "Everything else goes through ask_scheduling_bot.\n"
                         "8. Keep your spoken responses concise — this is a phone call, not a text chat. "
@@ -477,14 +505,19 @@ def _build_assistant_config(
                         'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
                         "10. If the tool call fails, say: "
                         '"I\'m having trouble looking that up. Let me try again." and retry once.\n'
-                        "11. CRITICAL — CONFIRMATION COMPLETES THE BOOKING: When the scheduling bot "
-                        'asks the user to confirm (e.g., "Should I go ahead?", "Shall I book this?"), '
-                        "the user's reply (yes, sure, go ahead, confirm, etc.) MUST be passed back "
-                        "to ask_scheduling_bot. The booking is NOT complete until the bot processes "
-                        "the confirmation. NEVER end the call or assume the appointment is booked — "
-                        "only the scheduling bot can finalize it.\n"
-                        "12. Do NOT end the call until the scheduling bot has confirmed the booking "
-                        "is complete OR the user explicitly says goodbye/bye/that's all I need."
+                        "11. CRITICAL — YOU CANNOT BOOK APPOINTMENTS YOURSELF. EVERY scheduling step "
+                        "MUST go through ask_scheduling_bot. This includes:\n"
+                        "   - Getting available dates → call ask_scheduling_bot\n"
+                        "   - User picks a date/time → call ask_scheduling_bot with their choice\n"
+                        "   - User confirms 'yes, book it' → call ask_scheduling_bot with 'yes'\n"
+                        "   The appointment is NOT booked until ask_scheduling_bot returns a message "
+                        "containing 'confirmed' or 'scheduled'. If you haven't received that, "
+                        "the booking DID NOT HAPPEN. Never tell the user their appointment is "
+                        "confirmed unless ask_scheduling_bot explicitly said so.\n"
+                        "12. Do NOT end the call until ask_scheduling_bot has returned a confirmation "
+                        "message OR the user explicitly says goodbye/bye/that's all I need. "
+                        "If the user says 'yes' or 'go ahead' to book, you MUST call "
+                        "ask_scheduling_bot ONE MORE TIME with their confirmation before ending."
                         + (
                             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
                             if hours_context and hours_context.get("prompt_snippet")
@@ -566,7 +599,7 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     """
     name = client_name or "ProjectsForce"
     return (
-        f'<break time="3000ms"/> Hi, this is {name}. '
+        f'<break time="3000ms"/> Hello! I\'m J from {name}. '
         '<break time="300ms"/> '
         "How can I help you today?"
     )
@@ -627,19 +660,23 @@ def _build_store_assistant_config(
                         "with lookup_type and lookup_value.\n"
                         "4. If CUSTOMER: say 'I don't recognize your phone number. "
                         "Let me transfer you to our team so they can help you.' "
-                        "Then use the transferCall tool.\n"
+                        "Then use the transferCall tool if available. If transferCall "
+                        "is not available, say: 'Please contact our support team "
+                        "directly and they\\'ll be happy to assist you.'\n"
                         "5. If their request is NOT project-related (e.g., job inquiry, "
                         "sales call, wrong number), say: 'Let me connect you with "
-                        "someone who can help.' Then use the transferCall tool.\n\n"
+                        "someone who can help.' Then use the transferCall tool if available. "
+                        "If not, say: 'Please contact our support team directly.'\n\n"
                         "## AFTER RETAILER AUTHENTICATION\n"
                         "Once authenticated via ask_store_bot, follow these rules:\n"
                         "- Use ask_store_bot for ALL subsequent queries. "
                         "You do NOT need lookup_type/lookup_value again.\n"
                         "- Pass the user's EXACT words in the \"question\" field. "
                         "Do NOT rephrase.\n"
-                        "- NEVER share customer names, technician names, phone numbers, "
+                        "- NEVER share customer names, phone numbers, "
                         "email addresses, or street addresses. "
-                        "Only share project status, project numbers, and PO numbers.\n"
+                        "Only share project status, scheduled dates, technician names, "
+                        "project numbers, and PO numbers.\n"
                         "- NEVER offer to schedule, reschedule, or cancel appointments. "
                         "Retailer callers can ONLY check project status. If they ask, "
                         "say: 'Scheduling is not available for retailer calls. "
@@ -657,6 +694,12 @@ def _build_store_assistant_config(
                         'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
                         "- Do NOT use filler phrases for transfers — just say "
                         "'I'm transferring you now' and invoke the transfer.\n"
+                        "- Whenever you would read out a phone number, offer to transfer "
+                        "the caller instead: 'Would you like me to connect you directly?' "
+                        "If yes, use the transferCall tool. If transferCall is not available "
+                        "or the caller declines, read the number.\n"
+                        "- If transferCall is not available and you cannot transfer, say: "
+                        "'Please contact our support team directly for further assistance.'\n"
                         "- NEVER ask clarifying questions before calling the tool. "
                         "Let the scheduling bot handle clarification."
                         + (
@@ -869,7 +912,7 @@ def _handle_server_event(body: dict) -> dict:
         store_session = _store_sessions.get(session_key)
 
         if store_session and store_session.get("authenticated") and summary:
-            # Store call — use /authentication/add-note endpoint
+            # Store call — use /project-notes/add-note endpoint
             store_creds = store_session["creds"]
             task = asyncio.create_task(
                 post_store_call_notes(
@@ -1025,14 +1068,22 @@ async def _handle_store_bot(
             )
         store_session["creds"] = creds
         store_session["authenticated"] = True
+        store_session["support_number"] = creds.get("support_number", "")
+        store_session["client_name"] = creds.get("client_name", "")
         _store_sessions[session_key] = store_session
 
     if not question:
-        return _build_tool_result(
+        msg = (
             "You're verified! How can I help you? "
-            "I can look up project status and details.",
-            tool_call_id,
+            "I can look up project status and details."
         )
+        support = store_session.get("support_number", "")
+        if support:
+            msg += (
+                f" If you need to speak with someone, "
+                f"the support number is {support}."
+            )
+        return _build_tool_result(msg, tool_call_id)
 
     # Step 2: Set AuthContext from cached store creds
     creds = store_session["creds"]
@@ -1049,7 +1100,7 @@ async def _handle_store_bot(
     # Step 3: Route through orchestrator with store context
     # Prepend store instruction so the scheduling agent restricts its response
     store_question = (
-        "[STORE CALLER — status only, no scheduling, no customer/technician names] "
+        "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
         + question
     )
     agent_name = ""
@@ -1161,31 +1212,40 @@ def _extract_phone_number(call_data: dict) -> str:
 
 
 def _resolve_to_phone(call_data: dict) -> str:
-    """Resolve the destination phone number from call data.
+    """Resolve the destination phone number from call data."""
+    phone, _ = _resolve_to_phone_and_support(call_data)
+    return phone
 
-    Fallback chain:
-    1. ``call_data.phoneNumber`` — populated for Twilio/Vonage numbers
-    2. Vapi assistant config table — maps ``assistantId`` → phone number
-    3. ``VAPI_PHONE_NUMBER`` env var — legacy single-tenant fallback
+
+def _resolve_to_phone_and_support(call_data: dict) -> tuple[str, str]:
+    """Resolve destination phone and support number from call data.
+
+    Returns (to_phone, support_number). Support number comes from the
+    vapi-assistants table (registered per tenant).
     """
+    support_number = ""
+
     # 1. Direct from call data (Twilio/Vonage-backed Vapi numbers)
     phone_obj = call_data.get("phoneNumber")
     if isinstance(phone_obj, dict):
         phone = phone_obj.get("number", "")
         if phone:
-            return phone
+            return phone, support_number
     elif isinstance(phone_obj, str) and phone_obj:
-        return phone_obj
+        return phone_obj, support_number
 
     # 2. Look up by assistant ID (multi-tenant, Vapi-managed numbers)
     assistant_id = call_data.get("assistantId", "")
     if assistant_id:
-        phone = get_phone_for_assistant(assistant_id)
+        info = get_assistant_info(assistant_id)
+        phone = info.get("phone_number", "")
+        support_number = info.get("support_number", "")
         if phone:
-            return phone
+            return phone, support_number
 
     # 3. Legacy env var fallback
-    return get_settings().vapi_phone_number
+    settings = get_settings()
+    return settings.vapi_phone_number, support_number or settings.default_support_number
 
 
 def _build_tool_result(text: str, tool_call_id: str = "") -> dict:

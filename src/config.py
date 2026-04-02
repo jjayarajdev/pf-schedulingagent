@@ -18,6 +18,13 @@ _PF_API_URLS = {
     "prod": "https://api-cx-portal.apps.projectsforce.com",
 }
 
+# Vapi phone numbers per environment (Vapi-managed numbers don't send
+# phoneNumber or assistantId in assistant-request, so we need a fallback)
+_VAPI_PHONE_NUMBERS = {
+    "dev": "+19566699322",
+    "qa": "+14588990940",
+}
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -45,6 +52,7 @@ class Settings(BaseSettings):
     vapi_secret_arn: str = ""
     vapi_assistants_table: str = ""  # assistant_id → phone_number mapping
     vapi_phone_number: str = ""  # Legacy fallback (prefer vapi_assistants_table)
+    default_support_number: str = ""  # Fallback support number for call transfers
 
     # SMS (AWS End User Messaging / pinpoint-sms-voice-v2)
     sms_origination_number: str = ""
@@ -74,6 +82,10 @@ class Settings(BaseSettings):
             self.dynamodb_conversations_table = f"pf-syn-schedulingagents-conversations-{env}"
         if not self.vapi_assistants_table:
             self.vapi_assistants_table = f"pf-syn-schedulingagents-vapi-assistants-{env}"
+
+        # Vapi phone number fallback
+        if not self.vapi_phone_number:
+            self.vapi_phone_number = _VAPI_PHONE_NUMBERS.get(env, "")
 
         # SMS configuration set: scheduling-agent-sms-config-{env}
         if not self.sms_configuration_set:

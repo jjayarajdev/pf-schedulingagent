@@ -46,7 +46,7 @@ class TestVapiAssistantEndpoints:
         assert data["assistant_id"] == "asst-123"
         assert data["phone_number"] == "+19566699322"
         assert data["tenant_name"] == "Test Corp"
-        mock_reg.assert_called_once_with("asst-123", "+19566699322", "Test Corp")
+        mock_reg.assert_called_once_with("asst-123", "+19566699322", "Test Corp", "")
 
     def test_register_missing_fields(self):
         """Rejects registration without required fields."""
