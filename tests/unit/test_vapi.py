@@ -1039,7 +1039,7 @@ class TestPostCallSummaryNotes:
 
 
 class TestPostStoreCallNotes:
-    """Store call notes use /authentication/add-note endpoint."""
+    """Store call notes use /project-notes/add-note endpoint."""
 
     @pytest.mark.asyncio
     async def test_posts_note_per_project(self):
@@ -1078,7 +1078,7 @@ class TestPostStoreCallNotes:
             # Verify it uses /authentication/add-note endpoint
             first_call = mock_client.post.call_args_list[0]
             url = first_call[0][0] if first_call[0] else first_call[1].get("url", "")
-            assert "/authentication/add-note" in url
+            assert "/project-notes/add-note" in url
 
             # Verify payload has client_id, project_id (int), note_text
             payload = first_call[1].get("json", {})
@@ -1105,7 +1105,7 @@ class TestPostStoreCallNotes:
 
 
 class TestStoreEndOfCallNotes:
-    """End-of-call handler routes store calls to /authentication/add-note."""
+    """End-of-call handler routes store calls to /project-notes/add-note."""
 
     def test_store_call_uses_store_notes(self, client):
         """Store session end-of-call uses post_store_call_notes."""

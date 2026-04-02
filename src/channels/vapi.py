@@ -295,16 +295,12 @@ def _normalize_e164(phone: str) -> str:
 
 
 def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce") -> list[dict]:
-    """Build a Vapi ``transferCall`` tool for warm transfer (experimental mode).
+    """Build a Vapi ``transferCall`` tool using blind transfer (SIP REFER).
 
-    Uses ``warm-transfer-experimental`` with a dedicated transfer assistant
-    that speaks a conversation summary to the support agent before connecting
-    the caller.  After ``transferSuccessful``, Vapi exits and the parties are
-    connected directly (no ongoing Vapi charge).
-
-    Hold music plays to the caller via ``holdAudioUrl`` while the transfer
-    assistant talks to the operator.  If the transfer fails, the caller
-    returns to the bot (``fallbackPlan.endCallEnabled: false``).
+    Blind transfer is the most reliable mode — Vapi initiates a standard SIP
+    transfer to the support number, the customer hears ringing, and once the
+    agent answers they are connected directly.  Vapi exits completely after
+    the transfer.
 
     Returns a list with one tool dict if ``support_number`` is provided,
     or an empty list (so it can be unpacked with ``*`` into the tools array).
@@ -312,7 +308,6 @@ def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce")
     if not support_number:
         return []
 
-    name = client_name or "ProjectsForce"
     e164 = _normalize_e164(support_number)
 
     return [
@@ -322,13 +317,13 @@ def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce")
                 {
                     "type": "request-start",
                     "content": (
-                        "I'm transferring you to our support team now. "
-                        "Please hold while I connect you."
+                        "I'm transferring you now. "
+                        "You'll hear ringing while I connect you."
                     ),
                 },
                 {
                     "type": "request-complete",
-                    "content": "https://desert-horse-9859.twil.io/assets/soothing-sound.mp3",
+                    "content": "You're now connected. Have a great day!",
                 },
                 {
                     "type": "request-failed",
@@ -344,76 +339,7 @@ def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce")
                     "type": "number",
                     "number": e164,
                     "transferPlan": {
-                        "mode": "warm-transfer-experimental",
-                        "holdAudioUrl": "https://desert-horse-9859.twil.io/assets/soothing-sound.mp3",
-                        "voicemailDetectionType": "transcript",
-                        "fallbackPlan": {
-                            "message": (
-                                "I wasn't able to connect you to our support team. "
-                                f"You can reach them directly at {_format_phone_for_speech(e164)}. "
-                                "Is there anything else I can help you with?"
-                            ),
-                            "endCallEnabled": False,
-                        },
-                        "transferAssistant": {
-                            "firstMessage": (
-                                f"Hi, this is J from {name}. "
-                                "I have a customer on hold. Quick brief."
-                            ),
-                            "firstMessageMode": "assistant-speaks-first",
-                            "maxDurationSeconds": 60,
-                            "silenceTimeoutSeconds": 15,
-                            "voice": _VOICE_CONFIG,
-                            "model": {
-                                "provider": "openai",
-                                "model": "gpt-4o-mini",
-                                "messages": [
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            "You are a call transfer assistant. Be VERY brief.\n\n"
-                                            "After your greeting, give a 2-3 sentence summary:\n"
-                                            "- Caller name\n"
-                                            "- What they need (one line)\n"
-                                            "- Then ask: 'Ready to connect?'\n\n"
-                                            "Do NOT retell the whole conversation. "
-                                            "Do NOT list every project detail. "
-                                            "Just the essentials — the customer is waiting.\n\n"
-                                            "If agent says yes → call transferSuccessful.\n"
-                                            "If agent says no or it's voicemail → call transferCancel."
-                                        ),
-                                    },
-                                ],
-                                "tools": [
-                                    {
-                                        "type": "transferSuccessful",
-                                        "function": {
-                                            "name": "transferSuccessful",
-                                            "description": "Connect the customer when the agent is ready.",
-                                        },
-                                        "messages": [
-                                            {
-                                                "type": "request-start",
-                                                "content": "Connecting the customer now.",
-                                            },
-                                        ],
-                                    },
-                                    {
-                                        "type": "transferCancel",
-                                        "function": {
-                                            "name": "transferCancel",
-                                            "description": "Cancel the transfer if the agent is unavailable or it's voicemail.",
-                                        },
-                                        "messages": [
-                                            {
-                                                "type": "request-complete",
-                                                "content": "I'll let the customer know.",
-                                            },
-                                        ],
-                                    },
-                                ],
-                            },
-                        },
+                        "mode": "blind-transfer",
                     },
                 }
             ],

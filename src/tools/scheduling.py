@@ -1174,7 +1174,7 @@ async def post_store_call_notes(
     summary: str,
     duration_seconds: float = 0,
 ) -> None:
-    """Post call summary as a note for store calls via /authentication/add-note.
+    """Post call summary as a note for store calls via /project-notes/add-note.
 
     Store callers don't have customer-level auth, so we use the separate
     add-note endpoint that only requires client_id + project_id.
@@ -1210,7 +1210,7 @@ async def post_store_call_notes(
             if truncated_summary:
                 note_text += f" Summary: {truncated_summary}"
 
-            url = f"{base_url}/authentication/add-note"
+            url = f"{base_url}/project-notes/add-note"
             payload = {
                 "client_id": client_id,
                 "project_id": int(project_id),
@@ -1281,12 +1281,19 @@ async def get_project_weather(project_id: str = "") -> str:
         if not target:
             return f"Project {project_id} not found."
     else:
-        # Use the first project with an address
+        # Prefer a scheduled project (user likely wants weather for their appointment)
         for p in projects:
             addr = p.get("address", {})
-            if addr.get("city"):
+            if addr.get("city") and p.get("scheduledDate"):
                 target = p
                 break
+        # Fallback to any project with an address
+        if not target:
+            for p in projects:
+                addr = p.get("address", {})
+                if addr.get("city"):
+                    target = p
+                    break
 
     if not target:
         return "No project address available. Please specify a location."
@@ -1306,8 +1313,14 @@ async def get_project_weather(project_id: str = "") -> str:
         parts.append(zipcode)
     location = ", ".join(parts)
 
-    logger.info("Weather for project %s at %s", target["id"], location)
-    result = await get_weather(location)
+    # Pass scheduled date so weather focuses on the installation day
+    scheduled_date = target.get("scheduledDate", "")
+
+    logger.info(
+        "Weather for project %s at %s (scheduled=%s)",
+        target["id"], location, scheduled_date or "unscheduled",
+    )
+    result = await get_weather(location, target_date=scheduled_date)
 
     # Merge project context into weather JSON
     try:
@@ -1315,7 +1328,8 @@ async def get_project_weather(project_id: str = "") -> str:
         project_label = target.get("category", target.get("projectType", "Project"))
         weather_data["project"] = project_label
         weather_data["project_id"] = target["id"]
-        weather_data["message"] = f"Weather for {project_label} at {location}"
+        if not scheduled_date:
+            weather_data["message"] = f"Weather for {project_label} at {location}"
         return json.dumps(weather_data, indent=2)
     except (json.JSONDecodeError, TypeError):
         # Fallback for non-JSON weather responses (error messages)

@@ -67,6 +67,7 @@ TASK_POLICY='{
         "dynamodb:UpdateItem",
         "dynamodb:DeleteItem",
         "dynamodb:Query",
+        "dynamodb:BatchWriteItem",
         "dynamodb:DescribeTable"
       ],
       "Resource": [
