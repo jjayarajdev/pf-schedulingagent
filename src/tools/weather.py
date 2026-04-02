@@ -143,8 +143,13 @@ def _get_project_location() -> str | None:
     return None
 
 
-async def get_weather(location: str = "") -> str:
-    """Get 5-day weather forecast for a location."""
+async def get_weather(location: str = "", target_date: str = "") -> str:
+    """Get weather forecast for a location.
+
+    If ``target_date`` (YYYY-MM-DD) is provided, extends the forecast range
+    to cover that date and highlights it in the response.  Otherwise returns
+    the default 5-day forecast from today.
+    """
     if not location or not location.strip():
         project_location = _get_project_location()
         if project_location:
@@ -159,13 +164,29 @@ async def get_weather(location: str = "") -> str:
     if not geo:
         return f"Sorry, I couldn't find the location '{location}'. Try a city name, state, or ZIP code."
 
+    # Determine how many forecast days we need
+    forecast_days = 5
+    if target_date:
+        try:
+            target_dt = datetime.strptime(target_date[:10], "%Y-%m-%d")
+            days_ahead = (target_dt - datetime.now()).days + 1
+            if days_ahead > 16:
+                return (
+                    f"The scheduled date ({target_date[:10]}) is more than 16 days away. "
+                    "Weather forecasts are only available up to 16 days out. "
+                    "Check back closer to the date for an accurate forecast."
+                )
+            forecast_days = max(5, min(days_ahead + 1, 16))
+        except ValueError:
+            logger.warning("Invalid target_date: %s", target_date)
+
     lat, lon = geo["latitude"], geo["longitude"]
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}"
         f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
         f"&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
-        f"&timezone=America/New_York&forecast_days=5"
+        f"&timezone=America/New_York&forecast_days={forecast_days}"
     )
 
     try:
@@ -213,7 +234,7 @@ async def get_weather(location: str = "") -> str:
     # Current = today's forecast
     today = forecast_days[0] if forecast_days else {}
 
-    result = {
+    result: dict = {
         "location": location_name,
         "current": {
             "temperature": today.get("high"),
@@ -223,4 +244,33 @@ async def get_weather(location: str = "") -> str:
         "message": f"5-Day Forecast for {location_name}",
     }
 
+    # If a target date was requested, highlight it and trim the forecast
+    if target_date:
+        target_key = target_date[:10]
+        target_forecast = next(
+            (d for d in forecast_days if d["date"] == target_key), None
+        )
+        if target_forecast:
+            result["scheduled_date"] = target_forecast
+            result["message"] = (
+                f"Weather for {location_name} on {target_forecast['day_name']} "
+                f"{target_key}: {target_forecast['condition']}, "
+                f"high {target_forecast['high']}°F, low {target_forecast['low']}°F"
+            )
+            # Keep only a few days around the target for context
+            result["forecast"] = [
+                d for d in forecast_days
+                if abs(_days_between(d["date"], target_key)) <= 2
+            ]
+
     return json.dumps(result, indent=2)
+
+
+def _days_between(date_a: str, date_b: str) -> int:
+    """Return the signed difference in days between two YYYY-MM-DD strings."""
+    try:
+        a = datetime.strptime(date_a[:10], "%Y-%m-%d")
+        b = datetime.strptime(date_b[:10], "%Y-%m-%d")
+        return (a - b).days
+    except ValueError:
+        return 999

@@ -257,6 +257,22 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
     return any(p in lower for p in _FABRICATED_FAILURE_PATTERNS)
 
 
+# Patterns the LLM uses when asking the user to confirm a scheduling action.
+# If ANY of these appear in the response, the UI should show Yes/No buttons.
+_CONFIRMATION_ASK_PATTERNS = re.compile(
+    r"(?:"
+    r"should I (?:go ahead|schedule|book|confirm|proceed)"
+    r"|shall I (?:go ahead|schedule|book|confirm|proceed)"
+    r"|would you like (?:me to |to )(?:go ahead|schedule|book|confirm|proceed)"
+    r"|want me to (?:go ahead|schedule|book|confirm|proceed)"
+    r"|ready to (?:schedule|book|confirm)"
+    r"|do you (?:want to |wish to )?(?:go ahead|confirm|proceed)"
+    r"|can I (?:go ahead|schedule|book|confirm)"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _detect_response_signals(response_text: str) -> dict:
     """Detect confirmation requests, actions, and PF API errors from response text.
 
@@ -265,25 +281,14 @@ def _detect_response_signals(response_text: str) -> dict:
     """
     signals: dict = {}
 
-    # Detect confirmation-before-write pattern
-    # Tool returns "Please confirm: Schedule appointment for project X on Y at Z?"
-    if "Please confirm:" in response_text and "confirmed=true" in response_text:
+    # Detect confirmation-before-write pattern — the LLM asks the user
+    # to confirm an appointment (e.g., "Should I go ahead and schedule this?")
+    if _CONFIRMATION_ASK_PATTERNS.search(response_text):
         signals["confirmation_required"] = True
-        # Try to extract pending action details from the confirmation prompt
-        pending = {}
-        # Pattern: "project {id} on {date} at {time}"
-        import re
-        m = re.search(
-            r"project\s+(\S+)\s+on\s+(\S+)\s+at\s+(.+?)(?:\?|\()",
-            response_text,
-        )
-        if m:
-            pending = {
-                "project_id": m.group(1),
-                "date": m.group(2),
-                "time": m.group(3).strip(),
-            }
-        signals["pending_action"] = pending
+        # Try to extract pending action details for the UI preview
+        pending = _extract_pending_action(response_text)
+        if pending:
+            signals["pending_action"] = pending
 
     # Detect PF API auth failures in response text
     lower = response_text.lower()
@@ -291,6 +296,37 @@ def _detect_response_signals(response_text: str) -> dict:
         signals["pf_http_status_code"] = 401
 
     return signals
+
+
+def _extract_pending_action(response_text: str) -> dict | None:
+    """Try to extract appointment details (date, time, location) from the confirmation prompt."""
+    pending: dict = {}
+
+    # Date: "Monday, April 6th, 2026" or "April 6, 2026" or "2026-04-06"
+    date_match = re.search(
+        r"\*?\*?Date:?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
+        response_text,
+    )
+    if date_match:
+        pending["date"] = date_match.group(1).strip().rstrip("*")
+
+    # Time: "8:00 AM" or "8:00 AM - 10:00 AM"
+    time_match = re.search(
+        r"\*?\*?Time:?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
+        response_text,
+    )
+    if time_match:
+        pending["time"] = time_match.group(1).strip().rstrip("*")
+
+    # Location / Address
+    loc_match = re.search(
+        r"\*?\*?(?:Location|Address):?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
+        response_text,
+    )
+    if loc_match:
+        pending["location"] = loc_match.group(1).strip().rstrip("*")
+
+    return pending if pending else None
 
 
 def _infer_intent(agent_name: str) -> str:
