@@ -36,7 +36,13 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
-from tools.scheduling import clear_session_projects, post_call_summary_notes, post_store_call_notes
+from tools.scheduling import (
+    clear_session_projects,
+    post_call_summary_notes,
+    post_store_call_notes,
+    reset_confirm_flag,
+    was_confirm_called,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +82,26 @@ _FALLBACK_MESSAGE = (
 # Store caller sessions: call_id → {to_phone, creds, authenticated}
 # Tracks auth state across tool calls within one Vapi call.
 _store_sessions: dict[str, dict] = {}
+
+# Patterns the scheduling agent uses when it hallucinated a booking confirmation
+# without actually calling confirm_appointment.
+_BOOKING_CONFIRMATION_PATTERNS = [
+    "appointment confirmed",
+    "appointment is now confirmed",
+    "is now scheduled",
+    "has been scheduled",
+    "has been successfully scheduled",
+    "successfully scheduled",
+    "appointment has been booked",
+    "you're all set",
+    "your appointment is confirmed",
+    "booking confirmed",
+]
+
+
+def _looks_like_booking_confirmation(text: str) -> bool:
+    lower = text.lower()
+    return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
 
 
 # ── Auth dependency ──────────────────────────────────────────────────────
@@ -910,6 +936,7 @@ async def _process_tool(
         agent_name = ""
         start_time = time.monotonic()
         try:
+            reset_confirm_flag()
             orchestrator = get_orchestrator()
             response = await orchestrator.route_request(
                 user_input=question,
@@ -920,6 +947,32 @@ async def _process_tool(
             response_text = extract_response_text(response.output)
             voice_text = format_for_voice(response_text)
             agent_name = response.metadata.agent_name if response.metadata else ""
+
+            # Guardrail: detect hallucinated booking confirmations.
+            # If the scheduling agent says "confirmed" without calling
+            # confirm_appointment, retry with an explicit instruction.
+            if not was_confirm_called() and _looks_like_booking_confirmation(voice_text):
+                logger.warning(
+                    "Hallucinated booking in Vapi call (call_id=%s) — retrying",
+                    call_id,
+                )
+                reset_confirm_flag()
+                response = await orchestrator.route_request(
+                    user_input=(
+                        "The customer confirmed. You MUST call the confirm_appointment "
+                        "tool NOW to actually book the appointment. Do NOT respond "
+                        "without calling the tool."
+                    ),
+                    user_id=user_id,
+                    session_id=session_id,
+                    additional_params={"channel": "vapi"},
+                )
+                retry_text = extract_response_text(response.output)
+                if was_confirm_called():
+                    voice_text = format_for_voice(retry_text)
+                    logger.info("Vapi retry succeeded — confirm_appointment called")
+                else:
+                    logger.warning("Vapi retry also failed to call confirm_appointment")
         except Exception:
             logger.exception("Orchestrator error during Vapi call (call_id=%s)", call_id)
             voice_text = _FALLBACK_MESSAGE

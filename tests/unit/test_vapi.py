@@ -1216,8 +1216,7 @@ class TestTransferCallTool:
         dest = tool["destinations"][0]
         assert dest["type"] == "number"
         assert dest["number"] == "+15106269299"
-        assert dest["transferPlan"]["mode"] == "warm-transfer-experimental"
-        assert "transferAssistant" in dest["transferPlan"]
+        assert dest["transferPlan"]["mode"] == "blind-transfer"
 
     def test_transfer_tool_with_formatted_number(self):
         from channels.vapi import _transfer_call_tool
@@ -1239,29 +1238,17 @@ class TestTransferCallTool:
         result = _transfer_call_tool("")
         assert result == []
 
-    def test_transfer_assistant_config(self):
-        """Transfer assistant should have system prompt, tools, and settings."""
+    def test_blind_transfer_config(self):
+        """Blind transfer has no transferAssistant — just mode and messages."""
         from channels.vapi import _transfer_call_tool
 
         result = _transfer_call_tool("5106269299")
-        assistant = result[0]["destinations"][0]["transferPlan"]["transferAssistant"]
-        assert assistant["firstMessageMode"] == "assistant-speaks-first"
-        assert assistant["maxDurationSeconds"] == 60
-        assert "ProjectsForce" in assistant["firstMessage"]
-
-        # System prompt instructs the assistant to summarize
-        model = assistant["model"]
-        system_msg = model["messages"][0]
-        assert system_msg["role"] == "system"
-        assert "summary" in system_msg["content"].lower()
-
-        # Has transferSuccessful and transferCancel tools
-        tool_types = {t["type"] for t in model["tools"]}
-        assert "transferSuccessful" in tool_types
-        assert "transferCancel" in tool_types
+        plan = result[0]["destinations"][0]["transferPlan"]
+        assert plan["mode"] == "blind-transfer"
+        assert "transferAssistant" not in plan
 
     def test_transfer_tool_caller_messages(self):
-        """Caller should hear request-start, hold music, and request-failed messages."""
+        """Caller should hear request-start, request-complete, and request-failed messages."""
         from channels.vapi import _transfer_call_tool
 
         result = _transfer_call_tool("5106269299")
@@ -1270,9 +1257,6 @@ class TestTransferCallTool:
         assert "request-start" in msg_types
         assert "request-complete" in msg_types
         assert "request-failed" in msg_types
-        # Hold music should be an audio URL
-        hold_msg = next(m for m in messages if m["type"] == "request-complete")
-        assert hold_msg["content"].endswith(".mp3")
 
     def test_assistant_config_includes_transfer_tool(self):
         from channels.vapi import _build_assistant_config
