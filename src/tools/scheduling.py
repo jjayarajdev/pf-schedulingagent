@@ -1056,10 +1056,19 @@ async def add_note(project_id: str, note_text: str) -> str:
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "add_note")
     client_id = AuthContext.get_client_id()
-    customer_id = AuthContext.get_customer_id()
-    url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note"
+    url = f"{get_pf_api_base()}/project-notes/add-note"
     headers = build_headers()
-    payload = {"note": note_text}
+    try:
+        pid = int(project_id)
+    except (ValueError, TypeError):
+        pid = project_id
+    payload = {
+        "client_id": client_id,
+        "project_id": pid,
+        "note_text": note_text,
+        "viewed": False,
+        "reviewed": False,
+    }
     log_curl("POST", url, headers, payload)
 
     try:
@@ -1100,6 +1109,10 @@ async def list_notes(project_id: str) -> str:
     return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
 
 
+# TODO: Switch customer call notes to dedicated customer note endpoint
+# (e.g. /communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note)
+# once the PF backend deploys it on QA/prod. Currently using /project-notes/add-note
+# (the store note endpoint) for both customer and store calls.
 async def post_call_summary_notes(
     *,
     session_id: str,
@@ -1146,11 +1159,18 @@ async def post_call_summary_notes(
             if truncated_summary:
                 note_text += f" Summary: {truncated_summary}"
 
-            url = (
-                f"{base_url}/communication/client/{client_id}"
-                f"/customer/{customer_id}/project/{project_id}/note"
-            )
-            payload = {"note": note_text}
+            url = f"{base_url}/project-notes/add-note"
+            try:
+                pid = int(project_id)
+            except (ValueError, TypeError):
+                pid = project_id
+            payload = {
+                "client_id": client_id,
+                "project_id": pid,
+                "note_text": note_text,
+                "viewed": False,
+                "reviewed": False,
+            }
             try:
                 resp = await client.post(url, headers=headers, json=payload)
                 logger.info(

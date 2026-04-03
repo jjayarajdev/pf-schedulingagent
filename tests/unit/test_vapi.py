@@ -1028,11 +1028,11 @@ class TestPostCallSummaryNotes:
             first_call_args = mock_client.post.call_args_list[0]
             url = first_call_args[0][0] if first_call_args[0] else first_call_args[1].get("url", "")
             payload = first_call_args[1].get("json", {})
-            note = payload.get("note", "")
+            note = payload.get("note_text", "")
             assert "AI Scheduling Assistant (J)" in note
             assert "2m 45s" in note
             assert "Customer scheduled fence installation." in note
-            assert "PROJ1" in url or "PROJ2" in url
+            assert "project-notes/add-note" in url
 
         # Session should be cleaned up
         assert get_session_projects("vapi-test-notes") == {}
