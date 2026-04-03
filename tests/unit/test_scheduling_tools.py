@@ -606,7 +606,7 @@ class TestUpdateInstallationAddress:
         assert data["project_id"] == "123"
         assert data["feature_unavailable"] is True
         assert "not available" in data["message"].lower()
-        assert "contact" in data["message"].lower() or "call" in data["message"].lower()
+        assert "office" in data["message"].lower()
 
     async def test_sets_confirm_flag(self):
         """update_installation_address sets the confirm flag for guardrail."""

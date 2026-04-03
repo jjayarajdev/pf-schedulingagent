@@ -39,7 +39,7 @@ class TestCanSchedule:
     def test_in_progress_blocked(self):
         allowed, reason = ProjectStatusRules.can_schedule("in progress")
         assert allowed is False
-        assert "contact" in reason.lower()
+        assert "office" in reason.lower()
 
     def test_pending_confirmation_blocked(self):
         allowed, reason = ProjectStatusRules.can_schedule("pending confirmation")

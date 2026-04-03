@@ -1511,30 +1511,20 @@ async def update_installation_address(
     #         "Please try again or contact support."
     #     )
 
-    # Feature not yet available — direct user to call the office
+    # Feature not yet available — offer transfer or number on phone, contact office on chat
     logger.info("update_installation_address (not available) for project %s", project_id)
 
-    # Try to get support number from phone auth cache (Vapi channel)
-    support_number = ""
-    try:
-        from auth.phone_auth import get_support_info
-        tenant_phone = AuthContext.get_tenant_phone()
-        if tenant_phone:
-            info = get_support_info(tenant_phone)
-            support_number = info.get("support_number", "")
-    except Exception:
-        pass
+    support_number = AuthContext.get_support_number()
 
-    if support_number:
-        contact_msg = f"Please call the office at {support_number} to update your address."
-    else:
-        contact_msg = "Please contact your local office to update your address."
-
-    return json.dumps({
+    result: dict = {
         "project_id": project_id,
         "feature_unavailable": True,
         "message": (
             "Updating the installation address through the bot is not available yet. "
-            + contact_msg
+            "The office can help with address updates."
         ),
-    })
+    }
+    if support_number:
+        result["support_number"] = support_number
+
+    return json.dumps(result)

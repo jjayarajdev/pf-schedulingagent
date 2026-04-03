@@ -50,7 +50,7 @@ class ProjectStatusRules:
             return False, f"Project is {status} and cannot be scheduled."
 
         if s in cls.BLOCKED:
-            return False, f"Project is {status}. Please contact the office for assistance."
+            return False, f"Project is {status} and cannot be scheduled right now. The office can help — offer to transfer the customer."
 
         if s in cls.SCHEDULABLE:
             return True, "OK"
@@ -86,7 +86,7 @@ class ProjectStatusRules:
             return False, "This project doesn't have a scheduled appointment to reschedule."
 
         if s in cls.TERMINAL or s in cls.BLOCKED:
-            return False, f"Project is {status} and cannot be rescheduled. Please contact the office."
+            return False, f"Project is {status} and cannot be rescheduled. The office can help — offer to transfer the customer."
 
         logger.warning("Unknown project status for reschedule check: %s", status)
         return False, f"Cannot reschedule project with status: {status}"
