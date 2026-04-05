@@ -1032,7 +1032,7 @@ class TestPostCallSummaryNotes:
             assert "AI Scheduling Assistant (J)" in note
             assert "2m 45s" in note
             assert "Customer scheduled fence installation." in note
-            assert "project-notes/add-note" in url
+            assert "/communication/client/CL1/project/" in url
 
         # Session should be cleaned up
         assert get_session_projects("vapi-test-notes") == {}

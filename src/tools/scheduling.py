@@ -1056,19 +1056,35 @@ async def add_note(project_id: str, note_text: str) -> str:
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "add_note")
     client_id = AuthContext.get_client_id()
-    url = f"{get_pf_api_base()}/project-notes/add-note"
+    caller_type = AuthContext.get_caller_type()
+    base = get_pf_api_base()
     headers = build_headers()
-    try:
-        pid = int(project_id)
-    except (ValueError, TypeError):
-        pid = project_id
-    payload = {
-        "client_id": client_id,
-        "project_id": pid,
-        "note_text": note_text,
-        "viewed": False,
-        "reviewed": False,
-    }
+
+    # Cancel/reschedule reason notes always use /project-notes/add-note
+    # (both store and customer). All other store notes also use it.
+    # Customer general notes use /communication/.../note.
+    is_cancel_note = any(
+        prefix in note_text.upper()
+        for prefix in ("CANCELLATION REASON:", "CANCELLATION:", "RESCHEDULE REASON:")
+    )
+
+    if caller_type == "store" or is_cancel_note:
+        # Store callers OR cancel/reschedule reasons: POST /project-notes/add-note
+        url = f"{base}/project-notes/add-note"
+        try:
+            pid = int(project_id)
+        except (ValueError, TypeError):
+            pid = project_id
+        payload = {
+            "client_id": client_id,
+            "project_id": pid,
+            "note_text": note_text,
+        }
+    else:
+        # Customer general notes: POST /communication/client/{cid}/project/{pid}/note
+        url = f"{base}/communication/client/{client_id}/project/{project_id}/note"
+        payload = {"note_text": note_text}
+
     log_curl("POST", url, headers, payload)
 
     try:
@@ -1109,10 +1125,6 @@ async def list_notes(project_id: str) -> str:
     return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
 
 
-# TODO: Switch customer call notes to dedicated customer note endpoint
-# (e.g. /communication/client/{client_id}/customer/{customer_id}/project/{project_id}/note)
-# once the PF backend deploys it on QA/prod. Currently using /project-notes/add-note
-# (the store note endpoint) for both customer and store calls.
 async def post_call_summary_notes(
     *,
     session_id: str,
@@ -1159,18 +1171,8 @@ async def post_call_summary_notes(
             if truncated_summary:
                 note_text += f" Summary: {truncated_summary}"
 
-            url = f"{base_url}/project-notes/add-note"
-            try:
-                pid = int(project_id)
-            except (ValueError, TypeError):
-                pid = project_id
-            payload = {
-                "client_id": client_id,
-                "project_id": pid,
-                "note_text": note_text,
-                "viewed": False,
-                "reviewed": False,
-            }
+            url = f"{base_url}/communication/client/{client_id}/project/{project_id}/note"
+            payload = {"note_text": note_text}
             try:
                 resp = await client.post(url, headers=headers, json=payload)
                 logger.info(

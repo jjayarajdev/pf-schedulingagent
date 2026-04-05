@@ -424,6 +424,76 @@ class TestAddNote:
             result = await add_note("123", "Test note")
         assert "successfully" in result.lower()
 
+    async def test_customer_general_note_uses_communication_endpoint(self):
+        """Customer general notes route to /communication/client/.../project/.../note."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("123", "General customer note")
+
+        url = mock_client.post.call_args[0][0]
+        assert "/communication/client/" in url
+        assert "/project/123/note" in url
+
+    async def test_customer_cancel_note_uses_add_note_endpoint(self):
+        """Customer cancel/reschedule reason notes route to /project-notes/add-note."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("123", "CANCELLATION REASON: Schedule conflict. Cancelled via AI.")
+
+        url = mock_client.post.call_args[0][0]
+        payload = mock_client.post.call_args[1].get("json", {})
+        assert "/project-notes/add-note" in url
+        assert payload["client_id"] == "test-client-123"
+        assert payload["project_id"] == 123
+
+    async def test_store_note_uses_add_note_endpoint(self):
+        """Store callers always route to /project-notes/add-note."""
+        from auth.context import AuthContext
+
+        AuthContext.set(
+            auth_token="tok", client_id="CL1", customer_id="C1",
+            caller_type="store",
+        )
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("456", "Store note")
+
+        url = mock_client.post.call_args[0][0]
+        assert "/project-notes/add-note" in url
+
 
 class TestListNotes:
     async def test_returns_notes(self, mock_httpx_client, mock_httpx_response):
