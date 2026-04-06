@@ -270,7 +270,7 @@ async def _handle_assistant_request(body: dict) -> dict:
     hours_context = _build_office_hours_context(office_hours, tenant_timezone)
 
     if is_store_caller:
-        _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False}
+        _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False, "support_number": support_number}
         greeting = _generate_store_greeting(client_name)
         logger.info("Vapi unknown caller greeting: call_id=%s client=%s office_open=%s", call_id, client_name, hours_context.get("is_open"))
         return {"assistant": _build_store_assistant_config(
@@ -1040,11 +1040,17 @@ async def _handle_store_bot(
                 "Store auth failed: call_id=%s lookup=%s:%s error=%s",
                 call_id, lookup_type, lookup_value, exc,
             )
-            return _build_tool_result(
+            support = store_session.get("support_number", "")
+            msg = (
                 "I couldn't find an account with that information. "
-                "Could you double-check and try again?",
-                tool_call_id,
+                "Could you double-check and try again?"
             )
+            if support:
+                msg += (
+                    f" Or if you'd prefer, I can transfer you to our support team "
+                    f"— or give you the number: {support}."
+                )
+            return _build_tool_result(msg, tool_call_id)
         store_session["creds"] = creds
         store_session["authenticated"] = True
         store_session["support_number"] = creds.get("support_number", "")
