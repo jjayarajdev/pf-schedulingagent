@@ -280,3 +280,120 @@ class TestChatStream:
         assert '"pf_http_status_code": 200' in body
         assert '"agenticscheduler_http_status_code": 200' in body
         assert '"intent": "scheduling"' in body
+
+
+class TestDetectResponseSignals:
+    """confirmation_required comes from the LLM's JSON block, not regex."""
+
+    def test_scheduling_confirmation_detected(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Great! Should I go ahead and schedule your carpet installation '
+            'for April 10th at 9:00 AM?\n\n'
+            '```json\n'
+            '{"message": "Confirm appointment", "confirmation_required": true, '
+            '"date": "2026-04-10", "time": "9:00 AM"}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is True
+
+    def test_reschedule_confirmation_detected(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Would you like me to reschedule to April 15th at 1:00 PM?\n\n'
+            '```json\n'
+            '{"message": "Reschedule appointment", "confirmation_required": true}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is True
+
+    def test_cancel_confirmation_detected(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Are you sure you want to cancel your windows appointment?\n\n'
+            '```json\n'
+            '{"message": "Cancel appointment", "confirmation_required": true}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is True
+
+    def test_list_projects_confirmation_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'You have 3 projects! Here they are:\n\n'
+            '```json\n'
+            '{"message": "Found 3 project(s):", "projects": [{"id": "123"}], '
+            '"confirmation_required": false}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_project_details_confirmation_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Here are the details for your flooring project:\n\n'
+            '```json\n'
+            '{"message": "Project details", "project": {"id": "456"}, '
+            '"confirmation_required": false}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_available_dates_confirmation_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Here are the available dates:\n\n'
+            '```json\n'
+            '{"available_dates": ["2026-04-10"], "confirmation_required": false}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_time_slots_confirmation_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Here are the available time slots for April 10th:\n\n'
+            '```json\n'
+            '{"time_slots": ["9:00 AM", "1:00 PM"], "confirmation_required": false}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_no_json_block_defaults_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = "Should I go ahead and schedule this for you?"
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_missing_field_defaults_false(self):
+        from channels.chat import _detect_response_signals
+
+        text = (
+            '```json\n'
+            '{"message": "Projects listed"}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is False
+
+    def test_auth_failure_detected(self):
+        from channels.chat import _detect_response_signals
+
+        text = "Your authentication expired. Please log in again."
+        signals = _detect_response_signals(text)
+        assert signals["pf_http_status_code"] == 401

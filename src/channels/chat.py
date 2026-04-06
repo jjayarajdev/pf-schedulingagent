@@ -257,38 +257,35 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
     return any(p in lower for p in _FABRICATED_FAILURE_PATTERNS)
 
 
-# Patterns the LLM uses when asking the user to confirm a scheduling action.
-# If ANY of these appear in the response, the UI should show Yes/No buttons.
-_CONFIRMATION_ASK_PATTERNS = re.compile(
-    r"(?:"
-    r"should I (?:go ahead|schedule|book|confirm|proceed)"
-    r"|shall I (?:go ahead|schedule|book|confirm|proceed)"
-    r"|would you like (?:me to |to )(?:go ahead|schedule|book|confirm|proceed)"
-    r"|want me to (?:go ahead|schedule|book|confirm|proceed)"
-    r"|ready to (?:schedule|book|confirm)"
-    r"|do you (?:want to |wish to )?(?:go ahead|confirm|proceed)"
-    r"|can I (?:go ahead|schedule|book|confirm)"
-    r")",
-    re.IGNORECASE,
-)
+_JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
 
 def _detect_response_signals(response_text: str) -> dict:
     """Detect confirmation requests, actions, and PF API errors from response text.
 
-    The LLM's response text and tool outputs carry signals that the
-    frontend needs as structured fields (v1.2.9 contract).
+    The LLM includes ``"confirmation_required": true`` in its JSON block
+    ONLY when asking the user to confirm a schedule, reschedule, or cancel
+    action.  We parse the JSON block rather than regex-matching the natural
+    language — the LLM knows what action it is performing.
     """
     signals: dict = {}
 
-    # Detect confirmation-before-write pattern — the LLM asks the user
-    # to confirm an appointment (e.g., "Should I go ahead and schedule this?")
-    if _CONFIRMATION_ASK_PATTERNS.search(response_text):
-        signals["confirmation_required"] = True
-        # Try to extract pending action details for the UI preview
-        pending = _extract_pending_action(response_text)
-        if pending:
-            signals["pending_action"] = pending
+    # Parse confirmation_required from the LLM's JSON block.
+    # Always present: true for schedule/reschedule/cancel, false otherwise.
+    json_match = _JSON_BLOCK_RE.search(response_text)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            confirmed = data.get("confirmation_required", False)
+            signals["confirmation_required"] = bool(confirmed)
+            if confirmed:
+                pending = _extract_pending_action(response_text)
+                if pending:
+                    signals["pending_action"] = pending
+        except (json.JSONDecodeError, AttributeError):
+            signals["confirmation_required"] = False
+    else:
+        signals["confirmation_required"] = False
 
     # Detect PF API auth failures in response text
     lower = response_text.lower()
@@ -614,8 +611,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
             "pf_http_status_code": signals.get("pf_http_status_code", 200),
             "agenticscheduler_http_status_code": 200,
         }
-        if signals.get("confirmation_required"):
-            done_data["confirmation_required"] = True
+        done_data["confirmation_required"] = signals.get("confirmation_required", False)
+        if done_data["confirmation_required"]:
             done_data["pending_action"] = signals.get("pending_action")
 
         yield _sse("done", done_data)
