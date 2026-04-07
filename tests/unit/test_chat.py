@@ -525,6 +525,28 @@ class TestEnrichJsonBlock:
         assert '"timeSlotsGrouped"' in result
         assert '"slotCount": 2' in result
 
+    def test_dates_response_strips_time_slots(self):
+        """When available_dates is present, time slots must be stripped."""
+        from channels.chat import _enrich_json_block
+        import json
+        import re
+
+        text = (
+            '```json\n'
+            '{"available_dates": ["2026-04-08", "2026-04-09"], '
+            '"available_time_slots": ["8:00 AM", "1:00 PM"], '
+            '"project_id": "90000119"}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
+        data = json.loads(match.group(1))
+        assert data["available_dates"] == ["2026-04-08", "2026-04-09"]
+        assert "available_time_slots" not in data
+        assert "timeSlotsGrouped" not in data
+        assert "slotCount" not in data
+        assert "timeSlots" not in data
+
     def test_no_json_block_returns_unchanged(self):
         from channels.chat import _enrich_json_block
 

@@ -307,29 +307,40 @@ def _enrich_json_block(response_text: str) -> str:
         return response_text
 
     modified = False
+    is_dates_response = bool(data.get("available_dates"))
 
-    # Detect time slots and add grouping if missing
-    # LLM may use any of these keys depending on its mood
-    slots = (
-        data.get("time_slots")
-        or data.get("timeSlots")
-        or data.get("available_slots")
-        or data.get("available_time_slots")
-        or []
-    )
-    if slots and "timeSlotsGrouped" not in data:
-        # Build display names from slot objects or strings
-        display: list[str] = []
-        for s in slots:
-            if isinstance(s, dict):
-                display.append(s.get("display_time", s.get("time", "")))
-            else:
-                display.append(str(s))
+    # If this is a dates response, strip time slot data so the frontend
+    # doesn't render a time picker at the date selection step.
+    if is_dates_response:
+        for key in ("available_time_slots", "time_slots", "timeSlots",
+                     "available_slots", "timeSlotsGrouped", "slotCount"):
+            if key in data:
+                del data[key]
+                modified = True
 
-        data["timeSlots"] = display
-        data["timeSlotsGrouped"] = _group_time_slots(display)
-        data["slotCount"] = len(display)
-        modified = True
+    # For pure time-slot responses (no available_dates), add grouping
+    if not is_dates_response:
+        # LLM may use any of these keys depending on its mood
+        slots = (
+            data.get("time_slots")
+            or data.get("timeSlots")
+            or data.get("available_slots")
+            or data.get("available_time_slots")
+            or []
+        )
+        if slots and "timeSlotsGrouped" not in data:
+            # Build display names from slot objects or strings
+            display: list[str] = []
+            for s in slots:
+                if isinstance(s, dict):
+                    display.append(s.get("display_time", s.get("time", "")))
+                else:
+                    display.append(str(s))
+
+            data["timeSlots"] = display
+            data["timeSlotsGrouped"] = _group_time_slots(display)
+            data["slotCount"] = len(display)
+            modified = True
 
     if not modified:
         return response_text
