@@ -338,6 +338,32 @@ class TestDetectResponseSignals:
         assert pa["formattedTime"] == "8:00 AM"
         assert pa["address"] == "910 North Harbor Drive, San Diego, AE 92101"
 
+    def test_confirmation_with_nested_project_details(self):
+        """LLM may nest fields under project_details instead of appointment_details."""
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Should I schedule this?\n\n'
+            '```json\n'
+            '{"confirmation_required": true, "project_details": {'
+            '"project_id": "90000119", "project_number": "6789", '
+            '"category": "Windows", "project_type": "Installation", '
+            '"scheduled_date": "2026-04-16", "scheduled_time": "08:00:00", '
+            '"address": "910 North Harbor Drive, San Diego, AE 92101"}}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is True
+        assert signals["action"] == "confirm_appointment_preview"
+        pa = signals["pending_action"]
+        assert pa is not None
+        assert pa["project_name"] == "Windows"
+        assert pa["project_type"] == "Installation"
+        assert pa["rawDate"] == "2026-04-16"
+        assert pa["time"] == "08:00"
+        assert pa["formattedTime"] == "8:00 AM"
+        assert pa["address"] == "910 North Harbor Drive, San Diego, AE 92101"
+
     def test_reschedule_confirmation_detected(self):
         from channels.chat import _detect_response_signals
 
@@ -605,3 +631,42 @@ class TestEnrichJsonBlock:
 
         text = '```json\n{broken json\n```'
         assert _enrich_json_block(text) == text
+
+    def test_strips_project_id_from_json_block(self):
+        """project_id and project_number should be stripped from JSON blocks."""
+        from channels.chat import _enrich_json_block
+        import json
+        import re
+
+        text = (
+            '```json\n'
+            '{"confirmation_required": true, "project_id": "90000119", '
+            '"project_number": "6789", "category": "Windows"}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
+        data = json.loads(match.group(1))
+        assert "project_id" not in data
+        assert "project_number" not in data
+        assert data["category"] == "Windows"
+
+    def test_strips_project_id_from_nested_project_details(self):
+        """project_id inside project_details should also be stripped."""
+        from channels.chat import _enrich_json_block
+        import json
+        import re
+
+        text = (
+            '```json\n'
+            '{"confirmation_required": true, "project_details": {'
+            '"project_id": "90000119", "project_number": "6789", '
+            '"category": "Windows", "scheduled_date": "2026-04-16"}}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
+        data = json.loads(match.group(1))
+        assert "project_id" not in data.get("project_details", {})
+        assert "project_number" not in data.get("project_details", {})
+        assert data["project_details"]["category"] == "Windows"

@@ -307,6 +307,19 @@ def _enrich_json_block(response_text: str) -> str:
         return response_text
 
     modified = False
+
+    # Strip internal IDs — frontend doesn't need them and they clutter the UI
+    for id_key in ("project_id", "project_number"):
+        if id_key in data:
+            del data[id_key]
+            modified = True
+        # Also strip from nested dicts (project_details, appointment_details, etc.)
+        for nested_key in ("project_details", "appointment_details", "appointment", "details"):
+            nested = data.get(nested_key)
+            if isinstance(nested, dict) and id_key in nested:
+                del nested[id_key]
+                modified = True
+
     is_dates_response = bool(data.get("available_dates"))
 
     # If this is a dates response, strip time slot data so the frontend
@@ -392,18 +405,26 @@ def _build_pending_action(json_data: dict) -> dict | None:
         project_name, project_id, project_type, date (display),
         rawDate (YYYY-MM-DD), time (24h), formattedTime (display), address
     """
-    # LLM may nest fields under appointment_details, appointment, or details
+    # LLM may nest fields under various keys depending on phrasing
     d = json_data
-    for nested_key in ("appointment_details", "appointment", "details"):
+    for nested_key in ("appointment_details", "appointment", "details",
+                        "project_details", "scheduling_details"):
         if nested_key in d and isinstance(d[nested_key], dict):
             d = {**d, **d[nested_key]}  # merge nested into top level
             break
 
-    raw_date = d.get("date", "")
-    raw_time = d.get("time", "")
+    raw_date = d.get("date", "") or d.get("scheduled_date", "")
+    raw_time = d.get("time", "") or d.get("scheduled_time", "")
     display_time = d.get("display_time", d.get("formattedTime", ""))
     address = d.get("address", d.get("installation_address", ""))
     project_type = d.get("project_type", "")
+    category = d.get("category", "")
+
+    # LLM sometimes splits "Windows Installation" into category + project_type
+    if category and project_type and category != project_type:
+        project_type = f"{category} {project_type}"
+    elif not project_type and category:
+        project_type = category
 
     # Split "Windows Installation" into name + type if needed
     project_name = project_type.split(" ")[0] if project_type else ""
