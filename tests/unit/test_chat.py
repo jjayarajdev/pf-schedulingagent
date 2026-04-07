@@ -311,6 +311,33 @@ class TestDetectResponseSignals:
         assert pa["formattedTime"] == "1:00 PM"
         assert pa["address"] == "123 Main St"
 
+    def test_confirmation_with_nested_appointment_details(self):
+        """LLM may nest fields under appointment_details."""
+        from channels.chat import _detect_response_signals
+
+        text = (
+            'Should I go ahead and schedule this?\n\n'
+            '```json\n'
+            '{"confirmation_required": true, "appointment_details": {'
+            '"project_id": "90000119", "project_type": "Windows Installation", '
+            '"date": "2026-04-09", "time": "08:00:00", '
+            '"display_time": "8:00 AM", '
+            '"address": "910 North Harbor Drive, San Diego, AE 92101"}}\n'
+            '```'
+        )
+        signals = _detect_response_signals(text)
+        assert signals["confirmation_required"] is True
+        assert signals["action"] == "confirm_appointment_preview"
+        pa = signals["pending_action"]
+        assert pa["project_id"] == "90000119"
+        assert pa["project_name"] == "Windows"
+        assert pa["project_type"] == "Installation"
+        assert pa["rawDate"] == "2026-04-09"
+        assert pa["date"] == "Thu 04/09/2026"
+        assert pa["time"] == "08:00"
+        assert pa["formattedTime"] == "8:00 AM"
+        assert pa["address"] == "910 North Harbor Drive, San Diego, AE 92101"
+
     def test_reschedule_confirmation_detected(self):
         from channels.chat import _detect_response_signals
 

@@ -392,11 +392,18 @@ def _build_pending_action(json_data: dict) -> dict | None:
         project_name, project_id, project_type, date (display),
         rawDate (YYYY-MM-DD), time (24h), formattedTime (display), address
     """
-    raw_date = json_data.get("date", "")
-    raw_time = json_data.get("time", "")
-    display_time = json_data.get("display_time", json_data.get("formattedTime", ""))
-    address = json_data.get("address", json_data.get("installation_address", ""))
-    project_type = json_data.get("project_type", "")
+    # LLM may nest fields under appointment_details, appointment, or details
+    d = json_data
+    for nested_key in ("appointment_details", "appointment", "details"):
+        if nested_key in d and isinstance(d[nested_key], dict):
+            d = {**d, **d[nested_key]}  # merge nested into top level
+            break
+
+    raw_date = d.get("date", "")
+    raw_time = d.get("time", "")
+    display_time = d.get("display_time", d.get("formattedTime", ""))
+    address = d.get("address", d.get("installation_address", ""))
+    project_type = d.get("project_type", "")
 
     # Split "Windows Installation" into name + type if needed
     project_name = project_type.split(" ")[0] if project_type else ""
@@ -433,7 +440,7 @@ def _build_pending_action(json_data: dict) -> dict | None:
 
     pending = {
         "project_name": project_name,
-        "project_id": json_data.get("project_id", ""),
+        "project_id": d.get("project_id", ""),
         "project_type": project_type.split(" ", 1)[1] if " " in project_type else project_type,
         "date": formatted_date,
         "rawDate": raw_date,
