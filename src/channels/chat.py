@@ -357,9 +357,10 @@ def _detect_response_signals(response_text: str) -> dict:
             confirmed = data.get("confirmation_required", False)
             signals["confirmation_required"] = bool(confirmed)
             if confirmed:
-                pending = _extract_pending_action(response_text)
+                pending = _build_pending_action(data)
                 if pending:
                     signals["pending_action"] = pending
+                    signals["action"] = "confirm_appointment_preview"
         except (json.JSONDecodeError, AttributeError):
             signals["confirmation_required"] = False
     else:
@@ -373,35 +374,64 @@ def _detect_response_signals(response_text: str) -> dict:
     return signals
 
 
-def _extract_pending_action(response_text: str) -> dict | None:
-    """Try to extract appointment details (date, time, location) from the confirmation prompt."""
-    pending: dict = {}
+def _build_pending_action(json_data: dict) -> dict | None:
+    """Build v1.2.9-compatible pending_action from the LLM's JSON block.
 
-    # Date: "Monday, April 6th, 2026" or "April 6, 2026" or "2026-04-06"
-    date_match = re.search(
-        r"\*?\*?Date:?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
-        response_text,
-    )
-    if date_match:
-        pending["date"] = date_match.group(1).strip().rstrip("*")
+    Old format expected by frontend:
+        project_name, project_id, project_type, date (display),
+        rawDate (YYYY-MM-DD), time (24h), formattedTime (display), address
+    """
+    raw_date = json_data.get("date", "")
+    raw_time = json_data.get("time", "")
+    display_time = json_data.get("display_time", json_data.get("formattedTime", ""))
+    address = json_data.get("address", json_data.get("installation_address", ""))
+    project_type = json_data.get("project_type", "")
 
-    # Time: "8:00 AM" or "8:00 AM - 10:00 AM"
-    time_match = re.search(
-        r"\*?\*?Time:?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
-        response_text,
-    )
-    if time_match:
-        pending["time"] = time_match.group(1).strip().rstrip("*")
+    # Split "Windows Installation" into name + type if needed
+    project_name = project_type.split(" ")[0] if project_type else ""
 
-    # Location / Address
-    loc_match = re.search(
-        r"\*?\*?(?:Location|Address):?\*?\*?\s*:?\s*(.+?)(?:\n|$)",
-        response_text,
-    )
-    if loc_match:
-        pending["location"] = loc_match.group(1).strip().rstrip("*")
+    # Format display date from raw date (e.g., "2026-04-18" → "Fri 04/18/2026")
+    formatted_date = raw_date
+    if raw_date and re.match(r"\d{4}-\d{2}-\d{2}", raw_date):
+        try:
+            from datetime import datetime
 
-    return pending if pending else None
+            dt = datetime.strptime(raw_date[:10], "%Y-%m-%d")
+            formatted_date = dt.strftime("%a %m/%d/%Y")
+        except ValueError:
+            pass
+
+    # Build formattedTime from raw time if display_time not provided
+    if not display_time and raw_time:
+        try:
+            from datetime import datetime
+
+            # Handle "13:00:00" or "13:00"
+            for fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    dt = datetime.strptime(raw_time, fmt)
+                    display_time = dt.strftime("%-I:%M %p")
+                    break
+                except ValueError:
+                    continue
+        except Exception:
+            display_time = raw_time
+
+    # Extract 24h time for "time" field
+    time_24h = raw_time.replace(":00:00", ":00") if raw_time.count(":") == 2 else raw_time
+
+    pending = {
+        "project_name": project_name,
+        "project_id": json_data.get("project_id", ""),
+        "project_type": project_type.split(" ", 1)[1] if " " in project_type else project_type,
+        "date": formatted_date,
+        "rawDate": raw_date,
+        "time": time_24h,
+        "formattedTime": display_time,
+        "address": address,
+    }
+
+    return pending if any(v for v in pending.values()) else None
 
 
 def _infer_intent(agent_name: str) -> str:
@@ -580,7 +610,7 @@ async def chat(request: ChatRequest, raw_request: Request):
         session_id=session_id,
         agent_name=agent_name,
         intent=intent,
-        action=None,
+        action=signals.get("action"),
         pf_http_status_code=signals.get("pf_http_status_code", 200),
         agenticscheduler_http_status_code=200,
         confirmation_required=signals.get("confirmation_required"),
@@ -696,6 +726,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
         done_data["confirmation_required"] = signals.get("confirmation_required", False)
         if done_data["confirmation_required"]:
             done_data["pending_action"] = signals.get("pending_action")
+            done_data["action"] = signals.get("action")
 
         yield _sse("done", done_data)
 

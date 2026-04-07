@@ -293,11 +293,23 @@ class TestDetectResponseSignals:
             'for April 10th at 9:00 AM?\n\n'
             '```json\n'
             '{"message": "Confirm appointment", "confirmation_required": true, '
-            '"date": "2026-04-10", "time": "9:00 AM"}\n'
+            '"project_id": "90000119", "project_type": "Windows Installation", '
+            '"date": "2026-04-10", "time": "13:00:00", "display_time": "1:00 PM", '
+            '"address": "123 Main St"}\n'
             '```'
         )
         signals = _detect_response_signals(text)
         assert signals["confirmation_required"] is True
+        assert signals["action"] == "confirm_appointment_preview"
+        pa = signals["pending_action"]
+        assert pa["project_id"] == "90000119"
+        assert pa["project_name"] == "Windows"
+        assert pa["project_type"] == "Installation"
+        assert pa["rawDate"] == "2026-04-10"
+        assert pa["date"] == "Fri 04/10/2026"
+        assert pa["time"] == "13:00"
+        assert pa["formattedTime"] == "1:00 PM"
+        assert pa["address"] == "123 Main St"
 
     def test_reschedule_confirmation_detected(self):
         from channels.chat import _detect_response_signals
