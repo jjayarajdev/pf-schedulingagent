@@ -44,7 +44,7 @@ aws iam create-role \
   --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
   2>/dev/null && echo "  ✓ Role created" || echo "  → Already exists"
 
-# Inline policy: Bedrock + DynamoDB (all 4 tables) + Secrets Manager + SMS
+# Inline policy: Bedrock + DynamoDB (5 tables) + SQS + Secrets Manager + SMS
 TASK_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -74,7 +74,23 @@ TASK_POLICY='{
         "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-sessions-'"$ENVIRONMENT"'",
         "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-phone-creds-'"$ENVIRONMENT"'",
         "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-conversations-'"$ENVIRONMENT"'",
-        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-vapi-assistants-'"$ENVIRONMENT"'"
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-vapi-assistants-'"$ENVIRONMENT"'",
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-outbound-calls-'"$ENVIRONMENT"'",
+        "arn:aws:dynamodb:'"$AWS_REGION"':'"$ACCOUNT"':table/'"$PROJECT_PREFIX"'-outbound-calls-'"$ENVIRONMENT"'/index/*"
+      ]
+    },
+    {
+      "Sid": "SQSOutbound",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "arn:aws:sqs:'"$AWS_REGION"':'"$ACCOUNT"':'"$PROJECT_PREFIX"'-outbound-queue-'"$ENVIRONMENT"'",
+        "arn:aws:sqs:'"$AWS_REGION"':'"$ACCOUNT"':'"$PROJECT_PREFIX"'-outbound-dlq-'"$ENVIRONMENT"'"
       ]
     },
     {
@@ -97,7 +113,7 @@ aws iam put-role-policy \
   --role-name "$TASK_ROLE" \
   --policy-name "${TASK_ROLE}-policy" \
   --policy-document "$TASK_POLICY"
-echo "  ✓ Task policy attached (Bedrock, DynamoDB x4, Secrets, SMS)"
+echo "  ✓ Task policy attached (Bedrock, DynamoDB x5, SQS, Secrets, SMS)"
 
 echo ""
 
@@ -128,3 +144,8 @@ echo "  - ${PROJECT_PREFIX}-sessions-${ENVIRONMENT}"
 echo "  - ${PROJECT_PREFIX}-phone-creds-${ENVIRONMENT}"
 echo "  - ${PROJECT_PREFIX}-conversations-${ENVIRONMENT}"
 echo "  - ${PROJECT_PREFIX}-vapi-assistants-${ENVIRONMENT}"
+echo "  - ${PROJECT_PREFIX}-outbound-calls-${ENVIRONMENT} (+ GSI)"
+echo ""
+echo "SQS queues in policy:"
+echo "  - ${PROJECT_PREFIX}-outbound-queue-${ENVIRONMENT}"
+echo "  - ${PROJECT_PREFIX}-outbound-dlq-${ENVIRONMENT}"

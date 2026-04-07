@@ -133,8 +133,46 @@ aws dynamodb create-table \
   2>/dev/null && echo "  ✓ Created" || echo "  → Already exists"
 
 echo ""
+
+# ── 5. Outbound calls table ────────────────────────────────────────
+OUTBOUND_TABLE="${PROJECT_PREFIX}-outbound-calls-${ENVIRONMENT}"
+
+echo "▶ Creating $OUTBOUND_TABLE..."
+aws dynamodb create-table \
+  --profile "$PROFILE" \
+  --region "$AWS_REGION" \
+  --table-name "$OUTBOUND_TABLE" \
+  --attribute-definitions \
+    AttributeName=call_id,AttributeType=S \
+    AttributeName=project_id,AttributeType=S \
+    AttributeName=created_at,AttributeType=S \
+  --key-schema \
+    AttributeName=call_id,KeyType=HASH \
+  --global-secondary-indexes \
+    '[{
+      "IndexName": "project-calls-index",
+      "KeySchema": [
+        {"AttributeName": "project_id", "KeyType": "HASH"},
+        {"AttributeName": "created_at", "KeyType": "RANGE"}
+      ],
+      "Projection": {"ProjectionType": "ALL"}
+    }]' \
+  --billing-mode PAY_PER_REQUEST \
+  --tags Key=Project,Value="${PROJECT_PREFIX}-bot" Key=Environment,Value="$ENVIRONMENT" \
+  2>/dev/null && echo "  ✓ Created" || echo "  → Already exists"
+
+echo "  Enabling TTL on attribute 'ttl'..."
+aws dynamodb update-time-to-live \
+  --profile "$PROFILE" \
+  --region "$AWS_REGION" \
+  --table-name "$OUTBOUND_TABLE" \
+  --time-to-live-specification Enabled=true,AttributeName=ttl \
+  2>/dev/null && echo "  ✓ TTL enabled" || echo "  → TTL already enabled"
+
+echo ""
 echo "Done. Tables:"
 echo "  Sessions:       $SESSION_TABLE"
 echo "  Phone creds:    $PHONE_TABLE"
 echo "  Conversations:  $CONVERSATIONS_TABLE"
 echo "  Vapi config:    $VAPI_TABLE"
+echo "  Outbound calls: $OUTBOUND_TABLE (+ project-calls-index GSI)"

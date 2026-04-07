@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     vapi_phone_number: str = ""  # Legacy fallback (prefer vapi_assistants_table)
     default_support_number: str = ""  # Fallback support number for call transfers
 
+    # Outbound calls
+    outbound_calls_table: str = ""
+    outbound_queue_url: str = ""
+
     # SMS (AWS End User Messaging / pinpoint-sms-voice-v2)
     sms_origination_number: str = ""
     sms_configuration_set: str = ""
@@ -82,6 +86,15 @@ class Settings(BaseSettings):
             self.dynamodb_conversations_table = f"pf-syn-schedulingagents-conversations-{env}"
         if not self.vapi_assistants_table:
             self.vapi_assistants_table = f"pf-syn-schedulingagents-vapi-assistants-{env}"
+
+        # Outbound calls
+        if not self.outbound_calls_table:
+            self.outbound_calls_table = f"pf-syn-schedulingagents-outbound-calls-{env}"
+        if not self.outbound_queue_url:
+            self.outbound_queue_url = (
+                f"https://sqs.{self.aws_region}.amazonaws.com/772634497954/"
+                f"pf-syn-schedulingagents-outbound-queue-{env}"
+            )
 
         # Vapi phone number fallback
         if not self.vapi_phone_number:
