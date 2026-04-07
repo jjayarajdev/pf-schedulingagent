@@ -478,6 +478,41 @@ class TestEnrichJsonBlock:
         assert data["timeSlotsGrouped"]["morning"]["slots"] == ["8:00 AM"]
         assert data["timeSlotsGrouped"]["afternoon"]["slots"] == ["1:00 PM"]
 
+    def test_available_slots_key_detected(self):
+        """LLM sometimes uses 'available_slots' instead of 'time_slots'."""
+        from channels.chat import _enrich_json_block
+        import json
+        import re
+
+        text = (
+            '```json\n'
+            '{"project_id": "90000119", "date": "2026-04-16", '
+            '"available_slots": [{"time": "08:00:00", "display_time": "8:00 AM"}, '
+            '{"time": "13:00:00", "display_time": "1:00 PM"}], '
+            '"message": "Found 2 available time slot(s)"}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
+        data = json.loads(match.group(1))
+        assert data["timeSlots"] == ["8:00 AM", "1:00 PM"]
+        assert data["slotCount"] == 2
+        assert data["timeSlotsGrouped"]["morning"]["slots"] == ["8:00 AM"]
+        assert data["timeSlotsGrouped"]["afternoon"]["slots"] == ["1:00 PM"]
+
+    def test_available_time_slots_key_detected(self):
+        """LLM sometimes uses 'available_time_slots'."""
+        from channels.chat import _enrich_json_block
+
+        text = (
+            '```json\n'
+            '{"available_time_slots": ["9:00 AM", "2:00 PM"]}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        assert '"timeSlotsGrouped"' in result
+        assert '"slotCount": 2' in result
+
     def test_no_json_block_returns_unchanged(self):
         from channels.chat import _enrich_json_block
 

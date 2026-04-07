@@ -309,7 +309,14 @@ def _enrich_json_block(response_text: str) -> str:
     modified = False
 
     # Detect time slots and add grouping if missing
-    slots = data.get("time_slots", data.get("timeSlots", []))
+    # LLM may use any of these keys depending on its mood
+    slots = (
+        data.get("time_slots")
+        or data.get("timeSlots")
+        or data.get("available_slots")
+        or data.get("available_time_slots")
+        or []
+    )
     if slots and "timeSlotsGrouped" not in data:
         # Build display names from slot objects or strings
         display: list[str] = []
