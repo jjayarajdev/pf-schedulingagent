@@ -397,3 +397,115 @@ class TestDetectResponseSignals:
         text = "Your authentication expired. Please log in again."
         signals = _detect_response_signals(text)
         assert signals["pf_http_status_code"] == 401
+
+
+class TestGroupTimeSlots:
+    def test_am_slots_go_to_morning(self):
+        from channels.chat import _group_time_slots
+
+        result = _group_time_slots(["8:00 AM", "9:00 AM", "10:00 AM"])
+        assert result["morning"]["slots"] == ["8:00 AM", "9:00 AM", "10:00 AM"]
+        assert result["morning"]["count"] == 3
+        assert result["afternoon"]["count"] == 0
+        assert result["evening"]["count"] == 0
+
+    def test_pm_slots_grouped_correctly(self):
+        from channels.chat import _group_time_slots
+
+        result = _group_time_slots(["12:00 PM", "1:00 PM", "3:00 PM", "5:00 PM", "6:00 PM"])
+        assert result["afternoon"]["slots"] == ["12:00 PM", "1:00 PM", "3:00 PM"]
+        assert result["evening"]["slots"] == ["5:00 PM", "6:00 PM"]
+
+    def test_mixed_am_pm(self):
+        from channels.chat import _group_time_slots
+
+        result = _group_time_slots(["8:00 AM", "1:00 PM"])
+        assert result["morning"]["slots"] == ["8:00 AM"]
+        assert result["afternoon"]["slots"] == ["1:00 PM"]
+
+    def test_empty_list(self):
+        from channels.chat import _group_time_slots
+
+        result = _group_time_slots([])
+        assert result["morning"]["count"] == 0
+        assert result["afternoon"]["count"] == 0
+        assert result["evening"]["count"] == 0
+
+
+class TestEnrichJsonBlock:
+    def test_adds_grouped_slots_from_time_slots_key(self):
+        from channels.chat import _enrich_json_block
+
+        text = (
+            'Here are the available times:\n\n'
+            '```json\n'
+            '{"time_slots": ["8:00 AM", "1:00 PM"], "confirmation_required": false}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        assert '"timeSlotsGrouped"' in result
+        assert '"slotCount": 2' in result
+
+    def test_adds_grouped_slots_from_timeSlots_key(self):
+        from channels.chat import _enrich_json_block
+
+        text = (
+            '```json\n'
+            '{"timeSlots": ["9:00 AM", "2:00 PM", "5:00 PM"]}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        assert '"timeSlotsGrouped"' in result
+        assert '"slotCount": 3' in result
+
+    def test_handles_dict_slot_objects(self):
+        from channels.chat import _enrich_json_block
+        import json
+
+        text = (
+            '```json\n'
+            '{"time_slots": [{"time": "08:00", "display_time": "8:00 AM"}, '
+            '{"time": "13:00", "display_time": "1:00 PM"}]}\n'
+            '```'
+        )
+        result = _enrich_json_block(text)
+        # Parse the enriched JSON block
+        import re
+        match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
+        data = json.loads(match.group(1))
+        assert data["timeSlots"] == ["8:00 AM", "1:00 PM"]
+        assert data["slotCount"] == 2
+        assert data["timeSlotsGrouped"]["morning"]["slots"] == ["8:00 AM"]
+        assert data["timeSlotsGrouped"]["afternoon"]["slots"] == ["1:00 PM"]
+
+    def test_no_json_block_returns_unchanged(self):
+        from channels.chat import _enrich_json_block
+
+        text = "No slots available today."
+        assert _enrich_json_block(text) == text
+
+    def test_no_time_slots_returns_unchanged(self):
+        from channels.chat import _enrich_json_block
+
+        text = (
+            '```json\n'
+            '{"projects": [{"id": "123"}], "confirmation_required": false}\n'
+            '```'
+        )
+        assert _enrich_json_block(text) == text
+
+    def test_already_grouped_returns_unchanged(self):
+        from channels.chat import _enrich_json_block
+
+        text = (
+            '```json\n'
+            '{"time_slots": ["8:00 AM"], "timeSlotsGrouped": {"morning": {}}}\n'
+            '```'
+        )
+        assert _enrich_json_block(text) == text
+
+    def test_invalid_json_returns_unchanged(self):
+        from channels.chat import _enrich_json_block
+
+        text = '```json\n{broken json\n```'
+        assert _enrich_json_block(text) == text

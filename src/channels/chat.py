@@ -260,6 +260,77 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
 
+def _group_time_slots(display_slots: list[str]) -> dict:
+    """Group display-format time slots into morning/afternoon/evening."""
+    morning: list[str] = []
+    afternoon: list[str] = []
+    evening: list[str] = []
+
+    for slot in display_slots:
+        try:
+            parts = slot.strip().upper()
+            if "AM" in parts:
+                morning.append(slot)
+            elif "PM" in parts:
+                # Parse hour to distinguish afternoon vs evening
+                hour_str = slot.split(":")[0].strip()
+                hour = int(hour_str)
+                if hour == 12 or hour < 5:
+                    afternoon.append(slot)
+                else:
+                    evening.append(slot)
+            else:
+                morning.append(slot)
+        except (ValueError, IndexError):
+            morning.append(slot)
+
+    return {
+        "morning": {"label": "Morning", "slots": morning, "count": len(morning)},
+        "afternoon": {"label": "Afternoon", "slots": afternoon, "count": len(afternoon)},
+        "evening": {"label": "Evening", "slots": evening, "count": len(evening)},
+    }
+
+
+def _enrich_json_block(response_text: str) -> str:
+    """Enrich the LLM's JSON block with frontend-required fields.
+
+    Adds ``timeSlotsGrouped`` and ``slotCount`` when time slot data is present,
+    since the LLM may not preserve these from tool output.
+    """
+    match = _JSON_BLOCK_RE.search(response_text)
+    if not match:
+        return response_text
+
+    try:
+        data = json.loads(match.group(1))
+    except (json.JSONDecodeError, AttributeError):
+        return response_text
+
+    modified = False
+
+    # Detect time slots and add grouping if missing
+    slots = data.get("time_slots", data.get("timeSlots", []))
+    if slots and "timeSlotsGrouped" not in data:
+        # Build display names from slot objects or strings
+        display: list[str] = []
+        for s in slots:
+            if isinstance(s, dict):
+                display.append(s.get("display_time", s.get("time", "")))
+            else:
+                display.append(str(s))
+
+        data["timeSlots"] = display
+        data["timeSlotsGrouped"] = _group_time_slots(display)
+        data["slotCount"] = len(display)
+        modified = True
+
+    if not modified:
+        return response_text
+
+    new_json = json.dumps(data, indent=2)
+    return response_text[:match.start(1)] + new_json + "\n" + response_text[match.end(1):]
+
+
 def _detect_response_signals(response_text: str) -> dict:
     """Detect confirmation requests, actions, and PF API errors from response text.
 
@@ -474,6 +545,9 @@ async def chat(request: ChatRequest, raw_request: Request):
         elapsed_ms,
     )
 
+    # Enrich JSON block with frontend-required fields (timeSlotsGrouped, etc.)
+    response_text = _enrich_json_block(response_text)
+
     # Detect confirmation requests and PF API errors from response text
     signals = _detect_response_signals(response_text)
     intent = _infer_intent(agent_name)
@@ -601,6 +675,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
             full_text = repaired
 
         agent_name = response.metadata.agent_name if hasattr(response, "metadata") else ""
+        full_text = _enrich_json_block(full_text)
         signals = _detect_response_signals(full_text)
         intent = _infer_intent(agent_name)
 
