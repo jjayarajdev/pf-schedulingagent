@@ -20,6 +20,7 @@ os.environ.setdefault("DYNAMODB_CONVERSATIONS_TABLE", "pf-syn-schedulingagents-c
 os.environ.setdefault("VAPI_ASSISTANTS_TABLE", "pf-syn-schedulingagents-vapi-assistants-test")
 os.environ.setdefault("SMS_ORIGINATION_NUMBER", "+15551234567")
 os.environ.setdefault("SMS_CONFIGURATION_SET", "scheduling-agent-sms-config-test")
+os.environ.setdefault("OUTBOUND_CALLS_TABLE", "pf-syn-schedulingagents-outbound-calls-test")
 
 
 @pytest.fixture(autouse=True)

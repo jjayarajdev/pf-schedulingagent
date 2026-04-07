@@ -1290,3 +1290,245 @@ class TestTransferCallTool:
         prompt = config["model"]["messages"][0]["content"]
         assert "transferCall" in prompt
         assert "send_support_sms" not in prompt
+
+
+# ── Outbound call tests ──────────────────────────────────────────────
+
+
+class TestOutboundGreeting:
+    def test_greeting_with_name_and_project(self):
+        from channels.vapi import _generate_outbound_greeting
+
+        greeting = _generate_outbound_greeting("Jane Doe", "FloorCo", "Flooring Installation")
+        assert "Jane" in greeting
+        assert "FloorCo" in greeting
+        assert "Flooring Installation" in greeting
+        assert "good time" in greeting.lower()
+
+    def test_greeting_without_name(self):
+        from channels.vapi import _generate_outbound_greeting
+
+        greeting = _generate_outbound_greeting("", "FloorCo", "Carpet")
+        assert "Hello!" in greeting
+        assert "FloorCo" in greeting
+
+    def test_greeting_without_project_type(self):
+        from channels.vapi import _generate_outbound_greeting
+
+        greeting = _generate_outbound_greeting("Jane", "FloorCo", "")
+        assert "Jane" in greeting
+        assert "upcoming project" in greeting.lower()
+
+
+class TestOutboundSchedulingConfig:
+    def test_config_structure(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane Doe",
+            "project_type": "Flooring",
+        }
+        config = _build_outbound_scheduling_config(
+            "Hello Jane!", "secret", outbound, "+15551234567", "FloorCo",
+        )
+
+        assert config["name"] == "FloorCo Outbound Scheduling"
+        assert config["firstMessage"] == "Hello Jane!"
+        assert config["voice"] is not None
+        assert config["model"]["tools"][0]["function"]["name"] == "ask_scheduling_bot"
+        assert "server" in config
+        assert config["server"]["secret"] == "secret"
+
+    def test_config_has_voicemail_message(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {"customer_name": "Jane Doe", "project_type": "Windows"}
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "+15551234567",
+        )
+
+        assert "voicemailMessage" in config
+        assert "Jane" in config["voicemailMessage"]
+        assert "Windows" in config["voicemailMessage"]
+
+    def test_config_has_transfer_tool_with_support_number(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {"customer_name": "Jane", "project_type": "Carpet"}
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "+15551234567",
+        )
+
+        tools = config["model"]["tools"]
+        transfer_tools = [t for t in tools if t.get("type") == "transferCall"]
+        assert len(transfer_tools) == 1
+
+    def test_config_no_transfer_without_number(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {"customer_name": "Jane", "project_type": "Carpet"}
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "",
+        )
+
+        tools = config["model"]["tools"]
+        transfer_tools = [t for t in tools if t.get("type") == "transferCall"]
+        assert len(transfer_tools) == 0
+
+    def test_system_prompt_has_6_steps(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {"customer_name": "Jane Doe", "project_type": "Flooring"}
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "+15551234567",
+        )
+
+        prompt = config["model"]["messages"][0]["content"]
+        assert "Step 1" in prompt
+        assert "Step 2" in prompt
+        assert "Step 3" in prompt
+        assert "Step 4" in prompt
+        assert "Step 5" in prompt
+        assert "Step 6" in prompt
+        assert "OUTBOUND" in prompt
+
+
+class TestClassifyOutboundOutcome:
+    def test_voicemail(self):
+        from channels.vapi import _classify_outbound_outcome
+
+        result = _classify_outbound_outcome("voicemail", "")
+        assert result["status"] == "voicemail"
+
+    def test_no_answer(self):
+        from channels.vapi import _classify_outbound_outcome
+
+        result = _classify_outbound_outcome("no-answer", "")
+        assert result["status"] == "no_answer"
+
+    def test_callback_requested(self):
+        from channels.vapi import _classify_outbound_outcome
+
+        result = _classify_outbound_outcome("customer-ended-call", "Customer said not a good time")
+        assert result["status"] == "callback_requested"
+
+    def test_completed_with_confirmation(self):
+        from channels.vapi import _classify_outbound_outcome
+
+        result = _classify_outbound_outcome("assistant-ended", "Appointment confirmed for April 10")
+        assert result["status"] == "completed"
+
+    def test_default_completed(self):
+        from channels.vapi import _classify_outbound_outcome
+
+        result = _classify_outbound_outcome("unknown", "")
+        assert result["status"] == "completed"
+
+
+class TestOutboundAssistantRequest:
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.update_outbound_call", new_callable=AsyncMock)
+    @patch("channels.vapi.get_secrets")
+    async def test_outbound_detection_routes_correctly(self, mock_secrets, mock_update, mock_cache):
+        """Outbound call type + our call_id in metadata triggers outbound handler."""
+        from channels.vapi import _handle_assistant_request
+
+        mock_secrets_instance = MagicMock()
+        mock_secrets_instance.vapi_api_key = "test-key"
+        mock_secrets.return_value = mock_secrets_instance
+
+        mock_cache.return_value = {
+            "call_id": "our-123",
+            "customer_name": "Jane Doe",
+            "client_name": "TestCo",
+            "project_type": "Flooring",
+            "auth_creds": {
+                "support_number": "+15551234567",
+                "timezone": "US/Eastern",
+                "office_hours": [],
+            },
+        }
+
+        body = {
+            "message": {
+                "type": "assistant-request",
+                "call": {
+                    "id": "vapi-call-1",
+                    "type": "outboundPhoneCall",
+                    "metadata": {"call_id": "our-123"},
+                },
+            }
+        }
+
+        result = await _handle_assistant_request(body)
+
+        assert "assistant" in result
+        config = result["assistant"]
+        assert "Outbound" in config["name"]
+        mock_update.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.get_outbound_call", new_callable=AsyncMock)
+    @patch("channels.vapi.update_outbound_call", new_callable=AsyncMock)
+    @patch("channels.vapi.get_secrets")
+    async def test_outbound_falls_back_to_dynamodb(self, mock_secrets, mock_update, mock_db, mock_cache):
+        """If not in active cache, falls back to DynamoDB lookup."""
+        from channels.vapi import _handle_assistant_request
+
+        mock_secrets_instance = MagicMock()
+        mock_secrets_instance.vapi_api_key = "test-key"
+        mock_secrets.return_value = mock_secrets_instance
+
+        mock_cache.return_value = None  # Not in cache
+        mock_db.return_value = {
+            "call_id": "our-456",
+            "customer_name": "Bob",
+            "client_name": "WinCo",
+            "project_type": "Windows",
+            "auth_creds": {"support_number": "", "timezone": "US/Eastern", "office_hours": []},
+        }
+
+        body = {
+            "message": {
+                "type": "assistant-request",
+                "call": {
+                    "id": "vapi-call-2",
+                    "type": "outboundPhoneCall",
+                    "metadata": {"call_id": "our-456"},
+                },
+            }
+        }
+
+        result = await _handle_assistant_request(body)
+
+        assert "assistant" in result
+        mock_db.assert_awaited_once_with("our-456")
+
+
+class TestOutboundAuthContext:
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    async def test_outbound_creds_populate_auth_context(self, mock_cache):
+        """Active outbound call creds should populate AuthContext."""
+        from channels.vapi import _set_auth_context_from_phone
+        from auth.context import AuthContext
+
+        mock_cache.return_value = {
+            "auth_creds": {
+                "bearer_token": "outbound-jwt",
+                "client_id": "outbound-client",
+                "customer_id": "outbound-cust",
+                "user_id": "outbound-user",
+                "user_name": "Outbound Jane",
+                "timezone": "US/Pacific",
+                "support_number": "+15550001111",
+            }
+        }
+
+        call_data = {"id": "vapi-outbound-1"}
+        await _set_auth_context_from_phone(call_data, "session-1")
+
+        assert AuthContext.get_auth_token() == "outbound-jwt"
+        assert AuthContext.get_client_id() == "outbound-client"

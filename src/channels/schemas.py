@@ -62,3 +62,17 @@ class VapiPayload(BaseModel):
     """Vapi webhook payload (flexible — Vapi sends various event types)."""
 
     message: dict = Field(default_factory=dict, description="Vapi event message object")
+
+
+class OutboundTriggerRequest(BaseModel):
+    """Manual trigger for outbound call (dev/testing). Production uses SQS."""
+
+    project_id: str
+    client_id: str
+    customer_phone: str = Field(..., description="Primary phone (E.164)")
+    customer_phone_alt: str = Field(default="", description="Alternate phone (E.164)")
+    customer_name: str = ""
+    customer_id: str = ""
+    project_type: str = ""
+    vapi_phone_number_id: str = Field(default="", description="Vapi phone to call FROM")
+    metadata: dict = Field(default_factory=dict)

@@ -1,5 +1,6 @@
 """FastAPI application — deployed on ECS Fargate via uvicorn."""
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from channels.admin import router as admin_router
 from channels.chat import router as chat_router
 from channels.history import router as history_router
+from channels.outbound import router as outbound_router
 from channels.sms import router as sms_router
 from channels.vapi import router as vapi_router
 from config import get_settings
@@ -17,11 +19,21 @@ from observability import RequestLoggingMiddleware, configure_logging
 
 configure_logging()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from channels.outbound_consumer import start_outbound_consumer, stop_outbound_consumer
+
+    await start_outbound_consumer()
+    yield
+    await stop_outbound_consumer()
+
 tags_metadata = [
     {"name": "chat", "description": "Chat channel endpoints for web chat integration"},
     {"name": "vapi", "description": "Vapi phone channel webhook"},
     {"name": "sms", "description": "SMS channel via Amazon Pinpoint"},
     {"name": "conversations", "description": "Conversation history and search"},
+    {"name": "Outbound Calls", "description": "Outbound call status, listing, and manual trigger"},
     {"name": "admin", "description": "Admin endpoints for configuration management"},
     {"name": "system", "description": "Health and status endpoints"},
 ]
@@ -31,6 +43,7 @@ app = FastAPI(
     description="ProjectsForce Scheduling AI Bot API",
     version="0.1.0",
     openapi_tags=tags_metadata,
+    lifespan=lifespan,
 )
 
 
@@ -72,6 +85,7 @@ app.include_router(chat_router)
 app.include_router(vapi_router)
 app.include_router(sms_router)
 app.include_router(history_router)
+app.include_router(outbound_router)
 app.include_router(admin_router)
 
 

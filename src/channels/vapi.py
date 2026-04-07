@@ -36,6 +36,13 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
+from channels.outbound_consumer import retry_outbound_call
+from channels.outbound_store import (
+    get_active_call,
+    get_outbound_call,
+    remove_active_call,
+    update_outbound_call,
+)
 from tools.scheduling import (
     clear_session_projects,
     post_call_summary_notes,
@@ -221,6 +228,12 @@ async def _handle_assistant_request(body: dict) -> dict:
     message = body.get("message", {})
     call_data = message.get("call", body.get("call", {}))
     call_id = call_data.get("id", "unknown")
+
+    # ── Outbound call detection ──────────────────────────────────────
+    call_type = call_data.get("type", "")
+    our_call_id = (call_data.get("metadata") or {}).get("call_id", "")
+    if call_type == "outboundPhoneCall" and our_call_id:
+        return await _handle_outbound_assistant_request(body, call_data, our_call_id)
 
     from_phone = _extract_phone_number(call_data)
     to_phone, tenant_support_number = _resolve_to_phone_and_support(call_data)
@@ -543,6 +556,282 @@ def _build_assistant_config(
     }
 
 
+# ── Outbound call handling ────────────────────────────────────────────
+
+
+async def _handle_outbound_assistant_request(
+    body: dict, call_data: dict, our_call_id: str
+) -> dict:
+    """Handle assistant-request for an outbound call.
+
+    Looks up the call from the active calls cache (or DynamoDB fallback),
+    builds an outbound-specific assistant config, and returns it.
+    """
+    vapi_call_id = call_data.get("id", "")
+    logger.info(
+        "Outbound assistant-request: vapi_call_id=%s our_call_id=%s",
+        vapi_call_id, our_call_id,
+    )
+
+    # Look up call context (cache first, then DynamoDB)
+    outbound = get_active_call(vapi_call_id)
+    if not outbound:
+        outbound = await get_outbound_call(our_call_id)
+    if not outbound:
+        logger.error("Outbound call not found: %s", our_call_id)
+        # Return a minimal config that tells the AI to apologize
+        return {"assistant": _build_assistant_config(
+            "I'm sorry, I'm experiencing a technical issue. Please try again later.",
+            get_secrets().vapi_api_key,
+        )}
+
+    # Update status to in_progress
+    await update_outbound_call(our_call_id, {"status": "in_progress"})
+
+    webhook_secret = get_secrets().vapi_api_key
+    customer_name = outbound.get("customer_name", "")
+    client_name = outbound.get("client_name", "ProjectsForce")
+    project_type = outbound.get("project_type", "")
+    support_number = (outbound.get("auth_creds") or {}).get("support_number", "")
+
+    # Office hours
+    office_hours = (outbound.get("auth_creds") or {}).get("office_hours", [])
+    timezone = (outbound.get("auth_creds") or {}).get("timezone", "US/Eastern")
+    hours_context = _build_office_hours_context(office_hours, timezone)
+
+    greeting = _generate_outbound_greeting(customer_name, client_name, project_type)
+    logger.info(
+        "Outbound config: call_id=%s customer=%s client=%s project_type=%s",
+        our_call_id, customer_name, client_name, project_type,
+    )
+
+    return {"assistant": _build_outbound_scheduling_config(
+        greeting, webhook_secret, outbound, support_number, client_name, hours_context,
+    )}
+
+
+def _generate_outbound_greeting(
+    customer_name: str, client_name: str, project_type: str
+) -> str:
+    """Build an SSML greeting for outbound scheduling calls."""
+    first_name = customer_name.split()[0] if customer_name and customer_name.strip() else ""
+    name_part = f"Hello {first_name}!" if first_name else "Hello!"
+    name = client_name or "ProjectsForce"
+
+    project_part = ""
+    if project_type:
+        project_part = f" I'm calling about your {project_type} project."
+    else:
+        project_part = " I'm calling about your upcoming project."
+
+    return (
+        f'<break time="2000ms"/> {name_part} <break time="300ms"/> '
+        f"This is J from {name}."
+        f' <break time="300ms"/> '
+        f"{project_part}"
+        ' <break time="500ms"/> '
+        "Is now a good time to talk?"
+    )
+
+
+def _build_outbound_scheduling_config(
+    first_message: str,
+    server_secret: str,
+    outbound_call: dict,
+    support_number: str = "",
+    client_name: str = "ProjectsForce",
+    hours_context: dict | None = None,
+) -> dict:
+    """Build Vapi assistant config for outbound scheduling calls.
+
+    Uses the same structure as inbound _build_assistant_config() but with
+    an outbound-specific system prompt encoding the 6-step call flow.
+    """
+    name = client_name or "ProjectsForce"
+    customer_name = outbound_call.get("customer_name", "")
+    project_type = outbound_call.get("project_type", "")
+    first_name = customer_name.split()[0] if customer_name and customer_name.strip() else "the customer"
+
+    support_speech = ""
+    if support_number:
+        support_speech = _format_phone_for_speech(support_number)
+
+    server_config: dict = {
+        "url": _get_webhook_url(),
+        "timeoutSeconds": 30,
+    }
+    if server_secret:
+        server_config["secret"] = server_secret
+
+    system_prompt = (
+        f"You are J, a friendly phone assistant calling on behalf of {name} "
+        "— a home improvement scheduling service.\n\n"
+        "## YOUR MISSION\n"
+        f"You are making an OUTBOUND call to {first_name} to schedule their "
+        f"{project_type or 'home improvement'} project. Follow the 6-step flow below.\n\n"
+        "## 6-STEP CALL FLOW\n\n"
+        "### Step 1 — Introduction (already done via firstMessage)\n"
+        "You already introduced yourself. Wait for the customer's response.\n\n"
+        "### Step 2 — Availability Check\n"
+        "If they say no, not a good time, or seem busy:\n"
+        "- Say: 'No problem! You can call us back anytime"
+        + (f" at {support_speech}" if support_speech else "")
+        + ", or we can try again later. Have a great day!'\n"
+        "- End the call gracefully.\n"
+        "If they say yes, proceed to Step 3.\n\n"
+        "### Step 3 — Scheduling\n"
+        "Call ask_scheduling_bot to help them schedule:\n"
+        f"- Say: 'Great! Let me pull up the available dates for your {project_type or 'project'}.'\n"
+        "- Call ask_scheduling_bot with: 'Show available dates'\n"
+        "- When dates come back, read them naturally to the customer.\n"
+        "- Customer picks a date → call ask_scheduling_bot with their choice.\n"
+        "- When time slots come back, read them naturally.\n"
+        "- Customer picks a time → call ask_scheduling_bot to confirm.\n"
+        "- CRITICAL: You MUST call ask_scheduling_bot for EVERY step. "
+        "The appointment is NOT booked until ask_scheduling_bot returns 'confirmed'.\n\n"
+        "### Step 4 — Address Confirmation\n"
+        "After scheduling is confirmed, ask: 'Let me confirm the installation address.'\n"
+        "Call ask_scheduling_bot with: 'What is the installation address?'\n"
+        "Read the address aloud. Ask: 'Is that correct?'\n"
+        "- If correct: proceed to Step 5.\n"
+        "- If corrections needed: call ask_scheduling_bot with: "
+        "'Add note: ADDRESS CORRECTION: [customer's correction]'\n"
+        "Do NOT try to update the address yourself.\n\n"
+        "### Step 5 — Additional Notes\n"
+        "Ask: 'Is there anything our team should know before arriving? "
+        "For example, pets, gate codes, or parking instructions?'\n"
+        "If the customer has notes, call ask_scheduling_bot with: "
+        "'Add note: CUSTOMER NOTE: [their notes]'\n"
+        "If no notes: proceed to Step 6.\n\n"
+        "### Step 6 — Wrap-up\n"
+        "Summarize: date, time, and address.\n"
+        "Say: 'You\\'ll receive a confirmation text and email shortly. "
+        "Thank you for choosing {name}! Have a wonderful day.'\n"
+        "End the call.\n\n"
+        "## CRITICAL RULES\n"
+        "1. You MUST call ask_scheduling_bot for EVERY request — no exceptions.\n"
+        "2. Pass the user's EXACT words in the \"question\" field.\n"
+        "3. NEVER ask clarifying questions before calling the tool.\n"
+        "4. Keep it conversational — you are on a phone call.\n"
+        "5. NEVER read out project numbers or IDs — identify by type.\n"
+        "6. Before calling ask_scheduling_bot, say a brief filler. Vary phrasing.\n"
+        "7. If the customer wants to speak to a person, use transferCall.\n"
+        "8. The appointment is NOT booked until ask_scheduling_bot says 'confirmed'.\n"
+        "9. NEVER say 'Hold on', 'Wait', or 'Hang on' — rude on outbound calls."
+        + (
+            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+            if hours_context and hours_context.get("prompt_snippet")
+            else ""
+        )
+    ).format(name=name)
+
+    voicemail_msg = (
+        f"Hello {first_name}, this is J from {name}. "
+        f"I'm calling about your {project_type or 'home improvement'} project. "
+        "We'd like to schedule your installation at a convenient time. "
+    )
+    if support_speech:
+        voicemail_msg += f"Please call us back at {support_speech}. "
+    voicemail_msg += "Thank you!"
+
+    return {
+        "name": f"{name} Outbound Scheduling",
+        "voice": _VOICE_CONFIG,
+        "model": {
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content": system_prompt}
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_scheduling_bot",
+                        "description": (
+                            "REQUIRED for ALL requests. Call for every question about "
+                            "scheduling, dates, times, address, or notes. The bot has "
+                            "full context about the customer's account."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": ["question"],
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The user's EXACT words.",
+                                },
+                            },
+                        },
+                    },
+                },
+                *(_transfer_call_tool(support_number, name)),
+            ],
+        },
+        "transcriber": {
+            "model": "nova-3",
+            "language": "en",
+            "provider": "deepgram",
+            "endpointing": 150,
+        },
+        "firstMessage": first_message,
+        "endCallMessage": (
+            f"Thank you for your time, {first_name}. Have a wonderful day!"
+        ),
+        "endCallPhrases": [
+            "goodbye", "bye", "bye bye", "bye now",
+            "talk to you later", "have a great day",
+            "no thanks", "not interested",
+        ],
+        "endCallFunctionEnabled": True,
+        "voicemailDetection": {
+            "provider": "vapi",
+            "voicemailDetectionTypes": ["machine_end_beep"],
+        },
+        "voicemailMessage": voicemail_msg,
+        "silenceTimeoutSeconds": 30,
+        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.4,
+            "smartEndpointingEnabled": True,
+        },
+        "hipaaEnabled": False,
+        "server": server_config,
+        "serverUrl": _get_webhook_url(),
+    }
+
+
+def _classify_outbound_outcome(ended_reason: str, summary: str) -> dict:
+    """Classify the outcome of an outbound call based on Vapi's end-of-call data."""
+    reason_lower = (ended_reason or "").lower()
+    summary_lower = (summary or "").lower()
+
+    # Voicemail detection
+    if "voicemail" in reason_lower or "machine" in reason_lower:
+        return {"status": "voicemail", "ended_reason": ended_reason, "summary": summary}
+
+    # No answer / busy
+    if "no-answer" in reason_lower or "busy" in reason_lower:
+        return {"status": "no_answer", "ended_reason": ended_reason, "summary": summary}
+
+    # Customer requested callback
+    if any(phrase in summary_lower for phrase in ("call back", "callback", "not a good time", "busy right now")):
+        return {"status": "callback_requested", "ended_reason": ended_reason, "summary": summary}
+
+    # Successful completion
+    if any(phrase in summary_lower for phrase in ("confirmed", "scheduled", "booked", "appointment")):
+        return {"status": "completed", "ended_reason": ended_reason, "summary": summary}
+
+    # Customer hung up or call ended normally
+    if "customer" in reason_lower and "ended" in reason_lower:
+        return {"status": "completed", "ended_reason": ended_reason, "summary": summary}
+
+    # Default: mark as completed (call happened, outcome unclear)
+    return {"status": "completed", "ended_reason": ended_reason, "summary": summary}
+
+
 def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     """Build a generic SSML greeting for unknown callers.
 
@@ -858,6 +1147,51 @@ def _handle_server_event(body: dict) -> dict:
             summary[:200] if summary else "",
         )
 
+        # ── Outbound call end-of-call handling ──────────────────────
+        outbound = get_active_call(call_id)
+        if outbound:
+            our_call_id = outbound.get("call_id", "")
+            outcome = _classify_outbound_outcome(reason, summary)
+            task = asyncio.create_task(
+                update_outbound_call(our_call_id, {
+                    "status": outcome["status"],
+                    "call_result": outcome,
+                })
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            remove_active_call(call_id)
+
+            # Post call notes using cached outbound creds
+            creds = outbound.get("auth_creds", {})
+            if creds.get("bearer_token") and summary:
+                session_id = f"vapi-{call_id}"
+                task2 = asyncio.create_task(
+                    post_call_summary_notes(
+                        session_id=session_id,
+                        bearer_token=creds["bearer_token"],
+                        client_id=creds.get("client_id", ""),
+                        customer_id=creds.get("customer_id", ""),
+                        summary=summary,
+                        duration_seconds=duration,
+                    )
+                )
+                _background_tasks.add(task2)
+                task2.add_done_callback(_background_tasks.discard)
+
+            # Retry on alternate number if no_answer/voicemail
+            if outcome["status"] in ("no_answer", "voicemail"):
+                retry_task = asyncio.create_task(retry_outbound_call(outbound))
+                _background_tasks.add(retry_task)
+                retry_task.add_done_callback(_background_tasks.discard)
+
+            logger.info(
+                "Outbound call ended: our_call_id=%s status=%s reason=%s",
+                our_call_id, outcome["status"], reason,
+            )
+            return {"status": "ok"}
+
+        # ── Inbound call end-of-call handling (existing) ────────────
         # Post call summary notes to discussed projects (fire-and-forget)
         session_id = f"vapi-{call_id}"
         session_key = f"vapi-{call_id}"
@@ -1136,6 +1470,21 @@ async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None
     """
     call_id = call_data.get("id", "")
     session_key = f"vapi-{call_id}"
+
+    # If this is an active outbound call, use pre-cached auth creds
+    outbound = get_active_call(call_id)
+    if outbound and outbound.get("auth_creds"):
+        creds = outbound["auth_creds"]
+        AuthContext.set(
+            auth_token=creds.get("bearer_token", ""),
+            client_id=creds.get("client_id", ""),
+            customer_id=creds.get("customer_id", creds.get("user_id", "")),
+            user_id=creds.get("user_id", ""),
+            user_name=creds.get("user_name", ""),
+            timezone=creds.get("timezone", "US/Eastern"),
+            support_number=creds.get("support_number", ""),
+        )
+        return
 
     # If this is an authenticated store session, use cached creds
     store_session = _store_sessions.get(session_key)
