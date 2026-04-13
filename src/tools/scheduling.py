@@ -44,6 +44,28 @@ _CACHE_TTL_SECONDS = 60
 # Cache of request_id per project_id — populated by get_available_dates, used by get_time_slots/confirm
 _request_id_by_project: dict[str, int] = {}
 
+# Tracks projects with an active reschedule flow.  Set by _get_reschedule_slots,
+# cleared by confirm_appointment.  Prevents the can_schedule("Scheduled") check
+# from blocking the confirm call after PF's atomic reschedule-slots endpoint
+# already cancelled the old appointment.
+_reschedule_pending: set[str] = set()  # project_ids with reschedule in progress
+
+# Per-request caches for server-side injection — the LLM truncates large arrays,
+# so chat.py injects the full data from these caches.  ContextVar ensures each
+# concurrent request gets its own value (no cross-customer data leakage).
+_last_weather_dates: ContextVar[list] = ContextVar("last_weather_dates", default=[])
+_last_projects_list: ContextVar[list] = ContextVar("last_projects_list", default=[])
+
+
+def get_last_weather_dates() -> list:
+    """Return the last weather dates array for server-side injection."""
+    return _last_weather_dates.get()
+
+
+def get_last_projects_list() -> list:
+    """Return the last list_projects result for server-side injection."""
+    return _last_projects_list.get()
+
 # Lock to prevent concurrent API fetches for the same customer
 _load_lock = asyncio.Lock()
 
@@ -92,6 +114,15 @@ def reset_confirm_flag() -> None:
     _confirm_called_in_request.set(False)
 
 
+def reset_request_caches() -> None:
+    """Reset per-request injection caches before each orchestrator call.
+
+    Prevents stale data from a previous request leaking into the current one.
+    """
+    _last_weather_dates.set([])
+    _last_projects_list.set([])
+
+
 def was_confirm_called() -> bool:
     """Check if confirm_appointment was actually called in this request."""
     return _confirm_called_in_request.get()
@@ -100,6 +131,42 @@ def was_confirm_called() -> bool:
 # ---------------------------------------------------------------------------
 #  Time normalization
 # ---------------------------------------------------------------------------
+
+def _format_time_display(time_str: str) -> str:
+    """Convert a 24-hour time string to 12-hour AM/PM for display.
+
+    Accepts: "13:00:00", "08:00:00", "8:00 AM", etc.
+    Returns: "1:00 PM", "8:00 AM", etc.
+    """
+    t = time_str.strip()
+    # Already in AM/PM format
+    if re.search(r"[AaPp][Mm]", t):
+        return t
+    # Parse HH:MM or HH:MM:SS
+    match = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", t)
+    if match:
+        hour = int(match.group(1))
+        minute = match.group(2)
+        period = "AM" if hour < 12 else "PM"
+        display_hour = hour if hour <= 12 else hour - 12
+        if display_hour == 0:
+            display_hour = 12
+        return f"{display_hour}:{minute} {period}"
+    return t
+
+
+def _format_date_display(date_str: str) -> str:
+    """Convert YYYY-MM-DD to US format MM/DD/YYYY for display.
+
+    Accepts: "2026-04-18"
+    Returns: "04/18/2026"
+    """
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return dt.strftime("%m/%d/%Y")
+    except (ValueError, TypeError):
+        return date_str
+
 
 def _normalize_time(time_str: str) -> str:
     """Normalize a time string to HH:MM:SS (24-hour) format.
@@ -534,6 +601,9 @@ async def list_projects(
             if pid:
                 _track_project_action(pid, "viewed_projects")
 
+    # Cache for server-side injection — the LLM truncates large JSON arrays
+    _last_projects_list.set(filtered)
+
     return json.dumps({"message": f"Found {len(filtered)} project(s):", "projects": filtered}, indent=2)
 
 
@@ -553,6 +623,17 @@ def _match_scheduled_date(scheduled_date: str, target_date: str) -> bool:
     if not scheduled_date:
         return False
     return scheduled_date[:10] == target_date[:10]
+
+
+def _get_project_number(project_id: str) -> str:
+    """Return the user-facing project number for a project_id.
+
+    Falls back to ``project_id`` if the cache miss or no projectNumber.
+    """
+    project = _get_cached_project(project_id)
+    if project:
+        return project.get("projectNumber") or project_id
+    return project_id
 
 
 async def get_project_details(project_id: str) -> str:
@@ -575,7 +656,8 @@ async def get_project_details(project_id: str) -> str:
         project = _get_cached_project(project_id)
 
     if not project:
-        return f"Project {project_id} not found. Please check the project ID and try again."
+        pnum = _get_project_number(project_id)
+        return f"Project {pnum} not found. Please check the project number and try again."
 
     result = {
         "project": project,
@@ -598,12 +680,37 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             end_date = range_result["end_date"]
         else:
             date_result = convert_natural_date(start_date)
+            if date_result and date_result.get("past"):
+                pnum = _get_project_number(project_id)
+                return json.dumps({
+                    "project_number": pnum,
+                    "available_dates": [],
+                    "past_dates": True,
+                    "message": (
+                        f"The requested dates ({date_result['start_date']} to "
+                        f"{date_result['end_date']}) have already passed. "
+                        "Please pick a future date range, or I can show you "
+                        "the next available dates."
+                    ),
+                }, indent=2)
             if date_result:
                 start_date = date_result["start_date"]
                 end_date = date_result.get("end_date", "")
 
+    # Reject past dates — clamp to tomorrow
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    if start_date:
+        try:
+            start_dt_check = datetime.strptime(start_date[:10], "%Y-%m-%d").date()
+            if start_dt_check < today:
+                logger.info("Past date requested (%s), clamping to tomorrow (%s)", start_date, tomorrow)
+                start_date = tomorrow.strftime("%Y-%m-%d")
+                end_date = ""  # Reset so it recalculates from new start
+        except ValueError:
+            pass
+
     if not start_date:
-        tomorrow = datetime.now() + timedelta(days=1)
         start_date = tomorrow.strftime("%Y-%m-%d")
     if not end_date:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -627,7 +734,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             )):
                 logger.info("Project %s is already scheduled (API 400)", project_id)
                 result = {
-                    "project_id": project_id,
+                    "project_number": _get_project_number(project_id),
                     "already_scheduled": True,
                     "available_dates": [],
                     "message": (
@@ -696,36 +803,40 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
         except (ValueError, IndexError):
             formatted_slots.append(s)
 
+    pnum = _get_project_number(project_id)
     result: dict[str, Any] = {
-        "project_id": project_id,
+        "project_number": pnum,
         "available_dates": sorted_dates,
         "date_range": {"start": start_date, "end": end_date},
-        "message": f"Found {len(sorted_dates)} available date(s) for project {project_id}.",
+        "message": f"Found {len(sorted_dates)} available date(s).",
     }
 
     if formatted_slots:
         result["available_time_slots"] = formatted_slots
         result["message"] += (
             f" Available time slots on each date: {', '.join(formatted_slots)}."
-            " These are the ONLY valid time slots — do not offer any other times."
         )
 
     if api_request_id:
-        result["request_id"] = api_request_id
+        # Cache internally — do NOT expose in response, the LLM confuses
+        # it with project_id and passes it to subsequent tool calls.
         _request_id_by_project[project_id] = api_request_id
 
     if weather_dates:
         # Sort weather dates chronologically too
-        result["dates_with_weather"] = sorted(weather_dates, key=lambda d: d.get("date", ""))
-        good = sum(1 for d in weather_dates if d.get("suitable", True))
+        # date is index 0 in [date, day, condition, high, indicator]
+        sorted_weather = sorted(weather_dates, key=lambda d: d[0])
+        result["dates_with_weather"] = sorted_weather
+        _last_weather_dates.set(sorted_weather)
+        # indicator is index 4 in [date, day, condition, high, indicator]
+        good = sum(1 for d in weather_dates if d[4] != "[BAD]")
         bad = len(weather_dates) - good
-        result["has_weather_concerns"] = bad > 0
-        result["suitable_date_count"] = good
-        result["unsuitable_date_count"] = bad
         result["message"] += (
             f" Weather checked for {project.get('category', 'outdoor')} work: "
             f"{good} good day(s), {bad} day(s) with concerns."
         )
+    else:
+        _last_weather_dates.set([])
 
     return json.dumps(result, indent=2)
 
@@ -741,50 +852,87 @@ async def get_time_slots(project_id: str, date: str) -> str:
         if date_obj.year < current_year:
             date = date.replace(str(date_obj.year), str(current_year), 1)
             logger.warning("Corrected date year from %d to %d: %s", date_obj.year, current_year, date)
+            date_obj = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         pass
 
-    # Get request_id from cache (populated by get_available_dates)
-    request_id = _request_id_by_project.get(project_id)
-    if not request_id:
-        logger.warning("No cached request_id for project %s — calling get_available_dates first", project_id)
-        await get_available_dates(project_id)
-        request_id = _request_id_by_project.get(project_id)
-    if not request_id:
-        return f"Could not get request_id for project {project_id}. Please call get_available_dates first."
+    # Reject past dates
+    today = datetime.now().date()
+    try:
+        if datetime.strptime(date, "%Y-%m-%d").date() < today:
+            tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info("Past date requested for time slots (%s), rejecting", date)
+            return json.dumps({
+                "project_number": _get_project_number(project_id),
+                "error": "past_date",
+                "requested_date": _format_date_display(date),
+                "message": (
+                    f"That date ({_format_date_display(date)}) has already passed. "
+                    f"Scheduling is only available from {_format_date_display(tomorrow)} onwards. "
+                    "Would you like me to check the next available dates?"
+                ),
+            }, indent=2)
+    except ValueError:
+        pass
 
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
-    url = f"{base_url}/date/{date}/selected/{date}/slots"
     headers = build_headers()
-    params = {"request_id": str(request_id)}
-    log_curl("GET", url, headers)
 
-    try:
-        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-            response = await client.get(url, headers=headers, params=params)
-        log_response(response, "get_time_slots")
-        response.raise_for_status()
-        data = _unwrap(response.json())
-    except httpx.HTTPError as exc:
-        logger.exception("Failed to get time slots")
-        return f"Sorry, I couldn't fetch time slots for {date}. Error: {exc}"
+    # Use reschedule-specific endpoint when a reschedule is in progress,
+    # otherwise use the standard slotsChatbot endpoint.
+    if project_id in _reschedule_pending:
+        url = f"{base_url}/date/{date}/selected/{date}/get-reschedule-slotsChatBot"
+        log_curl("GET", url, headers)
+        try:
+            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+            log_response(response, "get_reschedule_time_slots")
+            response.raise_for_status()
+            data = _unwrap(response.json())
+        except httpx.HTTPError as exc:
+            logger.exception("Failed to get reschedule time slots")
+            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Error: {exc}"
+    else:
+        # Get request_id from cache (populated by get_available_dates)
+        request_id = _request_id_by_project.get(project_id)
+        if not request_id:
+            logger.warning("No cached request_id for project %s — calling get_available_dates first", project_id)
+            await get_available_dates(project_id)
+            request_id = _request_id_by_project.get(project_id)
+        if not request_id:
+            pnum = _get_project_number(project_id)
+            return f"Could not get request_id for project {pnum}. Please call get_available_dates first."
+
+        url = f"{base_url}/startDate/{date}/endDate/{date}/slotsChatbot"
+        params = {"request_id": str(request_id)}
+        log_curl("GET", url, headers)
+        try:
+            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+                response = await client.get(url, headers=headers, params=params)
+            log_response(response, "get_time_slots")
+            response.raise_for_status()
+            data = _unwrap(response.json())
+        except httpx.HTTPError as exc:
+            logger.exception("Failed to get time slots")
+            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Error: {exc}"
 
     slots = data.get("slots", data.get("timeSlots", []))
     if not slots:
-        return f"No time slots available for {date}. Please try another date."
+        return f"No time slots available for {_format_date_display(date)}. Please try another date."
 
-    # Use request_id from response if available, otherwise use the one passed in
+    # Cache request_id internally for confirm_appointment — do NOT expose
+    # to the LLM (it confuses request_id with project_id).
     api_rid = data.get("request_id", request_id)
+    if api_rid:
+        _request_id_by_project[project_id] = api_rid
+    pnum = _get_project_number(project_id)
+    date_display = _format_date_display(date)
     result = {
-        "project_id": project_id,
-        "date": date,
+        "project_number": pnum,
+        "date": date_display,
         "time_slots": slots,
-        "request_id": api_rid,
-        "message": (
-            f"Found {len(slots)} available time slot(s) for project {project_id} on {date}. "
-            f"To confirm, use project_id={project_id} and request_id={api_rid}."
-        ),
+        "message": f"Found {len(slots)} available time slot(s) for {date_display}.",
     }
     return json.dumps(result, indent=2)
 
@@ -792,12 +940,27 @@ async def get_time_slots(project_id: str, date: str) -> str:
 async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -> str:
     """Schedule an appointment. Only call AFTER the customer has confirmed."""
     _confirm_called_in_request.set(True)
+    try:
+        return await _confirm_appointment_impl(project_id, date, time, **kwargs)
+    except (httpx.HTTPError, json.JSONDecodeError):
+        raise  # Let known errors propagate for specific handling
+    except Exception:
+        logger.exception("Unexpected error in confirm_appointment (project=%s)", project_id)
+        return "Sorry, something went wrong while scheduling. Please try again."
+
+
+async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwargs) -> str:
+    """Internal implementation of confirm_appointment."""
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "confirm_appointment")
 
-    # Validate status from cache (no extra API call)
+    # Validate status from cache (no extra API call).
+    # Skip when a reschedule is pending — PF's atomic reschedule-slots endpoint
+    # already cancelled the old appointment, but the cached status may still show
+    # "Scheduled" if the project cache was reloaded between the reschedule and confirm.
+    is_reschedule = project_id in _reschedule_pending
     project = _get_cached_project(project_id)
-    if project:
+    if project and not is_reschedule:
         status = project.get("status", "")
         if status:
             can_schedule, reason = ProjectStatusRules.can_schedule(status)
@@ -853,6 +1016,7 @@ async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -
 
     # Invalidate project cache — status will change after scheduling
     _invalidate_projects()
+    _reschedule_pending.discard(project_id)
 
     # Extract confirmation details (API may return data as True or a dict)
     confirmation_details = data.get("data", {})
@@ -865,11 +1029,12 @@ async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -
         or data.get("confirmation_number", "")
     )
 
-    msg = f"Appointment confirmed! Project {project_id} is scheduled for {date} at {normalized_time}."
+    date_display = _format_date_display(date)
+    time_display = _format_time_display(normalized_time)
+    msg = f"Appointment confirmed! Your appointment is scheduled for {date_display} at {time_display}."
     if confirmation_number:
-        msg += f" Confirmation number: {confirmation_number}"
-    else:
-        msg += " You will receive a confirmation to your registered email and phone number."
+        msg += f" Confirmation number: {confirmation_number}."
+    msg += " You will receive a confirmation to your registered email and phone number."
     return msg
 
 
@@ -879,6 +1044,15 @@ async def reschedule_appointment(project_id: str) -> str:
     Uses the dedicated ``get-reschedule-slotsChatBot`` API endpoint which
     ignores current appointment status and returns alternative availability.
     """
+    try:
+        return await _reschedule_appointment_impl(project_id)
+    except Exception:
+        logger.exception("Unexpected error in reschedule_appointment (project=%s)", project_id)
+        return "Sorry, something went wrong during rescheduling. Please try again."
+
+
+async def _reschedule_appointment_impl(project_id: str) -> str:
+    """Internal implementation of reschedule_appointment."""
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "reschedule_appointment")
     # Read from cache (no extra API call)
@@ -888,7 +1062,8 @@ async def reschedule_appointment(project_id: str) -> str:
         project = _get_cached_project(project_id)
 
     if not project:
-        return f"Project {project_id} not found. Please check the project ID."
+        pnum = _get_project_number(project_id)
+        return f"Project {pnum} not found. Please check the project number."
 
     status = project.get("status", "")
     has_date = bool(project.get("scheduledDate"))
@@ -898,48 +1073,50 @@ async def reschedule_appointment(project_id: str) -> str:
         if not can_reschedule:
             return reason
 
-    # Cancel existing appointment first
-    cancel_result = await cancel_appointment(project_id)
-    if "error" in cancel_result.lower() or "cannot" in cancel_result.lower():
-        return f"Couldn't cancel existing appointment to reschedule: {cancel_result}"
-
-    # Fetch new dates using the rescheduler-specific endpoint
+    # PF's reschedule endpoint handles cancel + new slots atomically.
+    # Do NOT call cancel_appointment separately — if the customer declines
+    # the new slots, the project stays in "reschedule pending" state instead
+    # of being hard-cancelled.
     reschedule_dates = await _get_reschedule_slots(project_id)
     if reschedule_dates:
+        _invalidate_projects()
+        _reschedule_pending.add(project_id)
         return reschedule_dates
 
+    # _get_reschedule_slots may have successfully cancelled but returned no
+    # dates (API returns only a message).  If it set _reschedule_pending,
+    # guide the LLM to fetch dates via the normal flow.
+    if project_id in _reschedule_pending:
+        return (
+            "The existing appointment has been cancelled. "
+            "Now call get_available_dates to fetch available dates for rescheduling."
+        )
+
     return (
-        f"The existing appointment for project {project_id} has been cancelled. "
-        "Now let's find new dates. Please use get_available_dates to see available scheduling dates."
+        "Couldn't fetch reschedule availability. "
+        "Please try again or use get_available_dates to see available scheduling dates."
     )
 
 
 async def _get_reschedule_slots(project_id: str) -> str | None:
-    """Fetch available reschedule dates via the dedicated rescheduler API.
+    """Cancel existing appointment and fetch available reschedule dates.
 
-    Uses ``get-reschedule-slotsChatBot`` which ignores current appointment
-    status and returns alternative availability.
+    Uses ``GET /cancel-reschedule`` which cancels the current
+    appointment and returns available dates for rescheduling.
 
     Returns a JSON response string on success, or ``None`` to fall back
     to the standard ``get_available_dates`` flow.
     """
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
-
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    end_date = (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d")
-
-    url = (
-        f"{base_url}/date/{tomorrow}/selected/{end_date}"
-        f"/get-reschedule-slotsChatBot"
-    )
+    url = f"{base_url}/cancel-reschedule"
     headers = build_headers()
     log_curl("GET", url, headers)
 
     try:
         async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
             response = await client.get(url, headers=headers)
-        log_response(response, "get_reschedule_slots")
+        log_response(response, "cancel_reschedule")
 
         if response.status_code != 200:
             error_text = response.text.lower()
@@ -956,7 +1133,19 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
 
     dates = data.get("dates", data.get("availableDates", []))
 
+    # Capture request_id so downstream get_time_slots doesn't need to call
+    # get_available_dates again (which might fail post-reschedule).
+    api_rid = data.get("request_id")
+    if api_rid:
+        _request_id_by_project[project_id] = api_rid
+
     if not dates:
+        # The cancel-reschedule API may return only a success message without
+        # dates.  Mark the reschedule as pending so confirm_appointment skips
+        # the "already scheduled" check, and tell the caller to fetch dates
+        # via the normal get_available_dates flow.
+        _reschedule_pending.add(project_id)
+        _invalidate_projects()
         return None
 
     # Weather enrichment for outdoor projects
@@ -990,15 +1179,16 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
 
     slots_msg = ""
     if formatted_slots:
-        slots_msg = f" Available time slots on each date: {', '.join(formatted_slots)}. These are the ONLY valid time slots."
+        slots_msg = f" Available time slots on each date: {', '.join(formatted_slots)}."
 
+    pnum = _get_project_number(project_id)
     result: dict[str, Any] = {
-        "project_id": project_id,
+        "project_number": pnum,
         "is_reschedule": True,
         "available_dates": dates,
         "message": (
             f"The existing appointment has been cancelled. "
-            f"Found {len(dates)} new date(s) for project {project_id}.{slots_msg}"
+            f"Found {len(dates)} new date(s) for rescheduling.{slots_msg}"
         ),
     }
 
@@ -1007,17 +1197,24 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
 
     if weather_dates:
         result["dates_with_weather"] = weather_dates
-        good = sum(1 for d in weather_dates if d.get("suitable", True))
+        # indicator is index 4 in [date, day, condition, high, indicator]
+        good = sum(1 for d in weather_dates if d[4] != "[BAD]")
         bad = len(weather_dates) - good
-        result["has_weather_concerns"] = bad > 0
-        result["suitable_date_count"] = good
-        result["unsuitable_date_count"] = bad
 
     return json.dumps(result, indent=2)
 
 
 async def cancel_appointment(project_id: str) -> str:
     """Cancel an existing appointment."""
+    try:
+        return await _cancel_appointment_impl(project_id)
+    except Exception:
+        logger.exception("Unexpected error in cancel_appointment (project=%s)", project_id)
+        return "Sorry, something went wrong while cancelling. Please try again."
+
+
+async def _cancel_appointment_impl(project_id: str) -> str:
+    """Internal implementation of cancel_appointment."""
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "cancel_appointment")
     # Validate from cache (no extra API call)
@@ -1031,8 +1228,8 @@ async def cancel_appointment(project_id: str) -> str:
                 return reason
 
     client_id = AuthContext.get_client_id()
-    base_url = _build_scheduler_url(client_id, project_id)
-    url = f"{base_url}/cancel-reschedule"
+    base = get_pf_api_base()
+    url = f"{base}/scheduler/{client_id}/{project_id}/cancel-appointment"
     headers = build_headers()
     log_curl("GET", url, headers)
 
@@ -1047,8 +1244,9 @@ async def cancel_appointment(project_id: str) -> str:
 
     # Invalidate project cache — status changed
     _invalidate_projects()
+    _reschedule_pending.discard(project_id)
 
-    return f"Appointment for project {project_id} has been cancelled successfully."
+    return "Appointment has been cancelled successfully."
 
 
 async def add_note(project_id: str, note_text: str) -> str:
@@ -1063,18 +1261,30 @@ async def add_note(project_id: str, note_text: str) -> str:
     # Cancel/reschedule reason notes always use /project-notes/add-note
     # (both store and customer). All other store notes also use it.
     # Customer general notes use /communication/.../note.
+    # Address corrections use /project-notes/update-address-note.
     is_cancel_note = any(
         prefix in note_text.upper()
         for prefix in ("CANCELLATION REASON:", "CANCELLATION:", "RESCHEDULE REASON:")
     )
+    is_address_note = "ADDRESS CORRECTION:" in note_text.upper()
 
-    if caller_type == "store" or is_cancel_note:
+    try:
+        pid = int(project_id)
+    except (ValueError, TypeError):
+        pid = project_id
+
+    if is_address_note and caller_type != "store":
+        # Customer address corrections (VAPI inbound/outbound):
+        # POST /project-notes/update-address-note
+        url = f"{base}/project-notes/update-address-note"
+        payload = {
+            "client_id": client_id,
+            "project_id": pid,
+            "note_text": note_text,
+        }
+    elif caller_type == "store" or is_cancel_note:
         # Store callers OR cancel/reschedule reasons: POST /project-notes/add-note
         url = f"{base}/project-notes/add-note"
-        try:
-            pid = int(project_id)
-        except (ValueError, TypeError):
-            pid = project_id
         payload = {
             "client_id": client_id,
             "project_id": pid,
@@ -1096,7 +1306,8 @@ async def add_note(project_id: str, note_text: str) -> str:
         logger.exception("Failed to add note")
         return f"Sorry, I couldn't add the note. Error: {exc}"
 
-    return f"Note added successfully to project {project_id}."
+    pnum = _get_project_number(project_id)
+    return f"Note added successfully to project {pnum}."
 
 
 async def list_notes(project_id: str) -> str:
@@ -1120,7 +1331,8 @@ async def list_notes(project_id: str) -> str:
 
     notes = data if isinstance(data, list) else data.get("notes", data.get("data", []))
     if not notes:
-        return f"No notes found for project {project_id}."
+        pnum = _get_project_number(project_id)
+        return f"No notes found for project {pnum}."
 
     return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
 
@@ -1349,7 +1561,7 @@ async def get_project_weather(project_id: str = "") -> str:
         weather_data = json.loads(result)
         project_label = target.get("category", target.get("projectType", "Project"))
         weather_data["project"] = project_label
-        weather_data["project_id"] = target["id"]
+        weather_data["project_number"] = target.get("projectNumber") or target["id"]
         if not scheduled_date:
             weather_data["message"] = f"Weather for {project_label} at {location}"
         return json.dumps(weather_data, indent=2)
@@ -1432,13 +1644,15 @@ async def get_installation_address(project_id: str, **kwargs) -> str:
     # Use cached address from dashboard
     cached = _get_cached_project(project_id)
     if cached and cached.get("address"):
+        pnum = cached.get("projectNumber") or project_id
         return json.dumps({
-            "project_id": project_id,
+            "project_number": pnum,
             "address": cached["address"],
-            "message": f"Installation address for project {project_id}",
+            "message": f"Installation address for project {pnum}",
         })
 
-    return f"Could not retrieve the installation address for project {project_id}."
+    pnum = _get_project_number(project_id)
+    return f"Could not retrieve the installation address for project {pnum}."
 
 
 async def update_installation_address(
@@ -1539,7 +1753,7 @@ async def update_installation_address(
     support_number = AuthContext.get_support_number()
 
     result: dict = {
-        "project_id": project_id,
+        "project_number": _get_project_number(project_id),
         "feature_unavailable": True,
         "message": (
             "Updating the installation address through the bot is not available yet. "

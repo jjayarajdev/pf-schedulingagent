@@ -1335,7 +1335,10 @@ class TestOutboundSchedulingConfig:
         assert config["name"] == "FloorCo Outbound Scheduling"
         assert config["firstMessage"] == "Hello Jane!"
         assert config["voice"] is not None
-        assert config["model"]["tools"][0]["function"]["name"] == "ask_scheduling_bot"
+        tool_names = [t["function"]["name"] for t in config["model"]["tools"] if t.get("type") == "function"]
+        assert "get_time_slots" in tool_names
+        assert "confirm_appointment" in tool_names
+        assert "add_note" in tool_names
         assert "server" in config
         assert config["server"]["secret"] == "secret"
 
@@ -1375,7 +1378,7 @@ class TestOutboundSchedulingConfig:
         transfer_tools = [t for t in tools if t.get("type") == "transferCall"]
         assert len(transfer_tools) == 0
 
-    def test_system_prompt_has_6_steps(self):
+    def test_system_prompt_has_call_flow_steps(self):
         from channels.vapi import _build_outbound_scheduling_config
 
         outbound = {"customer_name": "Jane Doe", "project_type": "Flooring"}
@@ -1389,8 +1392,186 @@ class TestOutboundSchedulingConfig:
         assert "Step 3" in prompt
         assert "Step 4" in prompt
         assert "Step 5" in prompt
-        assert "Step 6" in prompt
-        assert "OUTBOUND" in prompt
+        assert "Flooring" in prompt
+        assert "STYLE RULES" in prompt
+        assert "TOOL RULES" in prompt
+
+
+class TestOutboundPrefetchPrompt:
+    """Test that pre-fetched data is injected into the outbound prompt."""
+
+    def test_prefetched_dates_in_prompt(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane Doe",
+            "project_type": "Flooring",
+            "prefetched": {
+                "dates": {
+                    "available_dates": ["2026-04-14", "2026-04-15"],
+                    "available_time_slots": ["9:00 AM", "1:00 PM"],
+                    "request_id": 42,
+                },
+                "address": {
+                    "address1": "123 Main St",
+                    "city": "Austin",
+                    "state": "TX",
+                    "zipcode": "78701",
+                },
+            },
+        }
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "+15551234567",
+        )
+        prompt = config["model"]["messages"][0]["content"]
+
+        # Dates should be in the prompt as a range summary
+        assert "PRE-LOADED PROJECT DATA" in prompt
+        assert "Date Range" in prompt
+        assert "April 14" in prompt
+        assert "April 15" in prompt
+
+        # Address should NOT be in the prompt (removed)
+        assert "123 Main St" not in prompt
+
+        # Time slots should be in the prompt
+        assert "9:00 AM" in prompt
+
+        # Step 3 should NOT say "Show available dates"
+        assert "Show available dates" not in prompt
+        # Step 3 should say dates are already available
+        assert "already have the available dates" in prompt
+        # Step 3 should instruct summary presentation
+        assert "SUMMARY" in prompt
+
+    def test_prefetched_weather_dates_in_prompt(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane",
+            "project_type": "Roofing",
+            "prefetched": {
+                "dates": {
+                    "available_dates": ["2026-04-14"],
+                    "dates_with_weather": [
+                        ["2026-04-14", "Tue", "Sunny", 78, "[GOOD]"],
+                    ],
+                },
+            },
+        }
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "",
+        )
+        prompt = config["model"]["messages"][0]["content"]
+
+        # Weather summary + recommendation
+        assert "Sunny" in prompt
+        assert "78°F" in prompt
+        assert "Recommended Date" in prompt
+        # Full weather kept in reference section
+        assert "[GOOD]" in prompt
+
+    def test_no_prefetch_uses_tool_based_flow(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane",
+            "project_type": "Carpet",
+            "project_id": "12345",
+        }
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "",
+        )
+        prompt = config["model"]["messages"][0]["content"]
+
+        # Without prefetched data, should use tool-based flow
+        assert "PRE-LOADED PROJECT DATA" not in prompt
+        assert "get_available_dates" in prompt
+        # Should NOT proactively ask for address (but rule about it is fine)
+        assert "Do NOT proactively ask for the installation address" in prompt
+        # Project type still mentioned in the mission statement
+        assert "Carpet" in prompt
+
+    def test_no_address_confirmation_in_prompt(self):
+        """Address confirmation should NOT be in the outbound prompt."""
+        from channels.vapi import _build_outbound_scheduling_config
+
+        # With prefetched data
+        outbound_with = {
+            "customer_name": "Jane",
+            "project_type": "Tile",
+            "prefetched": {
+                "address": {"address1": "456 Oak Ave", "city": "Dallas", "state": "TX"},
+            },
+        }
+        config = _build_outbound_scheduling_config("Hi!", "secret", outbound_with, "")
+        prompt = config["model"]["messages"][0]["content"]
+        assert "Confirm Address" not in prompt
+        assert "we have your installation address" not in prompt
+
+        # Without prefetched data
+        outbound_without = {"customer_name": "Jane", "project_type": "Tile"}
+        config2 = _build_outbound_scheduling_config("Hi!", "secret", outbound_without, "")
+        prompt2 = config2["model"]["messages"][0]["content"]
+        assert "Confirm Address" not in prompt2
+        assert "Do NOT proactively ask for the installation address" in prompt2
+
+    def test_verbal_confirmation_before_booking(self):
+        """AI must summarize and get verbal YES before calling confirm_appointment."""
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane",
+            "project_type": "Carpet",
+            "prefetched": {
+                "dates": {"available_dates": [["2026-04-14", "Tue", "Sunny", "75", "GOOD"]]},
+            },
+        }
+        config = _build_outbound_scheduling_config("Hi!", "secret", outbound, "")
+        prompt = config["model"]["messages"][0]["content"]
+        assert "Shall I go ahead and book that" in prompt
+        assert "Wait for the customer to say YES before calling confirm_appointment" in prompt
+
+    def test_style_rules_present(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {"customer_name": "Jane", "project_type": "Carpet"}
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "",
+        )
+        prompt = config["model"]["messages"][0]["content"]
+
+        # Key style rules from the feedback
+        assert "ONCE per action" in prompt
+        assert "only discuss THIS project" in prompt.lower() or "Only discuss THIS project" in prompt
+        assert "Hold on" in prompt  # prohibition mentioned
+        assert "Do NOT proactively ask for the installation address" in prompt
+
+    def test_project_scoping_in_prompt(self):
+        from channels.vapi import _build_outbound_scheduling_config
+
+        outbound = {
+            "customer_name": "Jane",
+            "project_type": "Balcony grill",
+            "project_id": "90000120",
+            "prefetched": {
+                "project": {"projectNumber": "74356"},
+            },
+        }
+        config = _build_outbound_scheduling_config(
+            "Hello!", "secret", outbound, "",
+        )
+        prompt = config["model"]["messages"][0]["content"]
+
+        # Should mention the project type in the mission
+        assert "Balcony grill" in prompt
+        assert "Do NOT mention other projects" in prompt
+        # Internal project ID should NOT appear in the prompt
+        assert "90000120" not in prompt
+        # Direct tools — project_id is injected server-side, not in prompt
+        tool_names = [t["function"]["name"] for t in config["model"]["tools"] if t.get("type") == "function"]
+        assert "get_time_slots" in tool_names
+        assert "confirm_appointment" in tool_names
 
 
 class TestClassifyOutboundOutcome:
@@ -1532,3 +1713,144 @@ class TestOutboundAuthContext:
 
         assert AuthContext.get_auth_token() == "outbound-jwt"
         assert AuthContext.get_client_id() == "outbound-client"
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.cache_active_call")
+    @patch("channels.vapi.get_outbound_call", new_callable=AsyncMock)
+    @patch("channels.vapi.get_active_call", return_value=None)
+    async def test_outbound_ddb_fallback_on_cache_miss(self, mock_cache, mock_ddb, mock_recache):
+        """When in-memory cache misses, fall back to DynamoDB via metadata.call_id."""
+        from channels.vapi import _set_auth_context_from_phone
+        from auth.context import AuthContext
+
+        mock_ddb.return_value = {
+            "call_id": "our-internal-id",
+            "auth_creds": {
+                "bearer_token": "ddb-jwt",
+                "client_id": "10003",
+                "customer_id": "cust-ddb",
+                "user_id": "user-ddb",
+                "user_name": "DDB Jane",
+                "timezone": "US/Eastern",
+                "support_number": "+15550001111",
+            }
+        }
+
+        call_data = {"id": "vapi-xyz", "metadata": {"call_id": "our-internal-id"}}
+        await _set_auth_context_from_phone(call_data, "session-1")
+
+        mock_ddb.assert_awaited_once_with("our-internal-id")
+        mock_recache.assert_called_once_with("vapi-xyz", mock_ddb.return_value)
+        assert AuthContext.get_auth_token() == "ddb-jwt"
+        assert AuthContext.get_client_id() == "10003"
+
+
+class TestOutboundDirectTools:
+    """Test direct tool handling for outbound calls (bypasses orchestrator)."""
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.sched_get_time_slots", new_callable=AsyncMock)
+    @patch("channels.vapi.log_conversation", new_callable=AsyncMock)
+    async def test_get_time_slots_injects_project_id(self, mock_log, mock_slots, mock_cache):
+        from channels.vapi import _handle_outbound_direct_tool
+
+        mock_cache.return_value = {"project_id": "90000120", "call_id": "our-1"}
+        mock_slots.return_value = '{"time_slots": ["9:00 AM", "1:00 PM"]}'
+
+        result = await _handle_outbound_direct_tool(
+            "get_time_slots", {"date": "2026-04-10"}, "vapi-1", "tc-1", "sess-1", "user-1",
+        )
+
+        mock_slots.assert_awaited_once_with("90000120", "2026-04-10")
+        assert "results" in result
+        assert "9:00 AM" in result["results"][0]["result"]
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.sched_confirm_appointment", new_callable=AsyncMock)
+    @patch("channels.vapi.log_conversation", new_callable=AsyncMock)
+    async def test_confirm_appointment_injects_project_id(self, mock_log, mock_confirm, mock_cache):
+        from channels.vapi import _handle_outbound_direct_tool
+
+        mock_cache.return_value = {"project_id": "90000120", "call_id": "our-1"}
+        mock_confirm.return_value = "Appointment confirmed! Project 90000120 is scheduled."
+
+        result = await _handle_outbound_direct_tool(
+            "confirm_appointment", {"date": "2026-04-10", "time": "9:00 AM"},
+            "vapi-1", "tc-1", "sess-1", "user-1",
+        )
+
+        mock_confirm.assert_awaited_once_with("90000120", "2026-04-10", "9:00 AM")
+        assert "confirmed" in result["results"][0]["result"].lower()
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.sched_add_note", new_callable=AsyncMock)
+    @patch("channels.vapi.log_conversation", new_callable=AsyncMock)
+    async def test_add_note_injects_project_id(self, mock_log, mock_note, mock_cache):
+        from channels.vapi import _handle_outbound_direct_tool
+
+        mock_cache.return_value = {"project_id": "90000120", "call_id": "our-1"}
+        mock_note.return_value = "Note added successfully to project 90000120."
+
+        result = await _handle_outbound_direct_tool(
+            "add_note", {"note_text": "ADDRESS CORRECTION: 123 New St"},
+            "vapi-1", "tc-1", "sess-1", "user-1",
+        )
+
+        mock_note.assert_awaited_once_with("90000120", "ADDRESS CORRECTION: 123 New St")
+        assert "Note added" in result["results"][0]["result"]
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    async def test_no_active_call_returns_error(self, mock_cache):
+        from channels.vapi import _handle_outbound_direct_tool
+
+        mock_cache.return_value = None
+
+        result = await _handle_outbound_direct_tool(
+            "get_time_slots", {"date": "2026-04-10"}, "vapi-1", "tc-1", "sess-1", "user-1",
+        )
+
+        assert "trouble" in result["results"][0]["result"].lower()
+
+    @pytest.mark.asyncio
+    @patch("channels.vapi.get_active_call")
+    @patch("channels.vapi.sched_get_time_slots", new_callable=AsyncMock)
+    @patch("channels.vapi.log_conversation", new_callable=AsyncMock)
+    async def test_tool_exception_returns_graceful_error(self, mock_log, mock_slots, mock_cache):
+        from channels.vapi import _handle_outbound_direct_tool
+
+        mock_cache.return_value = {"project_id": "90000120", "call_id": "our-1"}
+        mock_slots.side_effect = Exception("API timeout")
+
+        result = await _handle_outbound_direct_tool(
+            "get_time_slots", {"date": "2026-04-10"}, "vapi-1", "tc-1", "sess-1", "user-1",
+        )
+
+        assert "trouble" in result["results"][0]["result"].lower()
+
+    def test_outbound_tools_list_with_prefetch(self):
+        """When dates are pre-fetched, get_available_dates should NOT be a tool."""
+        from channels.vapi import _outbound_scheduling_tools
+
+        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=True)
+        fn_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
+
+        assert "get_time_slots" in fn_names
+        assert "confirm_appointment" in fn_names
+        assert "add_note" in fn_names
+        assert "get_available_dates" not in fn_names
+
+    def test_outbound_tools_list_without_prefetch(self):
+        """When dates are NOT pre-fetched, get_available_dates should be included."""
+        from channels.vapi import _outbound_scheduling_tools
+
+        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=False)
+        fn_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
+
+        assert "get_time_slots" in fn_names
+        assert "confirm_appointment" in fn_names
+        assert "add_note" in fn_names
+        assert "get_available_dates" in fn_names

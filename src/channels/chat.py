@@ -20,7 +20,7 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from orchestrator.welcome import handle_welcome
-from tools.scheduling import reset_confirm_flag, was_confirm_called
+from tools.scheduling import reset_confirm_flag, reset_request_caches, was_confirm_called
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +260,33 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
 
+def _strip_json_block_for_confirmation(text: str, signals: dict) -> str:
+    """Remove the JSON code block when confirmation_required is true.
+
+    The frontend renders Confirm/Decline buttons from the outer
+    ``pending_action`` field — the inline JSON block is redundant and
+    displays as raw text in the chat bubble.
+    """
+    if not signals.get("confirmation_required"):
+        return text
+    return re.sub(r"\n*```json\s*\n.*?```\s*", "", text, flags=re.DOTALL).strip()
+
+
+def _strip_markdown_bold(text: str) -> str:
+    """Remove markdown bold markers (**text** and __text__) from the natural language
+    portion of the response, preserving JSON code blocks untouched."""
+    if "**" not in text and "__" not in text:
+        return text
+
+    # Split around JSON blocks, only strip markdown in non-JSON parts
+    parts = re.split(r"(```json\s*\n.*?```)", text, flags=re.DOTALL)
+    for i, part in enumerate(parts):
+        if not part.startswith("```json"):
+            parts[i] = re.sub(r"\*\*(.+?)\*\*", r"\1", part)
+            parts[i] = re.sub(r"__(.+?)__", r"\1", parts[i])
+    return "".join(parts)
+
+
 def _group_time_slots(display_slots: list[str]) -> dict:
     """Group display-format time slots into morning/afternoon/evening."""
     morning: list[str] = []
@@ -308,19 +335,105 @@ def _enrich_json_block(response_text: str) -> str:
 
     modified = False
 
-    # Strip internal IDs — frontend doesn't need them and they clutter the UI
-    for id_key in ("project_id", "project_number"):
-        if id_key in data:
-            del data[id_key]
+    # Strip project_id (internal ID) — only project_number should be visible
+    if "project_id" in data:
+        del data["project_id"]
+        modified = True
+    for nested_key in ("project_details", "appointment_details", "appointment", "details"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict) and "project_id" in nested:
+            del nested["project_id"]
             modified = True
-        # Also strip from nested dicts (project_details, appointment_details, etc.)
-        for nested_key in ("project_details", "appointment_details", "appointment", "details"):
-            nested = data.get(nested_key)
-            if isinstance(nested, dict) and id_key in nested:
-                del nested[id_key]
-                modified = True
+
+    # Inject full projects list from server-side cache — the LLM truncates large
+    # JSON arrays, so the ```json block may have fewer projects than the tool returned.
+    if "projects" in data and isinstance(data["projects"], list):
+        from tools.scheduling import get_last_projects_list
+
+        cached_projects = get_last_projects_list()
+        if cached_projects and len(data["projects"]) < len(cached_projects):
+            logger.info(
+                "Projects injection: LLM returned %d projects, cache has %d — injecting full list",
+                len(data["projects"]),
+                len(cached_projects),
+            )
+            data["projects"] = cached_projects
+            data["message"] = f"Found {len(cached_projects)} project(s):"
+            modified = True
 
     is_dates_response = bool(data.get("available_dates"))
+
+    # Convert available_dates from ISO (YYYY-MM-DD) to US format (MM/DD/YYYY)
+    if is_dates_response:
+        us_dates = []
+        for d in data["available_dates"]:
+            parts = d.split("-") if isinstance(d, str) else []
+            us_dates.append(f"{parts[1]}/{parts[2]}/{parts[0]}" if len(parts) == 3 else d)
+        data["available_dates"] = us_dates
+        modified = True
+
+    # Inject full weather data from server-side cache — the LLM truncates large arrays.
+    # Convert compact tuples [date, day, condition, high, indicator] back to dicts
+    # for frontend compatibility (frontend reads d.date, d.day_name, d.condition, etc.).
+    if is_dates_response:
+        from tools.scheduling import get_last_weather_dates
+
+        cached_weather = get_last_weather_dates()
+        # Validate cached weather matches the current response's available_dates.
+        # Extract ISO dates from cache for comparison (index 0 = date string).
+        cached_iso_dates: set[str] = set()
+        for entry in cached_weather:
+            if isinstance(entry, (list, tuple)) and entry:
+                cached_iso_dates.add(entry[0])
+            elif isinstance(entry, dict) and "date" in entry:
+                cached_iso_dates.add(entry["date"])
+
+        # Convert available_dates back to ISO for comparison (may already be MM/DD/YYYY)
+        response_iso_dates: set[str] = set()
+        for d in data.get("available_dates", []):
+            if isinstance(d, str):
+                parts = d.split("/")
+                if len(parts) == 3 and len(parts[2]) == 4:
+                    # MM/DD/YYYY → YYYY-MM-DD
+                    response_iso_dates.add(f"{parts[2]}-{parts[0]}-{parts[1]}")
+                else:
+                    response_iso_dates.add(d)
+
+        # Only inject if there's meaningful overlap (at least 1 shared date)
+        weather_matches = bool(cached_iso_dates & response_iso_dates)
+        logger.info(
+            "Weather injection: is_dates_response=%s, cached_weather_len=%d, "
+            "overlap=%s, json_keys=%s",
+            is_dates_response, len(cached_weather), weather_matches,
+            list(data.keys()),
+        )
+        if cached_weather and weather_matches:
+            enriched = []
+            for entry in cached_weather:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+                    date_str = entry[0]
+                    # Build MM/DD/YYYY display_date from YYYY-MM-DD
+                    parts = date_str.split("-") if isinstance(date_str, str) else []
+                    display_date = f"{parts[1]}/{parts[2]}/{parts[0]}" if len(parts) == 3 else date_str
+                    enriched.append({
+                        "date": date_str,
+                        "display_date": display_date,
+                        "day_name": entry[1],
+                        "condition": entry[2],
+                        "high_temp": entry[3],
+                        "indicator": entry[4],
+                    })
+                elif isinstance(entry, dict):
+                    if "display_date" not in entry and "date" in entry:
+                        parts = entry["date"].split("-") if isinstance(entry["date"], str) else []
+                        if len(parts) == 3:
+                            entry["display_date"] = f"{parts[1]}/{parts[2]}/{parts[0]}"
+                    enriched.append(entry)
+                else:
+                    enriched.append(entry)
+            data["dates_with_weather"] = enriched
+            logger.info("Weather injection: injected %d dict entries", len(enriched))
+            modified = True
 
     # If this is a dates response, strip time slot data so the frontend
     # doesn't render a time picker at the date selection step.
@@ -339,6 +452,9 @@ def _enrich_json_block(response_text: str) -> str:
             or data.get("timeSlots")
             or data.get("available_slots")
             or data.get("available_time_slots")
+            or data.get("available_times")
+            or data.get("times")
+            or data.get("slots")
             or []
         )
         if slots and "timeSlotsGrouped" not in data:
@@ -348,12 +464,33 @@ def _enrich_json_block(response_text: str) -> str:
                 if isinstance(s, dict):
                     display.append(s.get("display_time", s.get("time", "")))
                 else:
-                    display.append(str(s))
+                    raw = str(s)
+                    # Convert HH:MM:SS / HH:MM (24h) to 12h AM/PM display
+                    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", raw):
+                        try:
+                            h, m = int(raw.split(":")[0]), int(raw.split(":")[1])
+                            suffix = "AM" if h < 12 else "PM"
+                            h12 = h % 12 or 12
+                            raw = f"{h12}:{m:02d} {suffix}"
+                        except (ValueError, IndexError):
+                            pass
+                    display.append(raw)
 
+            # Remove LLM-variant keys, normalize to timeSlots
+            for variant in ("time_slots", "available_slots", "available_time_slots",
+                            "available_times", "times", "slots"):
+                data.pop(variant, None)
             data["timeSlots"] = display
             data["timeSlotsGrouped"] = _group_time_slots(display)
             data["slotCount"] = len(display)
             modified = True
+
+    # Convert any standalone "date" field from ISO to US format
+    raw_date = data.get("date", "")
+    if isinstance(raw_date, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
+        parts = raw_date.split("-")
+        data["date"] = f"{parts[1]}/{parts[2]}/{parts[0]}"
+        modified = True
 
     if not modified:
         return response_text
@@ -461,7 +598,7 @@ def _build_pending_action(json_data: dict) -> dict | None:
 
     pending = {
         "project_name": project_name,
-        "project_id": d.get("project_id", ""),
+        "project_number": d.get("project_number", "") or d.get("project_id", ""),
         "project_type": project_type.split(" ", 1)[1] if " " in project_type else project_type,
         "date": formatted_date,
         "rawDate": raw_date,
@@ -561,6 +698,7 @@ async def chat(request: ChatRequest, raw_request: Request):
     orchestrator = get_orchestrator()
     start_time = time.monotonic()
     reset_confirm_flag()
+    reset_request_caches()
     try:
         response = await orchestrator.route_request(
             user_input=request.message,
@@ -612,6 +750,7 @@ async def chat(request: ChatRequest, raw_request: Request):
             logger.exception("Retry failed")
 
     response_text = _repair_json_blocks(response_text)
+    response_text = _strip_markdown_bold(response_text)
     agent_name = response.metadata.agent_name
 
     logger.info(
@@ -627,6 +766,9 @@ async def chat(request: ChatRequest, raw_request: Request):
     # Detect confirmation requests and PF API errors from response text
     signals = _detect_response_signals(response_text)
     intent = _infer_intent(agent_name)
+
+    # Strip JSON block for confirmation responses — frontend uses pending_action instead
+    response_text = _strip_json_block_for_confirmation(response_text, signals)
 
     # Fire-and-forget conversation log
     task = asyncio.create_task(
@@ -750,10 +892,14 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
             yield _sse("delta", {"text": suffix})
             full_text = repaired
 
+        full_text = _strip_markdown_bold(full_text)
         agent_name = response.metadata.agent_name if hasattr(response, "metadata") else ""
         full_text = _enrich_json_block(full_text)
         signals = _detect_response_signals(full_text)
         intent = _infer_intent(agent_name)
+
+        # Strip JSON block for confirmation responses
+        display_text = _strip_json_block_for_confirmation(full_text, signals)
 
         done_data = {
             "session_id": session_id,
@@ -766,6 +912,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
         if done_data["confirmation_required"]:
             done_data["pending_action"] = signals.get("pending_action")
             done_data["action"] = signals.get("action")
+            # Provide cleaned text without JSON block — frontend can replace streamed content
+            done_data["response"] = display_text
 
         yield _sse("done", done_data)
 

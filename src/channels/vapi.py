@@ -30,26 +30,32 @@ from auth.phone_auth import (
 )
 from channels.conversation_log import log_conversation
 from channels.formatters import format_for_voice
+from channels.outbound_consumer import retry_outbound_call
+from channels.outbound_store import (
+    cache_active_call,
+    get_active_call,
+    get_outbound_call,
+    remove_active_call,
+    update_outbound_call,
+)
 from channels.vapi_config import get_assistant_info, get_phone_for_assistant
 from config import get_secrets, get_settings
 from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
-from channels.outbound_consumer import retry_outbound_call
-from channels.outbound_store import (
-    get_active_call,
-    get_outbound_call,
-    remove_active_call,
-    update_outbound_call,
-)
+from tools.scheduling import add_note as sched_add_note
 from tools.scheduling import (
     clear_session_projects,
     post_call_summary_notes,
     post_store_call_notes,
     reset_confirm_flag,
+    reset_request_caches,
     was_confirm_called,
 )
+from tools.scheduling import confirm_appointment as sched_confirm_appointment
+from tools.scheduling import get_available_dates as sched_get_available_dates
+from tools.scheduling import get_time_slots as sched_get_time_slots
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +80,7 @@ def _get_webhook_url() -> str:
 _VOICE_CONFIG = {
     "provider": "cartesia",
     "model": "sonic-3",
-    "voiceId": "829ccd10-f8b3-43cd-b8a0-4aeaa81f3b30",
+    "voiceId": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
 }
 
 # Background tasks need a strong reference to avoid GC before completion
@@ -171,7 +177,7 @@ async def vapi_webhook(request: Request):
             return await _handle_tool_calls(body)
         if event_type == "function-call":
             return await _handle_function_call(body)
-        return _handle_server_event(body)
+        return await _handle_server_event(body)
 
     # Unrecognized payload — still require auth
     await verify_vapi_secret(request)
@@ -634,6 +640,222 @@ def _generate_outbound_greeting(
     )
 
 
+def _format_prefetched_dates(dates_data: dict) -> str:
+    """Format pre-fetched date data as a concise summary with recommendation.
+
+    Instead of listing every date, produces:
+    - Date range (e.g. "April 8 through April 16")
+    - Weather summary (e.g. "mostly good conditions")
+    - Recommended date (best weather day)
+    - Available time slots
+    """
+    from datetime import datetime as dt
+
+    weather = dates_data.get("dates_with_weather", [])
+    plain_dates = dates_data.get("available_dates", [])
+    time_slots = dates_data.get("available_time_slots", [])
+
+    if not plain_dates and not weather:
+        return ""
+
+    # Parse date range
+    all_dates = plain_dates or [
+        e[0] if isinstance(e, (list, tuple)) else e.get("date", "")
+        for e in weather
+    ]
+    parsed_dates = []
+    for d in all_dates:
+        try:
+            parsed_dates.append(dt.strptime(d, "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            pass
+
+    result = ""
+    if parsed_dates:
+        first = min(parsed_dates)
+        last = max(parsed_dates)
+        if first == last:
+            result += f"**Date Range:** {first.strftime('%B %d')} (1 date available)\n"
+        else:
+            result += (
+                f"**Date Range:** {first.strftime('%B %d')} through "
+                f"{last.strftime('%B %d')} ({len(parsed_dates)} dates available)\n"
+            )
+
+    # Weather summary + recommendation
+    if weather:
+        good, moderate, other = 0, 0, 0
+        best_date = None
+        for entry in weather:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+                date_str, day, condition, high, indicator = entry[:5]
+                ind = str(indicator).upper()
+                if "GOOD" in ind:
+                    good += 1
+                    if not best_date:
+                        best_date = (date_str, day, condition, high)
+                elif "MODERATE" in ind:
+                    moderate += 1
+                    if not best_date:
+                        best_date = (date_str, day, condition, high)
+                else:
+                    other += 1
+
+        total = good + moderate + other
+        if good == total:
+            result += "**Weather:** Good conditions throughout\n"
+        elif good + moderate == total:
+            result += "**Weather:** Mostly good to moderate conditions\n"
+        elif good > 0:
+            result += f"**Weather:** Mixed — {good} good days, {moderate} moderate\n"
+        else:
+            result += "**Weather:** Mostly moderate conditions\n"
+
+        if best_date:
+            d_str, day_name, cond, high = best_date
+            try:
+                rec = dt.strptime(d_str, "%Y-%m-%d")
+                result += (
+                    f"**Recommended Date:** {rec.strftime('%A, %B %d')} "
+                    f"— {cond}, {high}°F\n"
+                )
+            except ValueError:
+                result += f"**Recommended Date:** {day_name} {d_str} — {cond}, {high}°F\n"
+
+    if time_slots:
+        result += f"**Time Slots:** {', '.join(time_slots)}\n"
+
+    # Also keep the full list for reference (so the AI can answer follow-ups)
+    if weather:
+        result += "\n<details for reference — do NOT read aloud>\n"
+        for entry in weather:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+                date_str, day, condition, high, indicator = entry[:5]
+                result += f"  {day} {date_str}: {condition} {high}°F {indicator}\n"
+        result += "</details>\n"
+
+    return result
+
+
+def _format_address_for_speech(address: dict) -> str:
+    """Format address for natural TTS reading.
+
+    Returns e.g. ``910 North Harbor Drive, San Diego, CA 92101``.
+    Does NOT spell digits individually.
+    """
+    parts = []
+    if address.get("address1"):
+        parts.append(address["address1"])
+    city_state = []
+    if address.get("city"):
+        city_state.append(address["city"])
+    if address.get("state"):
+        city_state.append(address["state"])
+    if city_state:
+        parts.append(", ".join(city_state))
+    if address.get("zipcode"):
+        parts.append(address["zipcode"])
+    return ", ".join(parts)
+
+
+def _outbound_scheduling_tools(
+    support_number: str, client_name: str, has_dates: bool
+) -> list[dict]:
+    """Build the Vapi tool definitions for outbound scheduling calls.
+
+    Direct tools — Vapi AI calls these directly.  Our webhook routes them
+    to the scheduling functions without going through the orchestrator.
+    The ``project_id`` is injected server-side from the active call cache.
+    """
+    tools: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_time_slots",
+                "description": (
+                    "Get available time slots for a specific date. "
+                    "Call this when the customer picks a date."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["date"],
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "The date in YYYY-MM-DD format (e.g. 2026-04-10)",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "confirm_appointment",
+                "description": (
+                    "Book the appointment. Call ONLY after the customer "
+                    "has confirmed their preferred date and time."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["date", "time"],
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "The appointment date in YYYY-MM-DD format",
+                        },
+                        "time": {
+                            "type": "string",
+                            "description": "The time slot (e.g. '8:00 AM - 10:00 AM')",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_note",
+                "description": (
+                    "Add a note to the project. For address corrections, "
+                    "start with 'ADDRESS CORRECTION:'. For customer notes, "
+                    "start with 'CUSTOMER NOTE:'."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["note_text"],
+                    "properties": {
+                        "note_text": {
+                            "type": "string",
+                            "description": (
+                                "The note text. Must start with 'ADDRESS CORRECTION:' "
+                                "or 'CUSTOMER NOTE:' as appropriate."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    ]
+
+    # Fallback: include get_available_dates when dates aren't pre-fetched
+    if not has_dates:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_available_dates",
+                "description": "Fetch available scheduling dates with weather information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        })
+
+    tools.extend(_transfer_call_tool(support_number, client_name))
+    return tools
+
+
 def _build_outbound_scheduling_config(
     first_message: str,
     server_secret: str,
@@ -646,6 +868,8 @@ def _build_outbound_scheduling_config(
 
     Uses the same structure as inbound _build_assistant_config() but with
     an outbound-specific system prompt encoding the 6-step call flow.
+    If ``outbound_call["prefetched"]`` contains dates/address, they are
+    injected into the prompt so the AI can present them immediately.
     """
     name = client_name or "ProjectsForce"
     customer_name = outbound_call.get("customer_name", "")
@@ -663,67 +887,122 @@ def _build_outbound_scheduling_config(
     if server_secret:
         server_config["secret"] = server_secret
 
-    system_prompt = (
-        f"You are J, a friendly phone assistant calling on behalf of {name} "
-        "— a home improvement scheduling service.\n\n"
-        "## YOUR MISSION\n"
-        f"You are making an OUTBOUND call to {first_name} to schedule their "
-        f"{project_type or 'home improvement'} project. Follow the 6-step flow below.\n\n"
-        "## 6-STEP CALL FLOW\n\n"
-        "### Step 1 — Introduction (already done via firstMessage)\n"
-        "You already introduced yourself. Wait for the customer's response.\n\n"
-        "### Step 2 — Availability Check\n"
-        "If they say no, not a good time, or seem busy:\n"
-        "- Say: 'No problem! You can call us back anytime"
-        + (f" at {support_speech}" if support_speech else "")
-        + ", or we can try again later. Have a great day!'\n"
-        "- End the call gracefully.\n"
-        "If they say yes, proceed to Step 3.\n\n"
-        "### Step 3 — Scheduling\n"
-        "Call ask_scheduling_bot to help them schedule:\n"
-        f"- Say: 'Great! Let me pull up the available dates for your {project_type or 'project'}.'\n"
-        "- Call ask_scheduling_bot with: 'Show available dates'\n"
-        "- When dates come back, read them naturally to the customer.\n"
-        "- Customer picks a date → call ask_scheduling_bot with their choice.\n"
-        "- When time slots come back, read them naturally.\n"
-        "- Customer picks a time → call ask_scheduling_bot to confirm.\n"
-        "- CRITICAL: You MUST call ask_scheduling_bot for EVERY step. "
-        "The appointment is NOT booked until ask_scheduling_bot returns 'confirmed'.\n\n"
-        "### Step 4 — Address Confirmation\n"
-        "After scheduling is confirmed, ask: 'Let me confirm the installation address.'\n"
-        "Call ask_scheduling_bot with: 'What is the installation address?'\n"
-        "Read the address aloud. Ask: 'Is that correct?'\n"
-        "- If correct: proceed to Step 5.\n"
-        "- If corrections needed: call ask_scheduling_bot with: "
-        "'Add note: ADDRESS CORRECTION: [customer's correction]'\n"
-        "Do NOT try to update the address yourself.\n\n"
-        "### Step 5 — Additional Notes\n"
-        "Ask: 'Is there anything our team should know before arriving? "
+    # Check for pre-fetched data
+    prefetched = outbound_call.get("prefetched", {})
+    dates_data = prefetched.get("dates", {})
+    has_dates = bool(dates_data.get("available_dates"))
+
+    # Build the pre-loaded data section for the prompt
+    preloaded_section = ""
+    if has_dates:
+        preloaded_section = "\n## PRE-LOADED PROJECT DATA\n"
+        preloaded_section += (
+            "You already have the customer's project data. "
+            "Present it directly — no tool call needed to look it up.\n\n"
+        )
+        preloaded_section += _format_prefetched_dates(dates_data) + "\n"
+
+    # Build Step 3 — different depending on whether we have pre-fetched dates
+    if has_dates:
+        step3 = (
+            "### Step 3 — Scheduling\n"
+            "You already have the available dates from PRE-LOADED DATA above.\n"
+            "- Present dates as a SUMMARY, not a list. Example:\n"
+            "  'We have dates available from [first] through [last]. "
+            "Weather looks [summary]. I'd recommend [best date] — "
+            "it's expected to be [condition] and [temp]. Would that work for you?'\n"
+            "- Do NOT read every date one by one.\n"
+            "- If they agree with the recommendation, proceed to time slots.\n"
+            "- If they want a different date, accommodate if it's in the range.\n"
+            "- If they pick a date NOT in the list, say: "
+            "'I'm sorry, that date isn't available. The closest options are [X] and [Y].'\n"
+            "- Once they pick a valid date, call get_time_slots with that date "
+            "(YYYY-MM-DD format).\n"
+            "- Read the time slots: 'I have [X] and [Y]. Which works better?'\n"
+            "- Customer picks a time → SUMMARIZE before booking:\n"
+            "  'Just to confirm — I'll schedule your appointment for [date] "
+            "between [time slot]. Shall I go ahead and book that?'\n"
+            "- Wait for the customer to say YES before calling confirm_appointment.\n"
+            "- The appointment is NOT booked until confirm_appointment returns 'confirmed'.\n"
+        )
+    else:
+        step3 = (
+            "### Step 3 — Scheduling\n"
+            f"- Say: 'Let me check the available dates for your {project_type or 'project'}.'\n"
+            "- Call get_available_dates to fetch dates with weather information.\n"
+            "- Present the dates as a summary with a recommendation (not one by one).\n"
+            "- Customer picks a date → call get_time_slots with that date.\n"
+            "- Read time slots, customer picks → SUMMARIZE before booking:\n"
+            "  'Just to confirm — I'll schedule your appointment for [date] "
+            "between [time slot]. Shall I go ahead and book that?'\n"
+            "- Wait for the customer to say YES before calling confirm_appointment.\n"
+            "- The appointment is NOT booked until confirm_appointment returns 'confirmed'.\n"
+        )
+
+    # Build Step 4+5 — Notes + Wrap-up (no address confirmation needed)
+    step45 = (
+        "### Step 4 — Additional Notes\n"
+        "- Ask: 'Is there anything our team should know before arriving? "
         "For example, pets, gate codes, or parking instructions?'\n"
-        "If the customer has notes, call ask_scheduling_bot with: "
-        "'Add note: CUSTOMER NOTE: [their notes]'\n"
-        "If no notes: proceed to Step 6.\n\n"
-        "### Step 6 — Wrap-up\n"
-        "Summarize: date, time, and address.\n"
-        "Say: 'You\\'ll receive a confirmation text and email shortly. "
-        "Thank you for choosing {name}! Have a wonderful day.'\n"
-        "End the call.\n\n"
-        "## CRITICAL RULES\n"
-        "1. You MUST call ask_scheduling_bot for EVERY request — no exceptions.\n"
-        "2. Pass the user's EXACT words in the \"question\" field.\n"
-        "3. NEVER ask clarifying questions before calling the tool.\n"
-        "4. Keep it conversational — you are on a phone call.\n"
-        "5. NEVER read out project numbers or IDs — identify by type.\n"
-        "6. Before calling ask_scheduling_bot, say a brief filler. Vary phrasing.\n"
-        "7. If the customer wants to speak to a person, use transferCall.\n"
-        "8. The appointment is NOT booked until ask_scheduling_bot says 'confirmed'.\n"
-        "9. NEVER say 'Hold on', 'Wait', or 'Hang on' — rude on outbound calls."
+        "- If the customer has notes, call add_note with "
+        "'CUSTOMER NOTE: [their notes]'\n"
+        "- If they say no / nothing: move on.\n\n"
+        "### Step 5 — Wrap-up\n"
+        f"Say: 'You\\'ll receive a confirmation text and email shortly. "
+        f"Thank you for choosing {name}! Have a great day.'\n"
+        "End the call.\n"
+    )
+
+    system_prompt = (
+        f"You are J, a friendly and concise phone assistant for {name}.\n\n"
+        "## YOUR MISSION\n"
+        f"Schedule {first_name}'s {project_type or 'home improvement'} project. "
+        "Be natural, brief, and conversational — like a human scheduler.\n"
+        + preloaded_section
+        + "\n## CALL FLOW\n\n"
+        "### Step 1 — Introduction (already done)\n"
+        "Wait for the customer's response.\n\n"
+        "### Step 2 — Availability Check\n"
+        "If they say no or seem busy: 'No problem! You can call us back anytime"
+        + (f" at {support_speech}" if support_speech else "")
+        + ". Have a great day!' — then end the call.\n"
+        "If yes, proceed.\n\n"
+        + step3
+        + "\n"
+        + step45
+        + "\n"
+        "## STYLE RULES\n"
+        "- Speak naturally and concisely, like a human scheduler.\n"
+        "- Only discuss THIS project ("
+        + (project_type or "the one you called about")
+        + "). Do NOT mention other projects the customer may have.\n"
+        "- Do NOT proactively ask for the installation address. But if the customer "
+        "volunteers an address correction, capture it with add_note.\n"
+        "- If a tool call takes time, say ONE short phrase: 'One moment while I "
+        "confirm that.' Do NOT repeat fillers. NEVER say 'Hold on', 'Wait', "
+        "'Hang on', or 'Just a sec'.\n"
+        "- Call each tool ONCE per action. If the tool already returned "
+        "a result, do NOT call it again for the same thing.\n\n"
+        "## TOOL RULES\n"
+        "1. get_time_slots: Call with a date (YYYY-MM-DD) to get available time slots.\n"
+        "2. confirm_appointment: Call with date and time ONLY after you have "
+        "summarized the appointment and the customer has said YES. "
+        "NEVER call this without verbal confirmation first.\n"
+        "3. add_note: For address corrections, start note_text with 'ADDRESS CORRECTION:'. "
+        "For customer notes (gate codes, pets, parking, etc.), start with 'CUSTOMER NOTE:'.\n"
+        "4. NEVER read project numbers or IDs aloud to the customer.\n"
+        "5. If the customer wants a person, use transferCall.\n"
+        "6. If the customer asks about weather — you ALREADY have the weather data "
+        "in PRE-LOADED DATA above. Answer directly, no tool call needed.\n"
+        "7. Past dates are NOT allowed. Scheduling is only available from tomorrow onwards. "
+        "If the customer suggests a past date, say: 'That date has already passed. "
+        "Let me check the next available dates for you.'"
         + (
             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
             if hours_context and hours_context.get("prompt_snippet")
             else ""
         )
-    ).format(name=name)
+    )
 
     voicemail_msg = (
         f"Hello {first_name}, this is J from {name}. "
@@ -744,30 +1023,7 @@ def _build_outbound_scheduling_config(
             "messages": [
                 {"role": "system", "content": system_prompt}
             ],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "ask_scheduling_bot",
-                        "description": (
-                            "REQUIRED for ALL requests. Call for every question about "
-                            "scheduling, dates, times, address, or notes. The bot has "
-                            "full context about the customer's account."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "required": ["question"],
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The user's EXACT words.",
-                                },
-                            },
-                        },
-                    },
-                },
-                *(_transfer_call_tool(support_number, name)),
-            ],
+            "tools": _outbound_scheduling_tools(support_number, name, has_dates),
         },
         "transcriber": {
             "model": "nova-3",
@@ -1126,7 +1382,7 @@ async def _handle_function_call(body: dict) -> dict:
 # ── Server URL event handler ────────────────────────────────────────────
 
 
-def _handle_server_event(body: dict) -> dict:
+async def _handle_server_event(body: dict) -> dict:
     """Handle Vapi Server URL events (end-of-call-report, status-update, etc.)."""
     message = body.get("message", {})
     event_type = message.get("type", "unknown")
@@ -1149,6 +1405,16 @@ def _handle_server_event(body: dict) -> dict:
 
         # ── Outbound call end-of-call handling ──────────────────────
         outbound = get_active_call(call_id)
+        # DynamoDB fallback for multi-instance
+        if not outbound:
+            our_call_id = (call_data.get("metadata") or {}).get("call_id", "")
+            if our_call_id:
+                outbound = await get_outbound_call(our_call_id)
+                if outbound:
+                    logger.info(
+                        "End-of-call cache miss for vapi_call_id=%s — loaded from DDB call_id=%s",
+                        call_id, our_call_id,
+                    )
         if outbound:
             our_call_id = outbound.get("call_id", "")
             outcome = _classify_outbound_outcome(reason, summary)
@@ -1271,6 +1537,7 @@ async def _process_tool(
         start_time = time.monotonic()
         try:
             reset_confirm_flag()
+            reset_request_caches()
             orchestrator = get_orchestrator()
             response = await orchestrator.route_request(
                 user_input=question,
@@ -1331,6 +1598,12 @@ async def _process_tool(
     if tool_name == "ask_store_bot":
         return await _handle_store_bot(
             tool_params, user_id, session_id, call_id, tool_call_id,
+        )
+
+    # Direct outbound tools — bypass orchestrator, call scheduling functions directly
+    if tool_name in ("get_time_slots", "confirm_appointment", "add_note", "get_available_dates"):
+        return await _handle_outbound_direct_tool(
+            tool_name, tool_params, call_id, tool_call_id, session_id, user_id,
         )
 
     logger.warning("Unknown tool: %s (call_id=%s)", tool_name, call_id)
@@ -1462,6 +1735,79 @@ async def _handle_store_bot(
     return _build_tool_result(voice_text, tool_call_id)
 
 
+async def _handle_outbound_direct_tool(
+    tool_name: str,
+    tool_params: dict,
+    call_id: str,
+    tool_call_id: str,
+    session_id: str,
+    user_id: str,
+) -> dict:
+    """Handle direct tool calls for outbound calls — bypass orchestrator.
+
+    Calls scheduling functions directly with the project_id from the
+    active outbound call cache.  No classifier, no scheduling agent —
+    just a direct function call.
+    """
+    outbound = get_active_call(call_id)
+    if not outbound:
+        logger.warning("Direct tool %s but no active outbound call (call_id=%s)", tool_name, call_id)
+        return _build_tool_result(
+            "I'm having trouble with that. Let me try again.", tool_call_id,
+        )
+
+    project_id = outbound.get("project_id", "")
+    if not project_id:
+        logger.error("No project_id in outbound call data (call_id=%s)", call_id)
+        return _build_tool_result(
+            "I'm having trouble with that. Let me try again.", tool_call_id,
+        )
+
+    start_time = time.monotonic()
+    try:
+        if tool_name == "get_time_slots":
+            date = tool_params.get("date", "")
+            result = await sched_get_time_slots(project_id, date)
+        elif tool_name == "confirm_appointment":
+            date = tool_params.get("date", "")
+            time_slot = tool_params.get("time", "")
+            result = await sched_confirm_appointment(project_id, date, time_slot)
+        elif tool_name == "add_note":
+            note_text = tool_params.get("note_text", "")
+            result = await sched_add_note(project_id, note_text)
+        elif tool_name == "get_available_dates":
+            result = await sched_get_available_dates(project_id)
+        else:
+            result = f"Unknown tool: {tool_name}"
+    except Exception:
+        logger.exception("Direct tool %s failed (call_id=%s)", tool_name, call_id)
+        result = "I'm having trouble with that right now. Let me try again."
+
+    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+    voice_text = format_for_voice(result)
+
+    logger.info(
+        "Outbound direct tool: call_id=%s tool=%s elapsed_ms=%d chars=%d",
+        call_id, tool_name, elapsed_ms, len(voice_text),
+    )
+
+    # Log conversation for tracking
+    task = asyncio.create_task(
+        log_conversation(
+            session_id=session_id,
+            user_id=user_id,
+            user_message=f"[{tool_name}] {json.dumps(tool_params)}",
+            bot_response=voice_text,
+            agent_name="direct_tool",
+            channel="vapi",
+            response_time_ms=elapsed_ms,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return _build_tool_result(voice_text, tool_call_id)
+
+
 async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None:
     """Authenticate the caller via phone number and populate AuthContext.
 
@@ -1473,6 +1819,20 @@ async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None
 
     # If this is an active outbound call, use pre-cached auth creds
     outbound = get_active_call(call_id)
+
+    # DynamoDB fallback: if cache miss (e.g. multi-instance ALB routing),
+    # use metadata.call_id to look up the outbound record from DynamoDB
+    if not outbound:
+        our_call_id = (call_data.get("metadata") or {}).get("call_id", "")
+        if our_call_id:
+            outbound = await get_outbound_call(our_call_id)
+            if outbound:
+                logger.info(
+                    "Outbound cache miss for vapi_call_id=%s — loaded from DDB call_id=%s",
+                    call_id, our_call_id,
+                )
+                cache_active_call(call_id, outbound)
+
     if outbound and outbound.get("auth_creds"):
         creds = outbound["auth_creds"]
         AuthContext.set(

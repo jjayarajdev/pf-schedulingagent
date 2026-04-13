@@ -1,6 +1,7 @@
 """Tests for scheduling tool handlers."""
 
 import json
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -333,41 +334,62 @@ class TestGetAvailableDates:
         assert data["already_scheduled"] is True
 
 
+    async def test_past_date_clamped_to_tomorrow(self, mock_httpx_client, mock_httpx_response):
+        """Past start_date is silently clamped to tomorrow — API still called."""
+        response = mock_httpx_response(
+            200,
+            {"dates": ["2026-05-01"], "request_id": 90001236},
+        )
+        past_date = "2025-01-15"
+        with mock_httpx_client(response=response):
+            result = await get_available_dates("123", start_date=past_date)
+        data = json.loads(result)
+        # Should still return dates (clamped, not rejected)
+        assert len(data["available_dates"]) == 1
+
+
 class TestGetTimeSlots:
     async def test_returns_slots(self, mock_httpx_client, mock_httpx_response):
         response = mock_httpx_response(
             200,
             {"slots": [{"time": "9:00 AM", "id": "slot-1"}, {"time": "10:00 AM", "id": "slot-2"}]},
         )
+        future_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
         with mock_httpx_client(response=response):
-            result = await get_time_slots("123", "2026-03-15")
+            result = await get_time_slots("123", future_date)
         data = json.loads(result)
         assert len(data["time_slots"]) == 2
 
     async def test_no_slots(self, mock_httpx_client, mock_httpx_response):
         response = mock_httpx_response(200, {"slots": []})
+        future_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
         with mock_httpx_client(response=response):
-            result = await get_time_slots("123", "2026-03-15")
+            result = await get_time_slots("123", future_date)
         assert "No time slots" in result
+
+    async def test_past_date_rejected(self, mock_httpx_client, mock_httpx_response):
+        """Past date in get_time_slots returns an error, not API call."""
+        # Use a date in the current year that's clearly in the past
+        result = await get_time_slots("123", "2026-01-01")
+        data = json.loads(result)
+        assert data["error"] == "past_date"
+        assert "already passed" in data["message"]
+        assert "01/01/2026" in data["requested_date"]
 
 
 class TestConfirmAppointment:
     async def test_confirm_schedules(self, mock_httpx_client, mock_httpx_response):
-        details_resp = mock_httpx_response(
-            200,
-            {"data": [{"project_project_id": "123", "status_info_status": "New", "store_info_store_name": "", "store_info_store_number": ""}]},
-        )
         schedule_resp = mock_httpx_response(200, {"confirmationNumber": "CONF-789"})
-        with mock_httpx_client(responses=[details_resp, schedule_resp]):
-            result = await confirm_appointment("123", "2026-03-15", "9:00 AM")
+        future_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        with mock_httpx_client(responses=[schedule_resp]):
+            result = await confirm_appointment("123", future_date, "9:00 AM")
         assert "confirmed" in result.lower()
-        assert "123" in result
+        assert "CONF-789" in result
 
 
 class TestRescheduleAppointment:
     async def test_reschedule_with_rescheduler_api(self, mock_httpx_client, mock_httpx_response):
-        """Reschedule uses dedicated rescheduler endpoint and returns new dates."""
-        # Pre-populate cache with a scheduled project
+        """Reschedule uses PF's atomic cancel+reschedule endpoint (no separate cancel call)."""
         from tools.scheduling import _projects_cache
         from datetime import datetime, timezone
 
@@ -379,7 +401,6 @@ class TestRescheduleAppointment:
             "loaded_at": datetime.now(timezone.utc),
         }
 
-        cancel_resp = mock_httpx_response(200, {"status": "ok"})
         reschedule_resp = mock_httpx_response(200, {
             "data": {
                 "dates": ["2026-03-20", "2026-03-21", "2026-03-22"],
@@ -387,7 +408,7 @@ class TestRescheduleAppointment:
             }
         })
 
-        with mock_httpx_client(responses=[cancel_resp, reschedule_resp]):
+        with mock_httpx_client(responses=[reschedule_resp]):
             result = await reschedule_appointment("100")
 
         data = json.loads(result)
@@ -395,7 +416,7 @@ class TestRescheduleAppointment:
         assert len(data["available_dates"]) == 3
 
     async def test_reschedule_fallback_when_api_fails(self, mock_httpx_client, mock_httpx_response):
-        """Falls back to standard message when rescheduler API fails."""
+        """Falls back to helpful message when rescheduler API fails."""
         from tools.scheduling import _projects_cache
         from datetime import datetime, timezone
 
@@ -407,14 +428,65 @@ class TestRescheduleAppointment:
             "loaded_at": datetime.now(timezone.utc),
         }
 
-        cancel_resp = mock_httpx_response(200, {"status": "ok"})
         reschedule_resp = mock_httpx_response(500, None, text="Internal Server Error")
 
-        with mock_httpx_client(responses=[cancel_resp, reschedule_resp]):
+        with mock_httpx_client(responses=[reschedule_resp]):
             result = await reschedule_appointment("100")
 
-        assert "cancelled" in result.lower()
+        assert "try again" in result.lower()
         assert "get_available_dates" in result
+
+    async def test_reschedule_then_confirm_skips_status_check(
+        self, mock_httpx_client, mock_httpx_response
+    ):
+        """After reschedule returns dates, confirm_appointment must skip the
+        'already scheduled' status check — PF's atomic endpoint already cancelled."""
+        from tools.scheduling import _projects_cache, _reschedule_pending
+        from datetime import datetime, timezone
+
+        # Pre-populate cache as "Scheduled" (simulates cache reload between turns)
+        _projects_cache["test-customer-456"] = {
+            "projects": [
+                {"id": "100", "projectNumber": "74356", "status": "Scheduled",
+                 "scheduledDate": "2026-04-17", "category": "Balcony grill",
+                 "address": {}},
+            ],
+            "loaded_at": datetime.now(timezone.utc),
+        }
+
+        # Step 1: reschedule_appointment → marks project as reschedule-pending
+        reschedule_resp = mock_httpx_response(200, {
+            "data": {
+                "dates": ["2026-04-18", "2026-04-19"],
+                "request_id": 9999,
+            }
+        })
+        with mock_httpx_client(responses=[reschedule_resp]):
+            result = await reschedule_appointment("100")
+
+        data = json.loads(result)
+        assert data["is_reschedule"] is True
+        assert "100" in _reschedule_pending
+
+        # Simulate cache reload (LLM called list_projects between turns)
+        _projects_cache["test-customer-456"] = {
+            "projects": [
+                {"id": "100", "projectNumber": "74356", "status": "Scheduled",
+                 "scheduledDate": "2026-04-17", "category": "Balcony grill",
+                 "address": {}},
+            ],
+            "loaded_at": datetime.now(timezone.utc),
+        }
+
+        # Step 2: confirm_appointment — must NOT block with "already scheduled"
+        confirm_resp = mock_httpx_response(200, {
+            "data": True, "confirmationNumber": "CONF-001"
+        })
+        with mock_httpx_client(responses=[confirm_resp]):
+            result = await confirm_appointment("100", "2026-04-18", "08:00:00")
+
+        assert "confirmed" in result.lower()
+        assert "100" not in _reschedule_pending  # flag cleared
 
 
 class TestAddNote:
@@ -493,6 +565,58 @@ class TestAddNote:
 
         url = mock_client.post.call_args[0][0]
         assert "/project-notes/add-note" in url
+
+
+    async def test_address_correction_uses_update_address_endpoint(self):
+        """Customer address correction notes route to /project-notes/update-address-note."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("123", "ADDRESS CORRECTION: 910 North Harbor Drive, San Diego, CA 92101")
+
+        url = mock_client.post.call_args[0][0]
+        payload = mock_client.post.call_args[1].get("json", {})
+        assert "/project-notes/update-address-note" in url
+        assert payload["client_id"] == "test-client-123"
+        assert payload["project_id"] == 123
+        assert "ADDRESS CORRECTION:" in payload["note_text"]
+
+    async def test_store_address_correction_uses_add_note_endpoint(self):
+        """Store caller address corrections route to /project-notes/add-note, not update-address."""
+        from auth.context import AuthContext
+
+        AuthContext.set(
+            auth_token="tok", client_id="CL1", customer_id="C1",
+            caller_type="store",
+        )
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("456", "ADDRESS CORRECTION: 100 New Street, Dallas, TX 75201")
+
+        url = mock_client.post.call_args[0][0]
+        assert "/project-notes/add-note" in url
+        assert "/update-address-note" not in url
 
 
 class TestListNotes:
@@ -641,7 +765,7 @@ class TestGetInstallationAddress:
 
         result = await get_installation_address("123")
         data = json.loads(result)
-        assert data["project_id"] == "123"
+        assert data["project_number"] == "123"
         assert data["address"]["city"] == "Denver"
         assert data["address"]["address_id"] == "777"
 
@@ -673,7 +797,7 @@ class TestUpdateInstallationAddress:
             "123", address1="123 New St", city="New City",
         )
         data = json.loads(result)
-        assert data["project_id"] == "123"
+        assert data["project_number"] == "123"
         assert data["feature_unavailable"] is True
         assert "not available" in data["message"].lower()
         assert "office" in data["message"].lower()

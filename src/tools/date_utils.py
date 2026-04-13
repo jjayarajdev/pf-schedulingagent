@@ -140,7 +140,12 @@ def convert_natural_date(date_str: str) -> dict | None:
             if start_dt.date() < tomorrow.date():
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d")
                 if end_dt.date() < tomorrow.date():
-                    return None  # Entire week in the past
+                    return {
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "strategy": "week",
+                        "past": True,
+                    }
                 start_date = tomorrow.strftime("%Y-%m-%d")
 
             return {"start_date": start_date, "end_date": end_date, "strategy": "week"}

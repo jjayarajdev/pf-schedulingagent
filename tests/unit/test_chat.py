@@ -302,7 +302,7 @@ class TestDetectResponseSignals:
         assert signals["confirmation_required"] is True
         assert signals["action"] == "confirm_appointment_preview"
         pa = signals["pending_action"]
-        assert pa["project_id"] == "90000119"
+        assert pa["project_number"] == "90000119"
         assert pa["project_name"] == "Windows"
         assert pa["project_type"] == "Installation"
         assert pa["rawDate"] == "2026-04-10"
@@ -329,7 +329,7 @@ class TestDetectResponseSignals:
         assert signals["confirmation_required"] is True
         assert signals["action"] == "confirm_appointment_preview"
         pa = signals["pending_action"]
-        assert pa["project_id"] == "90000119"
+        assert pa["project_number"] == "90000119"
         assert pa["project_name"] == "Windows"
         assert pa["project_type"] == "Installation"
         assert pa["rawDate"] == "2026-04-09"
@@ -594,7 +594,7 @@ class TestEnrichJsonBlock:
         result = _enrich_json_block(text)
         match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
         data = json.loads(match.group(1))
-        assert data["available_dates"] == ["2026-04-08", "2026-04-09"]
+        assert data["available_dates"] == ["04/08/2026", "04/09/2026"]
         assert "available_time_slots" not in data
         assert "timeSlotsGrouped" not in data
         assert "slotCount" not in data
@@ -632,8 +632,8 @@ class TestEnrichJsonBlock:
         text = '```json\n{broken json\n```'
         assert _enrich_json_block(text) == text
 
-    def test_strips_project_id_from_json_block(self):
-        """project_id and project_number should be stripped from JSON blocks."""
+    def test_strips_project_id_keeps_project_number(self):
+        """project_id (internal) stripped; project_number (display) kept."""
         from channels.chat import _enrich_json_block
         import json
         import re
@@ -648,11 +648,11 @@ class TestEnrichJsonBlock:
         match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
         data = json.loads(match.group(1))
         assert "project_id" not in data
-        assert "project_number" not in data
+        assert data["project_number"] == "6789"
         assert data["category"] == "Windows"
 
-    def test_strips_project_id_from_nested_project_details(self):
-        """project_id inside project_details should also be stripped."""
+    def test_strips_project_id_from_nested_dicts(self):
+        """project_id inside nested dicts stripped; project_number kept."""
         from channels.chat import _enrich_json_block
         import json
         import re
@@ -668,5 +668,5 @@ class TestEnrichJsonBlock:
         match = re.search(r'```json\s*\n(.*?)```', result, re.DOTALL)
         data = json.loads(match.group(1))
         assert "project_id" not in data.get("project_details", {})
-        assert "project_number" not in data.get("project_details", {})
+        assert data["project_details"]["project_number"] == "6789"
         assert data["project_details"]["category"] == "Windows"
