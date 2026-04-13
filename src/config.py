@@ -25,6 +25,12 @@ _VAPI_PHONE_NUMBERS = {
     "qa": "+14588990940",
 }
 
+# Vapi phone number UUIDs for outbound calls per environment
+_OUTBOUND_VAPI_PHONE_IDS = {
+    "dev": "f089f8dc-5886-464b-a615-236064f43956",   # SchedulingBot-Dev +19566699322
+    "qa": "4b958ae7-d662-47f3-ace5-fcfa14c3060c",    # SchedulingBot-QA  +14588990940
+}
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -57,6 +63,7 @@ class Settings(BaseSettings):
     # Outbound calls
     outbound_calls_table: str = ""
     outbound_queue_url: str = ""
+    outbound_vapi_phone_id: str = ""  # Vapi phone number UUID for outbound calls
 
     # SMS (AWS End User Messaging / pinpoint-sms-voice-v2)
     sms_origination_number: str = ""
@@ -95,6 +102,10 @@ class Settings(BaseSettings):
                 f"https://sqs.{self.aws_region}.amazonaws.com/772634497954/"
                 f"pf-syn-schedulingagents-outbound-queue-{env}"
             )
+
+        # Outbound Vapi phone number ID fallback
+        if not self.outbound_vapi_phone_id:
+            self.outbound_vapi_phone_id = _OUTBOUND_VAPI_PHONE_IDS.get(env, "")
 
         # Vapi phone number fallback
         if not self.vapi_phone_number:
@@ -157,6 +168,12 @@ class SecretsCache:
     def vapi_api_key(self) -> str:
         secret = self.get_secret(get_settings().vapi_secret_arn)
         return secret.get("vapi_api_key", "")
+
+    @property
+    def vapi_private_key(self) -> str:
+        """Private key for Vapi server-side APIs (POST /call, etc.)."""
+        secret = self.get_secret(get_settings().vapi_secret_arn)
+        return secret.get("vapi_private_key", "")
 
 
 @lru_cache(maxsize=1)

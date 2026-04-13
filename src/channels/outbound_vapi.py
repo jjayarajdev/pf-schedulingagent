@@ -28,19 +28,32 @@ async def create_vapi_call(
     customer_phone: str,
     customer_name: str,
     server_url: str,
+    assistant_config: dict | None = None,
+    server_block: dict | None = None,
     metadata: dict | None = None,
 ) -> dict:
     """Initiate an outbound call via Vapi POST /call.
 
-    Uses serverUrl mode — Vapi will send assistant-request back to our webhook,
-    where we return the outbound-specific assistant config dynamically.
+    Vapi's POST /call requires either ``assistant`` (inline config) or
+    ``assistantId``.  We pass the full assistant config inline — this
+    includes a ``server`` block with our webhook URL so Vapi sends
+    tool-calls back to us.
+
+    The ``server_block`` is placed at the **top level** of the payload
+    (not inside ``assistant``) so Vapi sends server events
+    (end-of-call-report, status-update, conversation-update) to our
+    webhook with the correct secret header.
 
     Args:
-        phone_number_id: Vapi phone number ID to call FROM
-        customer_phone: Customer phone number to call (E.164)
-        customer_name: Customer name (for Vapi metadata)
-        server_url: Our webhook URL (Vapi sends assistant-request here)
-        metadata: Pass-through metadata (includes our call_id)
+        phone_number_id: Vapi phone number ID to call FROM.
+        customer_phone: Customer phone number to call (E.164).
+        customer_name: Customer name (for Vapi metadata).
+        server_url: Our webhook URL (set inside assistant.server.url).
+        assistant_config: Full assistant config dict. If None, a minimal
+            config is built pointing tool-calls to ``server_url``.
+        server_block: Top-level server config for Vapi server events.
+            Must contain ``url`` and ``secret`` keys.
+        metadata: Pass-through metadata (includes our call_id).
 
     Returns:
         Vapi API response dict with call ID and status.
@@ -48,20 +61,37 @@ async def create_vapi_call(
     Raises:
         httpx.HTTPStatusError: On non-2xx response from Vapi.
     """
-    api_key = get_secrets().vapi_api_key
+    api_key = get_secrets().vapi_private_key
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    payload = {
+    # Build assistant config if not provided
+    if not assistant_config:
+        server_secret = get_secrets().vapi_api_key
+        assistant_config = {
+            "server": {
+                "url": server_url,
+                "secret": server_secret,
+            },
+        }
+
+    payload: dict = {
         "phoneNumberId": phone_number_id,
         "customer": {
             "number": customer_phone,
             "name": customer_name,
         },
-        "serverUrl": server_url,
+        "assistant": assistant_config,
     }
+
+    # NOTE: Vapi POST /call does NOT accept ``server`` or ``serverUrl`` at
+    # the payload top level.  The server config (url + secret) lives inside
+    # the ``assistant`` object and on each tool.  Vapi uses the assistant's
+    # ``server`` block to send server events (end-of-call, status-update)
+    # with the secret as the ``x-vapi-secret`` header.
+
     if metadata:
         payload["metadata"] = metadata
 
@@ -85,7 +115,7 @@ async def get_vapi_call_status(vapi_call_id: str) -> dict:
     Returns:
         Vapi call status dict.
     """
-    api_key = get_secrets().vapi_api_key
+    api_key = get_secrets().vapi_private_key
     headers = {"Authorization": f"Bearer {api_key}"}
 
     url = f"{_VAPI_BASE_URL}/call/{vapi_call_id}"

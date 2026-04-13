@@ -326,7 +326,8 @@ TASK_DEF=$(cat <<TASKEOF
       {"name": "USE_DYNAMODB_STORAGE", "value": "true"},
       {"name": "VAPI_SECRET_ARN", "value": "vapi/api-key/${ENVIRONMENT}"},
       {"name": "VAPI_PHONE_NUMBER", "value": "${VAPI_PHONE_NUMBER:-}"},
-      {"name": "SMS_ORIGINATION_NUMBER", "value": "${SMS_ORIGINATION_NUMBER:-+18786789053}"}
+      {"name": "SMS_ORIGINATION_NUMBER", "value": "${SMS_ORIGINATION_NUMBER:-+18786789053}"},
+      {"name": "OUTBOUND_QUEUE_URL", "value": "https://sqs.${AWS_REGION}.amazonaws.com/${ACCOUNT}/pf-syn-schedulingagents-outbound-queue-${ENVIRONMENT}"}
     ],
     "logConfiguration": {
       "logDriver": "awslogs",

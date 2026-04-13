@@ -426,45 +426,30 @@ async def enrich_dates_with_weather(
     enriched: list[dict[str, Any]] = []
     for date_str in dates:
         try:
-            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-            day_name = date_obj.strftime("%A")
-            display_date = date_obj.strftime("%m/%d/%Y")
+            day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
         except ValueError:
             day_name = date_str
-            display_date = date_str
-
-        entry: dict[str, Any] = {
-            "date": date_str,
-            "display_date": display_date,
-            "day_name": day_name,
-        }
 
         forecast = forecast_lookup.get(date_str)
         if forecast:
             assessment = _analyze_suitability(forecast, category)
-            entry["condition"] = forecast.get("condition", "Unknown")
-            entry["high_temp"] = forecast.get("high_temp")
-            entry["low_temp"] = forecast.get("low_temp")
-            entry["precipitation"] = forecast.get("precipitation", 0)
-            entry["wind"] = forecast.get("wind", 0)
-            entry["suitable"] = assessment["suitable"]
-            entry["severity"] = assessment["severity"]
-            entry["warnings"] = assessment["warnings"]
             if assessment["suitable"]:
-                entry["indicator"] = "[GOOD]"
+                indicator = "[GOOD]"
             elif assessment["severity"] == "high":
-                entry["indicator"] = "[BAD]"
+                indicator = "[BAD]"
             else:
-                entry["indicator"] = "[WARN]"
+                indicator = "[WARN]"
         else:
-            # No forecast for this date (beyond forecast range)
-            entry["suitable"] = True
-            entry["indicator"] = ""
-            entry["warnings"] = []
+            indicator = ""
 
-        enriched.append(entry)
+        # Tuple format — [date, day, condition, high, indicator]
+        # Objects get pretty-printed across 7 lines; tuples stay on 1 line
+        high = round(forecast["high_temp"]) if forecast and forecast.get("high_temp") else None
+        condition = forecast.get("condition", "") if forecast else ""
+        enriched.append([date_str, day_name[:3], condition, high, indicator])
 
-    good = sum(1 for d in enriched if d.get("suitable", True))
+    # indicator is index 4 in [date, day, condition, high, indicator]
+    good = sum(1 for d in enriched if d[4] != "[BAD]")
     logger.info(
         "Weather enrichment: %d/%d dates suitable for %s in %s",
         good, len(enriched), category, location,

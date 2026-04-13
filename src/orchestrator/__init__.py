@@ -62,6 +62,10 @@ def get_orchestrator() -> AgentSquad:
         LOG_EXECUTION_TIMES=True,
         USE_DEFAULT_AGENT_IF_NONE_IDENTIFIED=True,
         MAX_MESSAGE_PAIRS_PER_AGENT=settings.max_message_pairs,
+        GENERAL_ROUTING_ERROR_MSG_MESSAGE=(
+            "Sorry, I ran into an issue processing your request. "
+            "Please try again, or I can start fresh if you'd like."
+        ),
     )
 
     storage = _create_storage()

@@ -64,15 +64,43 @@ class VapiPayload(BaseModel):
     message: dict = Field(default_factory=dict, description="Vapi event message object")
 
 
-class OutboundTriggerRequest(BaseModel):
-    """Manual trigger for outbound call (dev/testing). Production uses SQS."""
+class OutboundCustomer(BaseModel):
+    """Customer info in outbound trigger — matches PF backend payload."""
 
+    customer_id: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    primary_phone: str = Field(..., description="Primary phone (E.164)")
+    alternate_phone: str = Field(default="", description="Alternate phone (E.164)")
+
+
+class OutboundTenantInfo(BaseModel):
+    """Tenant/project classification — matches PF backend payload."""
+
+    client_id: str = ""
+    source: str | None = None
+    category: str | None = None
+    type: str | None = None
+
+
+class OutboundProject(BaseModel):
+    """Project summary — matches PF backend payload."""
+
+    project_number: str | None = None
+    status_id: str | None = None
+    status_name: str | None = None
+
+
+class OutboundTriggerRequest(BaseModel):
+    """Trigger for outbound call — matches PF backend SQS payload."""
+
+    event: str = "auto_call_ready"
     project_id: str
     client_id: str
-    customer_phone: str = Field(..., description="Primary phone (E.164)")
-    customer_phone_alt: str = Field(default="", description="Alternate phone (E.164)")
-    customer_name: str = ""
     customer_id: str = ""
-    project_type: str = ""
+    store_id: str = ""
+    customer: OutboundCustomer
+    tenant_info: OutboundTenantInfo = Field(default_factory=OutboundTenantInfo)
+    project: OutboundProject = Field(default_factory=OutboundProject)
     vapi_phone_number_id: str = Field(default="", description="Vapi phone to call FROM")
     metadata: dict = Field(default_factory=dict)

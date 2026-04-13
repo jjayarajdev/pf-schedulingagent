@@ -31,6 +31,11 @@ from channels.outbound_store import (
 )
 from channels.outbound_vapi import create_vapi_call
 from config import get_settings
+from tools.scheduling import (
+    get_available_dates,
+    get_installation_address,
+    get_project_details,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,166 @@ _WEBHOOK_URLS = {
 def _get_webhook_url() -> str:
     env = get_settings().environment
     return _WEBHOOK_URLS.get(env, _WEBHOOK_URLS["dev"])
+
+
+def _extract_pf_payload(body: dict) -> dict:
+    """Extract fields from PF backend nested payload format.
+
+    PF sends: customer.primary_phone, customer.first_name/last_name,
+    tenant_info.category/type.  Used by both SQS consumer and trigger endpoint.
+    """
+    customer_obj = body.get("customer", {})
+    tenant_info = body.get("tenant_info", {})
+
+    first = customer_obj.get("first_name", "")
+    last = customer_obj.get("last_name", "")
+
+    category = tenant_info.get("category", "")
+    ptype = tenant_info.get("type", "")
+    if category and ptype:
+        project_type = f"{category} {ptype}"
+    else:
+        project_type = category or ptype or ""
+
+    # Vapi phone number ID: from payload, or fall back to config default
+    vapi_phone_id = body.get("vapi_phone_number_id", "")
+    if not vapi_phone_id:
+        vapi_phone_id = get_settings().outbound_vapi_phone_id
+
+    return {
+        "customer_phone": customer_obj.get("primary_phone", ""),
+        "customer_phone_alt": customer_obj.get("alternate_phone", ""),
+        "project_id": body.get("project_id", ""),
+        "client_id": body.get("client_id", ""),
+        "customer_id": customer_obj.get("customer_id", "") or body.get("customer_id", ""),
+        "customer_name": f"{first} {last}".strip(),
+        "project_type": project_type,
+        "vapi_phone_number_id": vapi_phone_id,
+    }
+
+
+def _build_assistant_for_call(call_data: dict) -> tuple[dict, dict | None]:
+    """Build the Vapi assistant config for an outbound call.
+
+    Vapi's POST /call requires the full assistant config inline.
+    We reuse the config builder from vapi.py, then strip ``server``
+    and ``serverUrl`` (not allowed inside ``assistant`` in POST /call).
+    Tool-call routing is handled by adding ``server`` to each tool.
+
+    Returns:
+        Tuple of (assistant_config, server_block).  The server_block
+        must be placed at the top level of the POST /call payload so
+        Vapi sends server events (end-of-call-report, status-update)
+        to our webhook with the correct secret.
+    """
+    from channels.vapi import (
+        _build_outbound_scheduling_config,
+        _generate_outbound_greeting,
+    )
+    from config import get_secrets
+
+    customer_name = call_data.get("customer_name", "")
+    client_name = call_data.get("client_name", "ProjectsForce")
+    project_type = call_data.get("project_type", "")
+    support_number = (call_data.get("auth_creds") or {}).get("support_number", "")
+
+    greeting = _generate_outbound_greeting(
+        customer_name=customer_name,
+        client_name=client_name,
+        project_type=project_type,
+    )
+
+    server_secret = get_secrets().vapi_api_key
+    config = _build_outbound_scheduling_config(
+        first_message=greeting,
+        server_secret=server_secret,
+        outbound_call=call_data,
+        support_number=support_number,
+        client_name=client_name,
+    )
+
+    # POST /call's assistant object accepts ``server`` (with url + secret)
+    # for server events (end-of-call-report, status-update).  Strip only
+    # ``serverUrl`` (the string-only shorthand) to avoid conflicts.
+    server_block = config.get("server")
+    config.pop("serverUrl", None)
+
+    # voicemailDetection uses different field names in POST /call
+    vm = config.get("voicemailDetection", {})
+    if "voicemailDetectionTypes" in vm:
+        # POST /call expects "enabled" boolean, not the detection types list
+        config["voicemailDetection"] = {"provider": vm.get("provider", "vapi")}
+
+    # Also set server on each tool so Vapi routes tool-calls to us
+    if server_block:
+        for tool in config.get("model", {}).get("tools", []):
+            if tool.get("type") == "function":
+                tool["server"] = server_block
+
+    return config, server_block
+
+
+async def _prefetch_project_data(
+    creds: dict, project_id: str, customer_id: str, client_id: str,
+) -> dict:
+    """Pre-fetch project data at trigger time so the AI has it immediately.
+
+    Sets AuthContext, loads projects, fetches available dates (with weather),
+    and gets the installation address.  The result is injected into the
+    outbound system prompt so the AI speaks dates/address without tool calls.
+
+    Also primes ``_request_id_by_project`` so downstream ``get_time_slots``
+    and ``confirm_appointment`` calls work without a second dates lookup.
+    """
+    AuthContext.set(
+        auth_token=creds.get("bearer_token", ""),
+        client_id=client_id,
+        customer_id=customer_id,
+        user_id=creds.get("user_id", ""),
+        user_name=creds.get("user_name", ""),
+        timezone=creds.get("timezone", "US/Eastern"),
+        support_number=creds.get("support_number", ""),
+    )
+
+    prefetched: dict = {}
+
+    try:
+        # 1. Load project details (populates _projects_cache for address, weather, etc.)
+        details_json = await get_project_details(project_id)
+        try:
+            details = json.loads(details_json)
+            project = details.get("project", {})
+            prefetched["project"] = project
+            logger.info("Pre-fetch: project %s loaded", project.get("projectNumber", project_id))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Pre-fetch: project details not JSON — %s", details_json[:200])
+
+        # 2. Available dates + weather enrichment (also primes _request_id_by_project)
+        dates_json = await get_available_dates(project_id)
+        try:
+            dates_data = json.loads(dates_json)
+            prefetched["dates"] = dates_data
+            logger.info(
+                "Pre-fetch: %d dates, request_id=%s",
+                len(dates_data.get("available_dates", [])),
+                dates_data.get("request_id", "?"),
+            )
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Pre-fetch: dates not JSON — %s", dates_json[:200])
+
+        # 3. Installation address
+        addr_json = await get_installation_address(project_id)
+        try:
+            addr_data = json.loads(addr_json)
+            prefetched["address"] = addr_data.get("address", {})
+            logger.info("Pre-fetch: address loaded for project %s", project_id)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Pre-fetch: address not JSON — %s", addr_json[:200])
+
+    except Exception:
+        logger.exception("Pre-fetch failed (non-fatal) for project %s", project_id)
+
+    return prefetched
 
 
 # ── Public lifecycle API ──────────────────────────────────────────────
@@ -141,14 +306,16 @@ async def _process_outbound_message(
         sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
         return
 
-    customer_phone = body.get("customer_phone", "")
-    customer_phone_alt = body.get("customer_phone_alt", "")
-    project_id = body.get("project_id", "")
-    client_id = body.get("client_id", "")
-    customer_name = body.get("customer_name", "")
-    customer_id = body.get("customer_id", "")
-    project_type = body.get("project_type", "")
-    vapi_phone_number_id = body.get("vapi_phone_number_id", "")
+    # Extract fields from PF nested payload format
+    extracted = _extract_pf_payload(body)
+    customer_phone = extracted["customer_phone"]
+    customer_phone_alt = extracted["customer_phone_alt"]
+    project_id = extracted["project_id"]
+    client_id = extracted["client_id"]
+    customer_id = extracted["customer_id"]
+    customer_name = extracted["customer_name"]
+    project_type = extracted["project_type"]
+    vapi_phone_number_id = extracted["vapi_phone_number_id"]
 
     if not customer_phone or not project_id:
         logger.error(
@@ -164,8 +331,10 @@ async def _process_outbound_message(
     )
 
     # Step 1: Authenticate customer via phone-call-login
+    # Pass system phone as to_phone (PF API requires it for validation)
+    system_phone = get_settings().vapi_phone_number
     try:
-        creds = await get_or_authenticate(customer_phone)
+        creds = await get_or_authenticate(customer_phone, system_phone)
     except AuthenticationError:
         logger.exception(
             "Auth failed for outbound call: project=%s phone=***%s",
@@ -195,6 +364,15 @@ async def _process_outbound_message(
         customer_id = creds.get("customer_id", creds.get("user_id", ""))
     client_name = creds.get("client_name", "ProjectsForce")
 
+    # Pre-fetch project data (dates, weather, address) so the AI has it immediately
+    resolved_client_id = client_id or creds.get("client_id", "")
+    prefetched = await _prefetch_project_data(
+        creds=creds,
+        project_id=project_id,
+        customer_id=customer_id,
+        client_id=resolved_client_id,
+    )
+
     # Step 2: Create outbound call record (status=pending)
     call_data = {
         "project_id": project_id,
@@ -217,19 +395,23 @@ async def _process_outbound_message(
             "timezone": creds.get("timezone", "US/Eastern"),
             "support_number": creds.get("support_number", ""),
         },
+        "prefetched": prefetched,
         "sqs_message_id": message_id,
     }
     call_id = await create_outbound_call(call_data)
     call_data["call_id"] = call_id
 
-    # Step 3: Initiate Vapi call
+    # Step 3: Build assistant config and initiate Vapi call
     try:
         webhook_url = _get_webhook_url()
+        assistant_config, server_block = _build_assistant_for_call(call_data)
         vapi_response = await create_vapi_call(
             phone_number_id=vapi_phone_number_id,
             customer_phone=customer_phone,
             customer_name=customer_name,
             server_url=webhook_url,
+            assistant_config=assistant_config,
+            server_block=server_block,
             metadata={"call_id": call_id, "project_id": project_id},
         )
         vapi_call_id = vapi_response.get("id", "")
@@ -290,8 +472,9 @@ async def retry_outbound_call(outbound_call: dict) -> None:
     next_attempt = attempt + 1
 
     # Re-authenticate with alternate phone
+    system_phone = get_settings().vapi_phone_number
     try:
-        creds = await get_or_authenticate(alt_phone)
+        creds = await get_or_authenticate(alt_phone, system_phone)
     except AuthenticationError:
         logger.exception("Auth failed for retry: call_id=%s phone=***%s", call_id, alt_phone[-4:])
         await update_outbound_call(call_id, {
@@ -322,11 +505,15 @@ async def retry_outbound_call(outbound_call: dict) -> None:
     # Initiate call on alternate number
     try:
         webhook_url = _get_webhook_url()
+        retry_call_data = {**outbound_call, "auth_creds": auth_creds}
+        assistant_config, server_block = _build_assistant_for_call(retry_call_data)
         vapi_response = await create_vapi_call(
             phone_number_id=outbound_call.get("vapi_phone_number_id", ""),
             customer_phone=alt_phone,
             customer_name=outbound_call.get("customer_name", ""),
             server_url=webhook_url,
+            assistant_config=assistant_config,
+            server_block=server_block,
             metadata={
                 "call_id": call_id,
                 "project_id": outbound_call.get("project_id", ""),
@@ -356,35 +543,46 @@ async def retry_outbound_call(outbound_call: dict) -> None:
 
 
 async def process_trigger(request_data: dict) -> dict:
-    """Process a manual outbound call trigger (bypasses SQS).
+    """Process an outbound call trigger (from endpoint or SQS-like payload).
 
-    Called by the /outbound/trigger endpoint. Uses the same flow as
-    SQS processing but without the SQS message envelope.
+    Called by the /outbound/trigger endpoint. Uses the same PF nested
+    payload format as SQS messages.
 
     Returns dict with call_id, vapi_call_id, status.
     """
-    customer_phone = request_data.get("customer_phone", "")
-    project_id = request_data.get("project_id", "")
+    extracted = _extract_pf_payload(request_data)
+    customer_phone = extracted["customer_phone"]
+    project_id = extracted["project_id"]
 
-    # Authenticate
-    creds = await get_or_authenticate(customer_phone)
+    # Authenticate — pass system phone as to_phone (PF API requires it)
+    system_phone = get_settings().vapi_phone_number
+    creds = await get_or_authenticate(customer_phone, system_phone)
 
-    customer_name = request_data.get("customer_name", "") or creds.get("user_name", "")
-    customer_id = request_data.get("customer_id", "") or creds.get("customer_id", "")
+    customer_name = extracted["customer_name"] or creds.get("user_name", "")
+    customer_id = extracted["customer_id"] or creds.get("customer_id", "")
     client_name = creds.get("client_name", "ProjectsForce")
+    resolved_client_id = extracted["client_id"] or creds.get("client_id", "")
+
+    # Pre-fetch project data (dates, weather, address) so the AI has it immediately
+    prefetched = await _prefetch_project_data(
+        creds=creds,
+        project_id=project_id,
+        customer_id=customer_id,
+        client_id=resolved_client_id,
+    )
 
     call_data = {
         "project_id": project_id,
-        "client_id": request_data.get("client_id", "") or creds.get("client_id", ""),
+        "client_id": resolved_client_id,
         "customer_id": customer_id,
         "customer_name": customer_name,
         "client_name": client_name,
         "call_type": "scheduling",
         "phone_primary": customer_phone,
-        "phone_alternate": request_data.get("customer_phone_alt", ""),
+        "phone_alternate": extracted["customer_phone_alt"],
         "phone_used": customer_phone,
-        "project_type": request_data.get("project_type", ""),
-        "vapi_phone_number_id": request_data.get("vapi_phone_number_id", ""),
+        "project_type": extracted["project_type"],
+        "vapi_phone_number_id": extracted["vapi_phone_number_id"],
         "auth_creds": {
             "bearer_token": creds.get("bearer_token", ""),
             "client_id": creds.get("client_id", ""),
@@ -394,17 +592,21 @@ async def process_trigger(request_data: dict) -> dict:
             "timezone": creds.get("timezone", "US/Eastern"),
             "support_number": creds.get("support_number", ""),
         },
+        "prefetched": prefetched,
     }
     call_id = await create_outbound_call(call_data)
     call_data["call_id"] = call_id
 
-    # Initiate Vapi call
+    # Build assistant config and initiate Vapi call
     webhook_url = _get_webhook_url()
+    assistant_config, server_block = _build_assistant_for_call(call_data)
     vapi_response = await create_vapi_call(
-        phone_number_id=request_data.get("vapi_phone_number_id", ""),
+        phone_number_id=extracted["vapi_phone_number_id"],
         customer_phone=customer_phone,
         customer_name=customer_name,
         server_url=webhook_url,
+        assistant_config=assistant_config,
+        server_block=server_block,
         metadata={"call_id": call_id, "project_id": project_id},
     )
     vapi_call_id = vapi_response.get("id", "")

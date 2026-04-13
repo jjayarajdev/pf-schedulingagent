@@ -141,7 +141,7 @@ class TestManualTrigger:
             json={
                 "project_id": "proj-789",
                 "client_id": "client-abc",
-                "customer_phone": "+15551234567",
+                "customer": {"primary_phone": "+15551234567"},
             },
         )
 
@@ -153,10 +153,10 @@ class TestManualTrigger:
         mock_trigger.assert_awaited_once()
 
     def test_trigger_missing_required_fields(self, authed_client):
-        """Missing project_id or customer_phone -> 422."""
+        """Missing customer.primary_phone -> 422."""
         resp = authed_client.post(
             "/outbound/trigger",
-            json={"project_id": "proj-789"},
+            json={"project_id": "proj-789", "client_id": "c1"},
         )
         assert resp.status_code == 422
 
@@ -174,7 +174,7 @@ class TestManualTrigger:
             json={
                 "project_id": "proj-789",
                 "client_id": "client-abc",
-                "customer_phone": "+15551234567",
+                "customer": {"primary_phone": "+15551234567"},
             },
         )
         assert resp.status_code == 401
@@ -188,7 +188,7 @@ class TestManualTrigger:
             json={
                 "project_id": "proj-789",
                 "client_id": "client-abc",
-                "customer_phone": "+15551234567",
+                "customer": {"primary_phone": "+15551234567"},
             },
         )
 

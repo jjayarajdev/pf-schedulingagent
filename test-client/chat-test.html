@@ -1627,12 +1627,12 @@
             const a = data.appointment;
             html += '<div class="rich-component">';
             html += '<div class="success-card"><span class="success-icon">&#x2705;</span><span>'
-                + escapeHtml(data.message || 'Appointment confirmed!') + '</span></div>';
+                + escapeHtml(stripMarkdown(data.message || 'Appointment confirmed!')) + '</span></div>';
             if (a.date || a.time || a.technician) {
                 html += '<div class="appt-preview" style="border-radius:12px;margin-top:8px;">';
-                if (a.project) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">' + escapeHtml(String(a.project)) + '</span></div>';
-                if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(a.date) + '</span></div>';
-                if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(a.time) + '</span></div>';
+                if (a.project) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">' + escapeHtml(String(a.projectNumber || a.project)) + '</span></div>';
+                if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(formatDateUS(a.date)) + '</span></div>';
+                if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(formatTime12h(a.time)) + '</span></div>';
                 if (a.technician) html += '<div class="appt-row"><span class="appt-label">Technician</span><span class="appt-value">' + escapeHtml(a.technician) + '</span></div>';
                 html += '</div>';
             }
@@ -1646,10 +1646,10 @@
             html += '<div class="rich-component">';
             html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CB;</span> Appointment Preview</div>';
             html += '<div class="appt-preview">';
-            if (a.project || a.projectNumber) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">#' + escapeHtml(String(a.project || a.projectNumber || '')) + '</span></div>';
+            if (a.projectNumber || a.project) html += '<div class="appt-row"><span class="appt-label">Project</span><span class="appt-value">#' + escapeHtml(String(a.projectNumber || a.project || '')) + '</span></div>';
             if (a.type || a.projectType) html += '<div class="appt-row"><span class="appt-label">Type</span><span class="appt-value">' + escapeHtml(a.type || a.projectType || '') + '</span></div>';
-            if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(a.date) + '</span></div>';
-            if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(a.time) + '</span></div>';
+            if (a.date) html += '<div class="appt-row"><span class="appt-label">Date</span><span class="appt-value">' + escapeHtml(formatDateUS(a.date)) + '</span></div>';
+            if (a.time) html += '<div class="appt-row"><span class="appt-label">Time</span><span class="appt-value">' + escapeHtml(formatTime12h(a.time)) + '</span></div>';
             html += '<div class="appt-actions">';
             html += '<button class="appt-btn appt-confirm" onclick="quickAction(\'Confirm\')">Confirm</button>';
             html += '<button class="appt-btn appt-decline" onclick="quickAction(\'Decline\')">Decline</button>';
@@ -1671,12 +1671,13 @@
                 // Group by period
                 const groups = { 'Morning': [], 'Afternoon': [], 'Evening': [] };
                 for (const s of slots) {
-                    const time = typeof s === 'string' ? s : (s.time || s.label || '');
+                    const rawTime = typeof s === 'string' ? s : (s.time || s.label || '');
+                    const time = formatTime12h(rawTime);
                     const period = typeof s === 'object' ? (s.period || '') : '';
                     if (period && groups[period]) { groups[period].push(time); }
                     else {
                         // Auto-classify by hour
-                        const h = parseInt(time);
+                        const h = parseInt(rawTime);
                         const isPM = time.toUpperCase().includes('PM');
                         if (isPM && h !== 12) groups['Afternoon'].push(time);
                         else if (h < 12 || h === 12 && !isPM) groups['Morning'].push(time);
@@ -1780,10 +1781,10 @@
 
             html += '<div class="rich-component">';
             html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4E6;</span> '
-                + escapeHtml(data.message || 'Found ' + activeProjects.length + ' project(s):') + '</div>';
+                + escapeHtml(stripMarkdown(data.message || 'Found ' + activeProjects.length + ' project(s):')) + '</div>';
 
             html += '<table class="projects-table"><thead><tr>';
-            html += '<th>Project #</th><th>Status</th><th>Category</th><th>Type</th><th>Date Sold</th>';
+            html += '<th>Project #</th><th>Status</th><th>Category</th><th>Type</th>';
             html += '</tr></thead><tbody>';
 
             for (const p of activeProjects) {
@@ -1792,14 +1793,12 @@
                 const statusCls = STATUS_CLASSES[status] || 'status-ready';
                 const category = p.category || '';
                 const type = p.projectType || p.type || '';
-                const date = p.dateSold || p.date_sold || p.date || p.scheduledDate || '';
 
                 html += '<tr onclick="quickAction(\'Schedule project ' + escapeHtml(String(number)) + '\')">';
                 html += '<td style="font-weight:600;color:#1565c0;">' + escapeHtml(String(number)) + '</td>';
                 html += '<td><span class="status-badge ' + statusCls + '">' + escapeHtml(status) + '</span></td>';
                 html += '<td>' + escapeHtml(category) + '</td>';
                 html += '<td>' + escapeHtml(type) + '</td>';
-                html += '<td>' + escapeHtml(date) + '</td>';
                 html += '</tr>';
             }
             html += '</tbody></table></div>';
@@ -1811,7 +1810,7 @@
             const proj = data.project;
             html += '<div class="rich-component">';
             html += '<div class="rich-header"><span class="rich-header-icon">&#x1F4CB;</span> Project #'
-                + escapeHtml(String(proj.id || proj.projectNumber || '')) + ' Details</div>';
+                + escapeHtml(String(proj.projectNumber || proj.id || '')) + ' Details</div>';
             html += '<div class="project-detail"><div class="project-detail-body">';
 
             if (proj.name || proj.category) {
@@ -1828,7 +1827,7 @@
 
             if (proj.scheduledDate || proj.date) {
                 html += '<div class="project-detail-row"><span class="icon">&#x1F4C5;</span> '
-                    + escapeHtml(proj.scheduledDate || proj.date) + '</div>';
+                    + escapeHtml(formatDateUS(proj.scheduledDate || proj.date)) + '</div>';
             }
 
             // Technician card
@@ -1913,7 +1912,7 @@
             html += '<div class="address-card">';
             if (street) html += '<div class="address-card-street">' + escapeHtml(street) + '</div>';
             if (cityLine) html += '<div class="address-card-city">' + escapeHtml(cityLine) + '</div>';
-            if (data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_id)) + '</div>';
+            if (data.project_number || data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_number || data.project_id)) + '</div>';
             html += '</div></div>';
             return html;
         }
@@ -1940,7 +1939,7 @@
             html += '<div class="address-card address-updated">';
             if (street) html += '<div class="address-card-street address-new">' + escapeHtml(street) + '</div>';
             if (cityLine) html += '<div class="address-card-city address-new">' + escapeHtml(cityLine) + '</div>';
-            if (data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_id)) + '</div>';
+            if (data.project_number || data.project_id) html += '<div class="address-card-project">Project #' + escapeHtml(String(data.project_number || data.project_id)) + '</div>';
             html += '</div></div>';
             return html;
         }
@@ -1948,7 +1947,7 @@
         // ── Generic message ──────────────────────────────────
         if (data.message) {
             return '<div style="background:#f0f4f8;border-radius:10px;padding:12px 16px;margin:6px 0;">'
-                + escapeHtml(data.message) + '</div>';
+                + escapeHtml(stripMarkdown(data.message)) + '</div>';
         }
 
         // ── Unknown JSON ─────────────────────────────────────
@@ -1972,6 +1971,35 @@
         html = html.replace(/^(?!<[huploi])((?!<).+)$/gm, '<p>$1</p>');
         html = html.replace(/\n{2,}/g, '\n');
         return html;
+    }
+
+    /** Strip **bold** markers from message strings (for use inside rich components). */
+    function stripMarkdown(text) {
+        if (!text) return '';
+        return text.replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1');
+    }
+
+    /** Format YYYY-MM-DD → MM/DD/YYYY for display. */
+    function formatDateUS(dateStr) {
+        if (!dateStr) return '';
+        const parts = String(dateStr).substring(0, 10).split('-');
+        if (parts.length === 3) return parts[1] + '/' + parts[2] + '/' + parts[0];
+        return dateStr;
+    }
+
+    /** Format 24h time (13:00:00) → 12h AM/PM (1:00 PM). */
+    function formatTime12h(timeStr) {
+        if (!timeStr) return '';
+        const t = String(timeStr).trim();
+        if (/[AaPp][Mm]/.test(t)) return t; // already 12h
+        const match = t.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+        if (!match) return t;
+        let hour = parseInt(match[1]);
+        const minute = match[2];
+        const period = hour < 12 ? 'AM' : 'PM';
+        if (hour === 0) hour = 12;
+        else if (hour > 12) hour -= 12;
+        return hour + ':' + minute + ' ' + period;
     }
 
     function escapeHtml(str) {

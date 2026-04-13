@@ -13,6 +13,7 @@ def mock_secrets():
     with patch("channels.outbound_vapi.get_secrets") as mock:
         secrets = MagicMock()
         secrets.vapi_api_key = "test-vapi-key"
+        secrets.vapi_private_key = "test-vapi-key"
         mock.return_value = secrets
         yield mock
 
@@ -47,7 +48,7 @@ class TestCreateVapiCall:
         assert payload["phoneNumberId"] == "ph-001"
         assert payload["customer"]["number"] == "+15551234567"
         assert payload["customer"]["name"] == "Jane Doe"
-        assert payload["serverUrl"] == "https://bot.example.com/vapi/webhook"
+        assert payload["assistant"]["server"]["url"] == "https://bot.example.com/vapi/webhook"
         assert payload["metadata"]["call_id"] == "our-123"
 
         headers = call_args[1]["headers"]
@@ -101,6 +102,46 @@ class TestCreateVapiCall:
 
         payload = mock_client.post.call_args[1]["json"]
         assert "metadata" not in payload
+
+
+    @pytest.mark.asyncio
+    async def test_server_block_at_top_level(self, mock_secrets):
+        """Server block must be at payload top level for Vapi server events."""
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": "v1"}
+        mock_response.text = '{"id": "v1"}'
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        server_block = {
+            "url": "https://bot.example.com/vapi/webhook",
+            "secret": "my-secret",
+            "timeoutSeconds": 30,
+        }
+        assistant_config = {"name": "Test", "model": {"tools": []}}
+
+        with patch("httpx.AsyncClient", return_value=mock_ctx):
+            await create_vapi_call(
+                phone_number_id="ph-001",
+                customer_phone="+15551234567",
+                customer_name="Jane",
+                server_url="https://bot.example.com/vapi/webhook",
+                assistant_config=assistant_config,
+                server_block=server_block,
+            )
+
+        payload = mock_client.post.call_args[1]["json"]
+        # Vapi rejects both server and serverUrl at the payload top level
+        assert "server" not in payload
+        assert "serverUrl" not in payload
+        # server block should be inside assistant (set by caller)
+        assert payload["assistant"]["name"] == "Test"
 
 
 class TestGetVapiCallStatus:

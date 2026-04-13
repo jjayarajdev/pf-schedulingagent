@@ -69,7 +69,7 @@ async def manual_trigger(request: OutboundTriggerRequest) -> dict:
         "Manual trigger: project=%s client=%s phone=%s",
         request.project_id,
         request.client_id,
-        request.customer_phone,
+        request.customer.primary_phone,
     )
     try:
         result = await process_trigger(request.model_dump())
