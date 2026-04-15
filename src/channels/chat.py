@@ -20,7 +20,13 @@ from observability.logging import RequestContext
 from orchestrator import get_orchestrator
 from orchestrator.response_utils import extract_response_text
 from orchestrator.welcome import handle_welcome
-from tools.scheduling import reset_confirm_flag, reset_request_caches, was_confirm_called
+from tools.scheduling import (
+    reset_action_flags,
+    reset_confirm_flag,
+    reset_request_caches,
+    was_cancel_called,
+    was_confirm_called,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +230,20 @@ _BOOKING_CONFIRMATION_PATTERNS = [
     "installation address has been updated",
 ]
 
+# Patterns that indicate the LLM fabricated a cancellation without calling the tool
+_CANCEL_CONFIRMATION_PATTERNS = [
+    "has been cancelled",
+    "has been canceled",
+    "appointment cancelled",
+    "appointment canceled",
+    "successfully cancelled",
+    "successfully canceled",
+    "i've cancelled",
+    "i've canceled",
+    "cancellation is complete",
+    "appointment has been removed",
+]
+
 # Patterns that indicate the LLM fabricated a scheduling failure instead of calling the tool
 _FABRICATED_FAILURE_PATTERNS = [
     "system issue",
@@ -247,6 +267,12 @@ def _looks_like_booking_confirmation(text: str) -> bool:
     """Check if the response text claims a booking was made."""
     lower = text.lower()
     return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
+
+
+def _looks_like_cancel_confirmation(text: str) -> bool:
+    """Check if the response text claims a cancellation was done."""
+    lower = text.lower()
+    return any(p in lower for p in _CANCEL_CONFIRMATION_PATTERNS)
 
 
 def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
@@ -697,7 +723,7 @@ async def chat(request: ChatRequest, raw_request: Request):
 
     orchestrator = get_orchestrator()
     start_time = time.monotonic()
-    reset_confirm_flag()
+    reset_action_flags()
     reset_request_caches()
     try:
         response = await orchestrator.route_request(
@@ -719,33 +745,49 @@ async def chat(request: ChatRequest, raw_request: Request):
     # If the LLM claims a booking was made but confirm_appointment was never called,
     # OR fabricated a "system issue" when the user said "yes", re-route.
     should_retry = False
+    retry_prompt = ""
     if not was_confirm_called() and _looks_like_booking_confirmation(response_text):
         logger.warning("Hallucinated booking detected — retrying with forced tool call")
         should_retry = True
+        retry_prompt = (
+            "The customer confirmed. You MUST call the confirm_appointment tool NOW "
+            "to actually book the appointment. Do NOT respond without calling the tool. "
+            "Do NOT check or worry about the project status — just call the tool."
+        )
     elif not was_confirm_called() and _looks_like_fabricated_failure(response_text, request.message):
         logger.warning("Fabricated scheduling failure detected — retrying with forced tool call")
         should_retry = True
+        retry_prompt = (
+            "The customer confirmed. You MUST call the confirm_appointment tool NOW "
+            "to actually book the appointment. Do NOT respond without calling the tool. "
+            "Do NOT check or worry about the project status — just call the tool."
+        )
+    elif not was_cancel_called() and _looks_like_cancel_confirmation(response_text):
+        logger.warning("Hallucinated cancellation detected — retrying with forced tool call")
+        should_retry = True
+        retry_prompt = (
+            "You said the appointment was cancelled but you did NOT call the cancel_appointment tool. "
+            "The appointment is NOT actually cancelled. You MUST call cancel_appointment(project_id, reason) "
+            "NOW to actually cancel it. Use the cancellation reason the customer already provided. "
+            "Do NOT respond without calling the tool."
+        )
 
     if should_retry:
-        reset_confirm_flag()
+        reset_action_flags()
         try:
             response = await orchestrator.route_request(
-                user_input=(
-                    "The customer confirmed. You MUST call the confirm_appointment tool NOW "
-                    "to actually book the appointment. Do NOT respond without calling the tool. "
-                    "Do NOT check or worry about the project status — just call the tool."
-                ),
+                user_input=retry_prompt,
                 user_id=user_id,
                 session_id=session_id,
                 additional_params={"channel": "chat"},
             )
             retry_text = extract_response_text(response.output)
-            if was_confirm_called():
+            if was_confirm_called() or was_cancel_called():
                 response_text = retry_text
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                logger.info("Retry succeeded — confirm_appointment was called")
+                logger.info("Retry succeeded — write tool was called")
             else:
-                logger.warning("Retry also failed to call confirm_appointment")
+                logger.warning("Retry also failed to call the required tool")
         except Exception:
             logger.exception("Retry failed")
 

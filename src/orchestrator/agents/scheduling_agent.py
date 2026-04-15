@@ -112,11 +112,19 @@ def create_scheduling_agent() -> BedrockLLMAgent:
         ),
         AgentTool(
             name="cancel_appointment",
-            description="REQUIRED to cancel. You MUST call this tool to cancel — never tell the user it's cancelled without calling it.",
+            description=(
+                "REQUIRED to cancel an appointment. You MUST call this tool — NEVER tell the user "
+                "the appointment is cancelled without calling it. Always include the reason parameter. "
+                "The note is saved automatically — do NOT call add_note separately for cancellation reasons."
+            ),
             properties={
                 "project_id": {"type": "string", "description": "The project ID"},
+                "reason": {
+                    "type": "string",
+                    "description": "The cancellation reason provided by the customer (REQUIRED by business rules)",
+                },
             },
-            required=["project_id"],
+            required=["project_id", "reason"],
             func=cancel_appointment,
         ),
         AgentTool(

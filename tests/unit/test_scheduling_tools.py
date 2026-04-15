@@ -334,6 +334,19 @@ class TestGetAvailableDates:
         assert data["already_scheduled"] is True
 
 
+    async def test_empty_slots_instructs_get_time_slots(self, mock_httpx_client, mock_httpx_response):
+        """When API returns dates but empty slots, response tells LLM to call get_time_slots."""
+        response = mock_httpx_response(
+            200,
+            {"dates": ["2026-04-15", "2026-04-16"], "slots": [], "request_id": 90001393},
+        )
+        with mock_httpx_client(response=response):
+            result = await get_available_dates("123")
+        data = json.loads(result)
+        assert data["available_time_slots"] == []
+        assert "MUST call get_time_slots" in data["message"]
+        assert "Do NOT guess" in data["message"]
+
     async def test_past_date_clamped_to_tomorrow(self, mock_httpx_client, mock_httpx_response):
         """Past start_date is silently clamped to tomorrow — API still called."""
         response = mock_httpx_response(
@@ -417,9 +430,10 @@ class TestRescheduleAppointment:
 
     async def test_reschedule_fallback_when_api_fails(self, mock_httpx_client, mock_httpx_response):
         """Falls back to helpful message when rescheduler API fails."""
-        from tools.scheduling import _projects_cache
+        from tools.scheduling import _projects_cache, _reschedule_pending
         from datetime import datetime, timezone
 
+        _reschedule_pending.discard("100")
         _projects_cache["test-customer-456"] = {
             "projects": [
                 {"id": "100", "status": "Scheduled", "scheduledDate": "2026-03-10",
@@ -487,6 +501,44 @@ class TestRescheduleAppointment:
 
         assert "confirmed" in result.lower()
         assert "100" not in _reschedule_pending  # flag cleared
+
+
+class TestCancelAppointment:
+    async def test_cancel_without_reason(self, mock_httpx_client, mock_httpx_response):
+        """Cancel without reason makes only the cancel API call."""
+        cancel_resp = mock_httpx_response(200, {"data": {"message": "Cancel successfully"}})
+        with mock_httpx_client(responses=[cancel_resp]):
+            result = await cancel_appointment("123")
+        assert "cancelled" in result.lower()
+
+    async def test_cancel_with_reason_saves_note(self, mock_httpx_client, mock_httpx_response):
+        """Cancel with reason auto-saves cancellation note via add_note."""
+        cancel_resp = mock_httpx_response(200, {"data": {"message": "Cancel successfully"}})
+        note_resp = mock_httpx_response(200, {"status": "ok"})
+        with mock_httpx_client(responses=[cancel_resp, note_resp]):
+            result = await cancel_appointment("123", reason="personal appointment conflict")
+        assert "cancelled" in result.lower()
+
+    async def test_cancel_with_reason_note_failure_still_returns_success(
+        self, mock_httpx_response
+    ):
+        """If cancel succeeds but note fails, report partial success."""
+        cancel_resp = mock_httpx_response(200, {"data": {"message": "Cancel successfully"}})
+        note_resp = mock_httpx_response(500, None, text="Internal Server Error")
+
+        # cancel uses .get(), add_note uses .post() — need separate side_effects
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=cancel_resp)
+        mock_client.post = AsyncMock(return_value=note_resp)
+
+        mock_context = AsyncMock()
+        mock_context.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_context.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=mock_context):
+            result = await cancel_appointment("123", reason="moving to new address")
+        assert "cancelled" in result.lower()
+        assert "unable to save" in result.lower()
 
 
 class TestAddNote:

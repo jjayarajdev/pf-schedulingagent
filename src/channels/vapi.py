@@ -49,8 +49,10 @@ from tools.scheduling import (
     clear_session_projects,
     post_call_summary_notes,
     post_store_call_notes,
+    reset_action_flags,
     reset_confirm_flag,
     reset_request_caches,
+    was_cancel_called,
     was_confirm_called,
 )
 from tools.scheduling import confirm_appointment as sched_confirm_appointment
@@ -115,6 +117,25 @@ _BOOKING_CONFIRMATION_PATTERNS = [
 def _looks_like_booking_confirmation(text: str) -> bool:
     lower = text.lower()
     return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
+
+
+_CANCEL_CONFIRMATION_PATTERNS = [
+    "has been cancelled",
+    "has been canceled",
+    "appointment cancelled",
+    "appointment canceled",
+    "successfully cancelled",
+    "successfully canceled",
+    "i've cancelled",
+    "i've canceled",
+    "cancellation is complete",
+    "appointment has been removed",
+]
+
+
+def _looks_like_cancel_confirmation(text: str) -> bool:
+    lower = text.lower()
+    return any(p in lower for p in _CANCEL_CONFIRMATION_PATTERNS)
 
 
 # ── Auth dependency ──────────────────────────────────────────────────────
@@ -422,7 +443,7 @@ def _build_assistant_config(
     name = client_name or "ProjectsForce"
     server_config: dict = {
         "url": _get_webhook_url(),
-        "timeoutSeconds": 30,
+        "timeoutSeconds": 60,
     }
     if server_secret:
         server_config["secret"] = server_secret
@@ -882,7 +903,7 @@ def _build_outbound_scheduling_config(
 
     server_config: dict = {
         "url": _get_webhook_url(),
-        "timeoutSeconds": 30,
+        "timeoutSeconds": 60,
     }
     if server_secret:
         server_config["secret"] = server_secret
@@ -1122,12 +1143,107 @@ def _build_store_assistant_config(
     for office transfers when a support number is available.
     """
     name = client_name or "ProjectsForce"
+    has_transfer = bool(support_number)
     server_config: dict = {
         "url": _get_webhook_url(),
-        "timeoutSeconds": 30,
+        "timeoutSeconds": 60,
     }
     if server_secret:
         server_config["secret"] = server_secret
+
+    # Build customer/non-project handling based on whether transfer is available
+    if has_transfer:
+        customer_instruction = (
+            "say 'I don't recognize your phone number. "
+            "Let me transfer you to our team so they can help you.' "
+            "Then use the transferCall tool to transfer the call."
+        )
+        non_project_instruction = (
+            "say 'Let me connect you with someone who can help.' "
+            "Then use the transferCall tool to transfer the call."
+        )
+    else:
+        customer_instruction = (
+            f"say 'I don't have your account on file right now. "
+            f"Someone from {name} will reach out to you regarding this. "
+            "Is there anything else I can help you with?' "
+            "Then end the call gracefully."
+        )
+        non_project_instruction = (
+            f"say 'Someone from {name} will reach out to you regarding this. "
+            "Is there anything else I can help you with?' "
+            "Then end the call gracefully."
+        )
+
+    system_prompt = (
+        f"You are J, a friendly phone assistant for {name} "
+        "— a home improvement scheduling service.\n\n"
+        "You do NOT know who this caller is. Do NOT assume they are a "
+        "retailer or a customer. You must qualify them first.\n\n"
+        "## QUALIFICATION FLOW\n"
+        "1. You already greeted them. Wait for them to state their need.\n"
+        "2. If their request is about a project, order, installation, "
+        "or scheduling, ask: 'Are you the customer, or are you calling "
+        "from a retailer?'\n"
+        "   - Recognize these as RETAILER: store, retailer, Lowe's, "
+        "Home Depot, vendor, supplier, dealer, shop.\n"
+        "   - Recognize these as CUSTOMER: customer, homeowner, "
+        "I'm the customer, it's my project, I placed the order.\n"
+        "3. If RETAILER: ask for a project number or PO number "
+        "(do NOT ask for a customer name). Then call ask_store_bot "
+        "with lookup_type and lookup_value.\n"
+        f"4. If CUSTOMER: {customer_instruction}\n"
+        "5. If their request is NOT project-related (e.g., job inquiry, "
+        f"sales call, wrong number): {non_project_instruction}\n\n"
+        "## HANDLING VAGUE OR CONFUSED CALLERS\n"
+        "If the caller says vague things like 'I don't know', "
+        "'What do you do?', 'Help me', or seems confused:\n"
+        "- Do NOT immediately transfer or end the call.\n"
+        "- Give a brief orientation: 'I help retailers check project status "
+        "and help customers schedule their home improvement appointments. "
+        "Are you a customer or calling from a retailer?'\n"
+        "- If after 2 attempts they still cannot clarify, "
+        f"{non_project_instruction}\n\n"
+        "## AFTER RETAILER AUTHENTICATION\n"
+        "Once authenticated via ask_store_bot, follow these rules:\n"
+        "- Use ask_store_bot for ALL subsequent queries. "
+        "You do NOT need lookup_type/lookup_value again.\n"
+        "- Pass the user's EXACT words in the \"question\" field. "
+        "Do NOT rephrase.\n"
+        "- NEVER share customer names, phone numbers, "
+        "email addresses, or street addresses. "
+        "Only share project status, scheduled dates, technician names, "
+        "project numbers, and PO numbers.\n"
+        "- NEVER offer to schedule, reschedule, or cancel appointments. "
+        "Retailer callers can ONLY check project status. If they ask, "
+        "say: 'Scheduling is not available for retailer calls. "
+        "Please have the customer call us directly.'\n"
+        "- NEVER read out project numbers or IDs — they are long and "
+        "unintelligible. Identify projects by category/type and status.\n\n"
+        "## GENERAL RULES\n"
+        "- Keep responses concise — no bullet points, no markdown.\n"
+        "- Before calling a tool, say a brief natural filler. "
+        "Vary your phrasing — rotate between: "
+        '"Give me one moment while I check that", '
+        '"Let me pull that up", "One second", '
+        '"Let me take a look". '
+        "Do NOT repeat the same phrase back to back. "
+        'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
+        "- NEVER say 'I'm transferring you now' unless you are actually "
+        "invoking the transferCall tool in the same turn. If you cannot "
+        "transfer, do NOT mention transferring at all.\n"
+        "- If the caller says 'just a second', 'hold on', 'let me check', "
+        "or similar — say 'Take your time, I'll be right here' and wait "
+        "patiently. Do NOT end the call or rush them.\n"
+        "- NEVER ask clarifying questions before calling the tool. "
+        "Let the scheduling bot handle clarification."
+        + (
+            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+            if hours_context and hours_context.get("prompt_snippet")
+            else ""
+        )
+    )
+
     return {
         "name": f"{name} Assistant",
         "voice": _VOICE_CONFIG,
@@ -1138,73 +1254,7 @@ def _build_store_assistant_config(
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        f"You are J, a friendly phone assistant for {name} "
-                        "— a home improvement scheduling service.\n\n"
-                        "You do NOT know who this caller is. Do NOT assume they are a "
-                        "retailer or a customer. You must qualify them first.\n\n"
-                        "## QUALIFICATION FLOW\n"
-                        "1. You already greeted them. Wait for them to state their need.\n"
-                        "2. If their request is about a project, order, installation, "
-                        "or scheduling, ask: 'Are you the customer, or are you calling "
-                        "from a retailer?'\n"
-                        "   - Recognize these as RETAILER: store, retailer, Lowe's, "
-                        "Home Depot, vendor, supplier, dealer, shop.\n"
-                        "   - Recognize these as CUSTOMER: customer, homeowner, "
-                        "I'm the customer, it's my project, I placed the order.\n"
-                        "3. If RETAILER: ask for a project number or PO number "
-                        "(do NOT ask for a customer name). Then call ask_store_bot "
-                        "with lookup_type and lookup_value.\n"
-                        "4. If CUSTOMER: say 'I don't recognize your phone number. "
-                        "Let me transfer you to our team so they can help you.' "
-                        "Then use the transferCall tool if available. If transferCall "
-                        "is not available, say: 'Please contact our support team "
-                        "directly and they\\'ll be happy to assist you.'\n"
-                        "5. If their request is NOT project-related (e.g., job inquiry, "
-                        "sales call, wrong number), say: 'Let me connect you with "
-                        "someone who can help.' Then use the transferCall tool if available. "
-                        "If not, say: 'Please contact our support team directly.'\n\n"
-                        "## AFTER RETAILER AUTHENTICATION\n"
-                        "Once authenticated via ask_store_bot, follow these rules:\n"
-                        "- Use ask_store_bot for ALL subsequent queries. "
-                        "You do NOT need lookup_type/lookup_value again.\n"
-                        "- Pass the user's EXACT words in the \"question\" field. "
-                        "Do NOT rephrase.\n"
-                        "- NEVER share customer names, phone numbers, "
-                        "email addresses, or street addresses. "
-                        "Only share project status, scheduled dates, technician names, "
-                        "project numbers, and PO numbers.\n"
-                        "- NEVER offer to schedule, reschedule, or cancel appointments. "
-                        "Retailer callers can ONLY check project status. If they ask, "
-                        "say: 'Scheduling is not available for retailer calls. "
-                        "Please have the customer call us directly.'\n"
-                        "- NEVER read out project numbers or IDs — they are long and "
-                        "unintelligible. Identify projects by category/type and status.\n\n"
-                        "## GENERAL RULES\n"
-                        "- Keep responses concise — no bullet points, no markdown.\n"
-                        "- Before calling a tool, say a brief natural filler. "
-                        "Vary your phrasing — rotate between: "
-                        '"Give me one moment while I check that", '
-                        '"Let me pull that up", "One second", '
-                        '"Let me take a look". '
-                        "Do NOT repeat the same phrase back to back. "
-                        'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
-                        "- Do NOT use filler phrases for transfers — just say "
-                        "'I'm transferring you now' and invoke the transfer.\n"
-                        "- Whenever you would read out a phone number, offer to transfer "
-                        "the caller instead: 'Would you like me to connect you directly?' "
-                        "If yes, use the transferCall tool. If transferCall is not available "
-                        "or the caller declines, read the number.\n"
-                        "- If transferCall is not available and you cannot transfer, say: "
-                        "'Please contact our support team directly for further assistance.'\n"
-                        "- NEVER ask clarifying questions before calling the tool. "
-                        "Let the scheduling bot handle clarification."
-                        + (
-                            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
-                            if hours_context and hours_context.get("prompt_snippet")
-                            else ""
-                        )
-                    ),
+                    "content": system_prompt,
                 }
             ],
             "tools": [
@@ -1267,7 +1317,7 @@ def _build_store_assistant_config(
             "have a good day",
         ],
         "endCallFunctionEnabled": True,
-        "silenceTimeoutSeconds": 30,
+        "silenceTimeoutSeconds": 45,
         "maxDurationSeconds": 600,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -1536,7 +1586,7 @@ async def _process_tool(
         agent_name = ""
         start_time = time.monotonic()
         try:
-            reset_confirm_flag()
+            reset_action_flags()
             reset_request_caches()
             orchestrator = get_orchestrator()
             response = await orchestrator.route_request(
@@ -1552,28 +1602,43 @@ async def _process_tool(
             # Guardrail: detect hallucinated booking confirmations.
             # If the scheduling agent says "confirmed" without calling
             # confirm_appointment, retry with an explicit instruction.
+            retry_prompt = ""
             if not was_confirm_called() and _looks_like_booking_confirmation(voice_text):
                 logger.warning(
                     "Hallucinated booking in Vapi call (call_id=%s) — retrying",
                     call_id,
                 )
-                reset_confirm_flag()
+                retry_prompt = (
+                    "The customer confirmed. You MUST call the confirm_appointment "
+                    "tool NOW to actually book the appointment. Do NOT respond "
+                    "without calling the tool."
+                )
+            elif not was_cancel_called() and _looks_like_cancel_confirmation(voice_text):
+                logger.warning(
+                    "Hallucinated cancellation in Vapi call (call_id=%s) — retrying",
+                    call_id,
+                )
+                retry_prompt = (
+                    "You said the appointment was cancelled but you did NOT call "
+                    "cancel_appointment. The appointment is NOT actually cancelled. "
+                    "You MUST call cancel_appointment(project_id, reason) NOW. "
+                    "Use the reason the customer already provided."
+                )
+
+            if retry_prompt:
+                reset_action_flags()
                 response = await orchestrator.route_request(
-                    user_input=(
-                        "The customer confirmed. You MUST call the confirm_appointment "
-                        "tool NOW to actually book the appointment. Do NOT respond "
-                        "without calling the tool."
-                    ),
+                    user_input=retry_prompt,
                     user_id=user_id,
                     session_id=session_id,
                     additional_params={"channel": "vapi"},
                 )
                 retry_text = extract_response_text(response.output)
-                if was_confirm_called():
+                if was_confirm_called() or was_cancel_called():
                     voice_text = format_for_voice(retry_text)
-                    logger.info("Vapi retry succeeded — confirm_appointment called")
+                    logger.info("Vapi retry succeeded — write tool was called")
                 else:
-                    logger.warning("Vapi retry also failed to call confirm_appointment")
+                    logger.warning("Vapi retry also failed to call the required tool")
         except Exception:
             logger.exception("Orchestrator error during Vapi call (call_id=%s)", call_id)
             voice_text = _FALLBACK_MESSAGE

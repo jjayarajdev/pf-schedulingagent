@@ -103,15 +103,28 @@ def clear_session_projects(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Request-scoped confirm_appointment tracking (hallucination guardrail)
+#  Request-scoped tool-call tracking (hallucination guardrail)
+#
+#  Tracks which write operations were ACTUALLY called by the LLM in the
+#  current request.  Post-response guardrails in chat.py / vapi.py check
+#  these flags to catch hallucinated confirmations, cancellations, etc.
 # ---------------------------------------------------------------------------
 
 _confirm_called_in_request: ContextVar[bool] = ContextVar("confirm_called", default=False)
+_cancel_called_in_request: ContextVar[bool] = ContextVar("cancel_called", default=False)
+_reschedule_called_in_request: ContextVar[bool] = ContextVar("reschedule_called", default=False)
 
 
 def reset_confirm_flag() -> None:
     """Reset before each orchestrator call."""
     _confirm_called_in_request.set(False)
+
+
+def reset_action_flags() -> None:
+    """Reset ALL write-action flags before each orchestrator call."""
+    _confirm_called_in_request.set(False)
+    _cancel_called_in_request.set(False)
+    _reschedule_called_in_request.set(False)
 
 
 def reset_request_caches() -> None:
@@ -126,6 +139,16 @@ def reset_request_caches() -> None:
 def was_confirm_called() -> bool:
     """Check if confirm_appointment was actually called in this request."""
     return _confirm_called_in_request.get()
+
+
+def was_cancel_called() -> bool:
+    """Check if cancel_appointment was actually called in this request."""
+    return _cancel_called_in_request.get()
+
+
+def was_reschedule_called() -> bool:
+    """Check if reschedule_appointment was actually called in this request."""
+    return _reschedule_called_in_request.get()
 
 
 # ---------------------------------------------------------------------------
@@ -716,46 +739,63 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_date = (start_dt + timedelta(days=10)).strftime("%Y-%m-%d")
 
-    url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
     headers = build_headers()
-    log_curl("GET", url, headers)
 
-    try:
-        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-            response = await client.get(url, headers=headers)
-        log_response(response, "get_available_dates")
+    # Use reschedule-specific endpoint when a reschedule is in progress
+    if project_id in _reschedule_pending:
+        url = f"{base_url}/date/{start_date}/selected/{start_date}/get-reschedule-slotsChatBot"
+        log_curl("GET", url, headers)
+        try:
+            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+            log_response(response, "get_reschedule_available_dates")
+            response.raise_for_status()
+            data = _unwrap(response.json())
+        except httpx.HTTPError as exc:
+            logger.exception("Failed to get reschedule available dates")
+            return f"Sorry, I couldn't check available dates for rescheduling. Error: {exc}"
+    else:
+        url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
+        log_curl("GET", url, headers)
+        try:
+            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+            log_response(response, "get_available_dates")
 
-        # Check for "already scheduled" errors BEFORE raise_for_status
-        if response.status_code == 400:
-            error_body = response.text.lower()
-            if any(phrase in error_body for phrase in (
-                "already requested", "already scheduled",
-                "already contains a technician", "technician already assigned",
-            )):
-                logger.info("Project %s is already scheduled (API 400)", project_id)
-                result = {
-                    "project_number": _get_project_number(project_id),
-                    "already_scheduled": True,
-                    "available_dates": [],
-                    "message": (
-                        "This project is already scheduled. "
-                        "Would you like to reschedule to a different date?"
-                    ),
-                }
-                return json.dumps(result, indent=2)
+            # Check for "already scheduled" errors BEFORE raise_for_status
+            if response.status_code == 400:
+                error_body = response.text.lower()
+                if any(phrase in error_body for phrase in (
+                    "already requested", "already scheduled",
+                    "already contains a technician", "technician already assigned",
+                )):
+                    logger.info("Project %s is already scheduled (API 400)", project_id)
+                    result = {
+                        "project_number": _get_project_number(project_id),
+                        "already_scheduled": True,
+                        "available_dates": [],
+                        "message": (
+                            "This project is already scheduled. "
+                            "Would you like to reschedule to a different date?"
+                        ),
+                    }
+                    return json.dumps(result, indent=2)
 
-        response.raise_for_status()
-        data = _unwrap(response.json())
-    except httpx.HTTPError as exc:
-        logger.exception("Failed to get available dates")
-        return f"Sorry, I couldn't check available dates. Error: {exc}"
+            response.raise_for_status()
+            data = _unwrap(response.json())
+        except httpx.HTTPError as exc:
+            logger.exception("Failed to get available dates")
+            return f"Sorry, I couldn't check available dates. Error: {exc}"
 
     dates = data.get("dates", data.get("availableDates", []))
     api_request_id = data.get("request_id")
 
     if not dates:
         expanded_end = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=21)).strftime("%Y-%m-%d")
-        url = f"{base_url}/startDate/{start_date}/endDate/{expanded_end}/slotsChatbot"
+        if project_id in _reschedule_pending:
+            url = f"{base_url}/date/{start_date}/selected/{start_date}/get-reschedule-slotsChatBot"
+        else:
+            url = f"{base_url}/startDate/{start_date}/endDate/{expanded_end}/slotsChatbot"
         try:
             async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
                 response = await client.get(url, headers=headers)
@@ -815,6 +855,13 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
         result["available_time_slots"] = formatted_slots
         result["message"] += (
             f" Available time slots on each date: {', '.join(formatted_slots)}."
+        )
+    else:
+        result["available_time_slots"] = []
+        result["message"] += (
+            " IMPORTANT: No time slots were returned with dates."
+            " You MUST call get_time_slots with the customer's chosen date"
+            " to get the actual available time slots. Do NOT guess or fabricate time slots."
         )
 
     if api_request_id:
@@ -1044,6 +1091,7 @@ async def reschedule_appointment(project_id: str) -> str:
     Uses the dedicated ``get-reschedule-slotsChatBot`` API endpoint which
     ignores current appointment status and returns alternative availability.
     """
+    _reschedule_called_in_request.set(True)
     try:
         return await _reschedule_appointment_impl(project_id)
     except Exception:
@@ -1204,16 +1252,23 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
     return json.dumps(result, indent=2)
 
 
-async def cancel_appointment(project_id: str) -> str:
-    """Cancel an existing appointment."""
+async def cancel_appointment(project_id: str, reason: str = "") -> str:
+    """Cancel an existing appointment.
+
+    Args:
+        project_id: The project ID or project number.
+        reason: The cancellation reason (required by business rules).
+            If provided, a cancellation note is automatically saved.
+    """
+    _cancel_called_in_request.set(True)
     try:
-        return await _cancel_appointment_impl(project_id)
+        return await _cancel_appointment_impl(project_id, reason)
     except Exception:
         logger.exception("Unexpected error in cancel_appointment (project=%s)", project_id)
         return "Sorry, something went wrong while cancelling. Please try again."
 
 
-async def _cancel_appointment_impl(project_id: str) -> str:
+async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
     """Internal implementation of cancel_appointment."""
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "cancel_appointment")
@@ -1223,9 +1278,9 @@ async def _cancel_appointment_impl(project_id: str) -> str:
         status = project.get("status", "")
         has_date = bool(project.get("scheduledDate"))
         if status:
-            can_cancel, reason = ProjectStatusRules.can_cancel(status, has_date)
+            can_cancel, validation_msg = ProjectStatusRules.can_cancel(status, has_date)
             if not can_cancel:
-                return reason
+                return validation_msg
 
     client_id = AuthContext.get_client_id()
     base = get_pf_api_base()
@@ -1245,6 +1300,26 @@ async def _cancel_appointment_impl(project_id: str) -> str:
     # Invalidate project cache — status changed
     _invalidate_projects()
     _reschedule_pending.discard(project_id)
+
+    # Auto-save cancellation reason note if provided
+    if reason.strip():
+        note_text = f"CANCELLATION REASON: {reason.strip()}. Cancelled via AI Scheduling Assistant."
+        try:
+            note_result = await add_note(project_id, note_text)
+            logger.info("Cancel note saved for project %s: %s", project_id, note_result)
+            if "sorry" in note_result.lower() or "couldn't" in note_result.lower():
+                return (
+                    "Appointment has been cancelled successfully. "
+                    "However, I was unable to save the cancellation reason note. "
+                    "Please try adding the note manually."
+                )
+        except Exception:
+            logger.exception("Failed to save cancellation note for project %s", project_id)
+            return (
+                "Appointment has been cancelled successfully. "
+                "However, I was unable to save the cancellation reason note. "
+                "Please try adding the note manually."
+            )
 
     return "Appointment has been cancelled successfully."
 
