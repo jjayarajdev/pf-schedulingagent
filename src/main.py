@@ -14,6 +14,7 @@ from channels.history import router as history_router
 from channels.outbound import router as outbound_router
 from channels.sms import router as sms_router
 from channels.vapi import router as vapi_router
+from channels.vapi_llm import router as vapi_llm_router
 from config import get_settings
 from observability import RequestLoggingMiddleware, configure_logging
 
@@ -83,6 +84,7 @@ app.add_middleware(
 
 app.include_router(chat_router)
 app.include_router(vapi_router)
+app.include_router(vapi_llm_router)
 app.include_router(sms_router)
 app.include_router(history_router)
 app.include_router(outbound_router)
