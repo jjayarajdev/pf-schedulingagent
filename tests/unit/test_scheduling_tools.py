@@ -334,8 +334,21 @@ class TestGetAvailableDates:
         assert data["already_scheduled"] is True
 
 
-    async def test_empty_slots_instructs_get_time_slots(self, mock_httpx_client, mock_httpx_response):
-        """When API returns dates but empty slots, response tells LLM to call get_time_slots."""
+    async def test_dates_response_never_includes_time_slots(self, mock_httpx_client, mock_httpx_response):
+        """Dates response must NEVER include time slots — forces get_time_slots call."""
+        response = mock_httpx_response(
+            200,
+            {"dates": ["2026-04-15", "2026-04-16"], "slots": ["08:00:00", "13:00:00"], "request_id": 90001393},
+        )
+        with mock_httpx_client(response=response):
+            result = await get_available_dates("123")
+        data = json.loads(result)
+        assert "available_time_slots" not in data
+        assert "MUST call get_time_slots" in data["message"]
+        assert "Do NOT guess" in data["message"]
+
+    async def test_empty_slots_also_instructs_get_time_slots(self, mock_httpx_client, mock_httpx_response):
+        """Even with empty slots, response tells LLM to call get_time_slots."""
         response = mock_httpx_response(
             200,
             {"dates": ["2026-04-15", "2026-04-16"], "slots": [], "request_id": 90001393},
@@ -343,9 +356,8 @@ class TestGetAvailableDates:
         with mock_httpx_client(response=response):
             result = await get_available_dates("123")
         data = json.loads(result)
-        assert data["available_time_slots"] == []
+        assert "available_time_slots" not in data
         assert "MUST call get_time_slots" in data["message"]
-        assert "Do NOT guess" in data["message"]
 
     async def test_past_date_clamped_to_tomorrow(self, mock_httpx_client, mock_httpx_response):
         """Past start_date is silently clamped to tomorrow — API still called."""

@@ -113,6 +113,7 @@ def clear_session_projects(session_id: str) -> None:
 _confirm_called_in_request: ContextVar[bool] = ContextVar("confirm_called", default=False)
 _cancel_called_in_request: ContextVar[bool] = ContextVar("cancel_called", default=False)
 _reschedule_called_in_request: ContextVar[bool] = ContextVar("reschedule_called", default=False)
+_time_slots_called_in_request: ContextVar[bool] = ContextVar("time_slots_called", default=False)
 
 
 def reset_confirm_flag() -> None:
@@ -125,6 +126,7 @@ def reset_action_flags() -> None:
     _confirm_called_in_request.set(False)
     _cancel_called_in_request.set(False)
     _reschedule_called_in_request.set(False)
+    _time_slots_called_in_request.set(False)
 
 
 def reset_request_caches() -> None:
@@ -149,6 +151,11 @@ def was_cancel_called() -> bool:
 def was_reschedule_called() -> bool:
     """Check if reschedule_appointment was actually called in this request."""
     return _reschedule_called_in_request.get()
+
+
+def was_time_slots_called() -> bool:
+    """Check if get_time_slots was actually called in this request."""
+    return _time_slots_called_in_request.get()
 
 
 # ---------------------------------------------------------------------------
@@ -825,44 +832,25 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
     # Sort dates chronologically
     sorted_dates = sorted(dates)
 
-    # Include available time slots from the API response.
-    # The slotsChatbot endpoint returns the valid time slots alongside dates.
-    # Including them here prevents the LLM from fabricating slots.
-    raw_slots = data.get("slots", [])
-    formatted_slots = []
-    for s in raw_slots:
-        try:
-            h, m, *_ = s.split(":")
-            hour = int(h)
-            minute = m
-            period = "AM" if hour < 12 else "PM"
-            display_hour = hour if hour <= 12 else hour - 12
-            if display_hour == 0:
-                display_hour = 12
-            formatted_slots.append(f"{display_hour}:{minute} {period}")
-        except (ValueError, IndexError):
-            formatted_slots.append(s)
-
+    # IMPORTANT: Never include time slots in the dates response.
+    # The slotsChatbot endpoint may return generic slots alongside dates,
+    # but including them causes the LLM to fabricate additional 30-min
+    # increments between the real slots.  The correct flow is:
+    #   1. get_available_dates → returns ONLY dates
+    #   2. User picks a date
+    #   3. get_time_slots(date) → returns actual slots for that date
     pnum = _get_project_number(project_id)
     result: dict[str, Any] = {
         "project_number": pnum,
         "available_dates": sorted_dates,
         "date_range": {"start": start_date, "end": end_date},
-        "message": f"Found {len(sorted_dates)} available date(s).",
+        "message": (
+            f"Found {len(sorted_dates)} available date(s)."
+            " Present these dates to the customer. Once they pick a date,"
+            " you MUST call get_time_slots to get the actual available time slots."
+            " Do NOT guess, fabricate, or infer time slots — ONLY use what get_time_slots returns."
+        ),
     }
-
-    if formatted_slots:
-        result["available_time_slots"] = formatted_slots
-        result["message"] += (
-            f" Available time slots on each date: {', '.join(formatted_slots)}."
-        )
-    else:
-        result["available_time_slots"] = []
-        result["message"] += (
-            " IMPORTANT: No time slots were returned with dates."
-            " You MUST call get_time_slots with the customer's chosen date"
-            " to get the actual available time slots. Do NOT guess or fabricate time slots."
-        )
 
     if api_request_id:
         # Cache internally — do NOT expose in response, the LLM confuses
@@ -890,6 +878,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
 
 async def get_time_slots(project_id: str, date: str) -> str:
     """Get available time slots for a specific date."""
+    _time_slots_called_in_request.set(True)
     project_id = _resolve_project_id(project_id)
     _track_project_action(project_id, "get_time_slots")
     # Fix common LLM date errors: wrong year

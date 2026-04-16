@@ -26,6 +26,7 @@ from tools.scheduling import (
     reset_request_caches,
     was_cancel_called,
     was_confirm_called,
+    was_time_slots_called,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,8 +223,12 @@ _BOOKING_CONFIRMATION_PATTERNS = [
     "successfully scheduled",
     "appointment has been booked",
     "you're all set",
+    "all set",
     "your appointment is confirmed",
     "booking confirmed",
+    "is booked",
+    "you're scheduled",
+    "have been booked",
     "address has been updated",
     "address updated successfully",
     "address has been changed",
@@ -281,6 +286,16 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
         return False
     lower = text.lower()
     return any(p in lower for p in _FABRICATED_FAILURE_PATTERNS)
+
+
+# Regex to detect fabricated time slots: 3+ AM/PM time patterns in a response
+_TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
+
+
+def _looks_like_time_slot_list(text: str) -> bool:
+    """Detect if the response contains a list of time slots (3+ AM/PM times)."""
+    matches = _TIME_SLOT_PATTERN.findall(text)
+    return len(matches) >= 3
 
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
@@ -771,6 +786,15 @@ async def chat(request: ChatRequest, raw_request: Request):
             "NOW to actually cancel it. Use the cancellation reason the customer already provided. "
             "Do NOT respond without calling the tool."
         )
+    elif not was_time_slots_called() and _looks_like_time_slot_list(response_text):
+        logger.warning("Fabricated time slots detected — retrying with forced tool call")
+        should_retry = True
+        retry_prompt = (
+            "You listed time slots but you did NOT call the get_time_slots tool. "
+            "Those time slots are FABRICATED and WRONG. You MUST call "
+            "get_time_slots(project_id, date) NOW to get the real available "
+            "time slots. NEVER guess or make up time slots."
+        )
 
     if should_retry:
         reset_action_flags()
@@ -782,10 +806,10 @@ async def chat(request: ChatRequest, raw_request: Request):
                 additional_params={"channel": "chat"},
             )
             retry_text = extract_response_text(response.output)
-            if was_confirm_called() or was_cancel_called():
+            if was_confirm_called() or was_cancel_called() or was_time_slots_called():
                 response_text = retry_text
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                logger.info("Retry succeeded — write tool was called")
+                logger.info("Retry succeeded — required tool was called")
             else:
                 logger.warning("Retry also failed to call the required tool")
         except Exception:

@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -54,6 +55,7 @@ from tools.scheduling import (
     reset_request_caches,
     was_cancel_called,
     was_confirm_called,
+    was_time_slots_called,
 )
 from tools.scheduling import confirm_appointment as sched_confirm_appointment
 from tools.scheduling import get_available_dates as sched_get_available_dates
@@ -77,6 +79,20 @@ def _get_webhook_url() -> str:
     return _WEBHOOK_URLS.get(env, _WEBHOOK_URLS["dev"])
 
 
+# Environment-aware base URLs (without path suffix)
+_BASE_URLS = {
+    "dev": "https://schedulingagent.dev.projectsforce.com",
+    "qa": "https://schedulingagent.qa.projectsforce.com",
+    "staging": "https://schedulingagent.staging.projectsforce.com",
+    "prod": "https://schedulingagent.apps.projectsforce.com",
+}
+
+
+def _get_base_url() -> str:
+    env = get_settings().environment
+    return _BASE_URLS.get(env, _BASE_URLS["dev"])
+
+
 # Shared voice config — used by main assistant, store assistant, AND transfer assistant
 # so the caller hears a consistent voice throughout the entire call.
 _VOICE_CONFIG = {
@@ -98,6 +114,22 @@ _FALLBACK_MESSAGE = (
 # Tracks auth state across tool calls within one Vapi call.
 _store_sessions: dict[str, dict] = {}
 
+# Call auth cache: call_id → creds dict.
+# Populated during assistant-request (after phone auth), consumed by the
+# Custom LLM endpoint (POST /vapi/chat/completions) so it can set AuthContext
+# without re-authenticating on every request.
+_call_auth_cache: dict[str, dict] = {}
+
+
+def get_call_auth(call_id: str) -> dict | None:
+    """Retrieve cached auth credentials for a call."""
+    return _call_auth_cache.get(call_id)
+
+
+def remove_call_auth(call_id: str) -> None:
+    """Remove cached auth credentials when a call ends."""
+    _call_auth_cache.pop(call_id, None)
+
 # Patterns the scheduling agent uses when it hallucinated a booking confirmation
 # without actually calling confirm_appointment.
 _BOOKING_CONFIRMATION_PATTERNS = [
@@ -109,8 +141,12 @@ _BOOKING_CONFIRMATION_PATTERNS = [
     "successfully scheduled",
     "appointment has been booked",
     "you're all set",
+    "all set",
     "your appointment is confirmed",
     "booking confirmed",
+    "is booked",
+    "you're scheduled",
+    "have been booked",
 ]
 
 
@@ -136,6 +172,17 @@ _CANCEL_CONFIRMATION_PATTERNS = [
 def _looks_like_cancel_confirmation(text: str) -> bool:
     lower = text.lower()
     return any(p in lower for p in _CANCEL_CONFIRMATION_PATTERNS)
+
+
+# Regex to detect fabricated time slots: 3+ AM/PM time patterns in a response
+# indicates the LLM is presenting time slots (which must come from get_time_slots).
+_TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
+
+
+def _looks_like_time_slot_list(text: str) -> bool:
+    """Detect if the response contains a list of time slots (3+ AM/PM times)."""
+    matches = _TIME_SLOT_PATTERN.findall(text)
+    return len(matches) >= 3
 
 
 # ── Auth dependency ──────────────────────────────────────────────────────
@@ -317,6 +364,10 @@ async def _handle_assistant_request(body: dict) -> dict:
             greeting, webhook_secret, client_name, support_number, hours_context,
         )}
 
+    # Cache auth creds for Custom LLM endpoint (keyed by call_id)
+    if creds:
+        _call_auth_cache[call_id] = creds
+
     greeting = _generate_dynamic_greeting(first_name, client_name)
     logger.info(
         "Vapi dynamic greeting: call_id=%s name=%s client=%s office_open=%s",
@@ -451,7 +502,7 @@ def _build_assistant_config(
         "name": f"{name} Scheduling Bot",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o-mini",
+            "model": "gpt-4o",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -495,8 +546,10 @@ def _build_assistant_config(
                         '"Let me take a look". '
                         "Do NOT repeat the same phrase back to back. "
                         'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
-                        "10. If the tool call fails, say: "
-                        '"I\'m having trouble looking that up. Let me try again." and retry once.\n'
+                        "10. If the tool call fails or times out, say: "
+                        '"Let me try that again." and retry once. '
+                        "NEVER say 'I'm having trouble looking that up' or fabricate an error "
+                        "message. Only report a problem if the tool fails TWICE.\n"
                         "11. CRITICAL — YOU CANNOT BOOK APPOINTMENTS YOURSELF. EVERY scheduling step "
                         "MUST go through ask_scheduling_bot. This includes:\n"
                         "   - Getting available dates → call ask_scheduling_bot\n"
@@ -509,7 +562,12 @@ def _build_assistant_config(
                         "12. Do NOT end the call until ask_scheduling_bot has returned a confirmation "
                         "message OR the user explicitly says goodbye/bye/that's all I need. "
                         "If the user says 'yes' or 'go ahead' to book, you MUST call "
-                        "ask_scheduling_bot ONE MORE TIME with their confirmation before ending."
+                        "ask_scheduling_bot ONE MORE TIME with their confirmation before ending.\n"
+                        "13. NEVER add your own information to tool calls. You do NOT know the "
+                        "customer's projects, dates, time slots, or appointment details. "
+                        "ONLY the scheduling bot knows this. Do NOT include dates, times, "
+                        "slot lists, or project details in the question — just pass "
+                        "the user's exact words. The scheduling bot has all the context."
                         + (
                             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
                             if hours_context and hours_context.get("prompt_snippet")
@@ -538,14 +596,103 @@ def _build_assistant_config(
                                 "question": {
                                     "type": "string",
                                     "description": (
-                                        "The user's EXACT words. Pass verbatim what they said "
-                                        "— do not rephrase or add context."
+                                        "The user's EXACT words — pass VERBATIM what they said. "
+                                        "Do NOT rephrase, summarize, or add ANY context. "
+                                        "Do NOT include dates, times, project details, or "
+                                        "time slots — the bot already knows everything. "
+                                        "Example: user says 'April 22nd' → pass 'April 22nd'"
                                     ),
                                 },
                             },
                         },
                     },
                 },
+                *(_transfer_call_tool(support_number, name)),
+            ],
+        },
+        "transcriber": {
+            "model": "nova-3",
+            "language": "en",
+            "provider": "deepgram",
+            "endpointing": 150,
+        },
+        "firstMessage": first_message,
+        "endCallMessage": (
+            f"Thank you for calling {name}. "
+            "Your scheduling is all set. Have a wonderful day!"
+        ),
+        "endCallPhrases": [
+            "goodbye", "bye", "bye bye", "bye now",
+            "talk to you later", "have a great day",
+            "have a good day",
+        ],
+        "endCallFunctionEnabled": True,
+        "voicemailMessage": (
+            f"Hello, this is J from {name}. I'm calling about your "
+            "home improvement project. Please call us back at your earliest convenience."
+        ),
+        "silenceTimeoutSeconds": 30,
+        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.4,
+            "smartEndpointingEnabled": True,
+        },
+        "hipaaEnabled": False,
+        "server": server_config,
+        "serverUrl": _get_webhook_url(),
+    }
+
+
+def _build_custom_llm_assistant_config(
+    first_message: str,
+    server_secret: str = "",
+    support_number: str = "",
+    client_name: str = "ProjectsForce",
+    hours_context: dict | None = None,
+) -> dict:
+    """Build Vapi assistant config using Custom LLM — our Claude handles all reasoning.
+
+    Instead of GPT-4o-mini calling ``ask_scheduling_bot``, Vapi sends each
+    user utterance directly to ``POST /vapi/chat/completions`` where our
+    Bedrock Claude + AgentSquad orchestrator handles everything.
+
+    The ``model.tools`` only includes ``transferCall`` (Vapi-native); all
+    scheduling tools are handled server-side by the orchestrator.
+    """
+    name = client_name or "ProjectsForce"
+    server_config: dict = {
+        "url": _get_webhook_url(),
+        "timeoutSeconds": 60,
+    }
+    if server_secret:
+        server_config["secret"] = server_secret
+
+    # Minimal system prompt — voice style + office hours only.
+    # All reasoning is done by our Claude via the Custom LLM endpoint.
+    system_content = (
+        f"You are J, a friendly phone assistant for {name} "
+        "— a home improvement scheduling service.\n"
+        "Keep your responses concise and conversational — this is a phone call.\n"
+        "No bullet points, no markdown.\n"
+        "NEVER read out project numbers or IDs — they are long and unintelligible.\n"
+        "Identify projects by their category/type and status."
+    )
+    if hours_context and hours_context.get("prompt_snippet"):
+        system_content += f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+
+    return {
+        "name": f"{name} Scheduling Bot",
+        "voice": _VOICE_CONFIG,
+        "model": {
+            "provider": "custom-llm",
+            "model": "scheduling-agent",
+            "url": f"{_get_base_url()}/vapi/chat/completions?secret={quote(server_secret, safe='')}",
+            "metadataSendMode": "variable",
+            "messages": [
+                {"role": "system", "content": system_content},
+            ],
+            "tools": [
                 *(_transfer_call_tool(support_number, name)),
             ],
         },
@@ -1038,7 +1185,7 @@ def _build_outbound_scheduling_config(
         "name": f"{name} Outbound Scheduling",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o-mini",
+            "model": "gpt-4o",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -1053,9 +1200,7 @@ def _build_outbound_scheduling_config(
             "endpointing": 150,
         },
         "firstMessage": first_message,
-        "endCallMessage": (
-            f"Thank you for your time, {first_name}. Have a wonderful day!"
-        ),
+        "endCallMessage": "",
         "endCallPhrases": [
             "goodbye", "bye", "bye bye", "bye now",
             "talk to you later", "have a great day",
@@ -1248,7 +1393,7 @@ def _build_store_assistant_config(
         "name": f"{name} Assistant",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o-mini",
+            "model": "gpt-4o",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -1554,8 +1699,9 @@ async def _handle_server_event(body: dict) -> dict:
             else:
                 clear_session_projects(session_id)
 
-        # Clean up store session
+        # Clean up store session + call auth cache
         _store_sessions.pop(session_key, None)
+        _call_auth_cache.pop(call_id, None)
     elif event_type == "status-update":
         status = message.get("status", "unknown")
         logger.info("Vapi status-update: call_id=%s status=%s", call_id, status)
@@ -1582,6 +1728,11 @@ async def _process_tool(
         if not question:
             logger.warning("Empty question in %s (call_id=%s)", tool_name, call_id)
             return _build_tool_result(_FALLBACK_MESSAGE, tool_call_id)
+
+        logger.info(
+            "Vapi ask_scheduling_bot question: call_id=%s q=%s",
+            call_id, question[:500],
+        )
 
         agent_name = ""
         start_time = time.monotonic()
@@ -1624,6 +1775,17 @@ async def _process_tool(
                     "You MUST call cancel_appointment(project_id, reason) NOW. "
                     "Use the reason the customer already provided."
                 )
+            elif not was_time_slots_called() and _looks_like_time_slot_list(voice_text):
+                logger.warning(
+                    "Fabricated time slots in Vapi call (call_id=%s) — retrying",
+                    call_id,
+                )
+                retry_prompt = (
+                    "You listed time slots but you did NOT call the get_time_slots tool. "
+                    "Those time slots are FABRICATED and WRONG. You MUST call "
+                    "get_time_slots(project_id, date) NOW to get the real available "
+                    "time slots. NEVER guess or make up time slots."
+                )
 
             if retry_prompt:
                 reset_action_flags()
@@ -1634,9 +1796,9 @@ async def _process_tool(
                     additional_params={"channel": "vapi"},
                 )
                 retry_text = extract_response_text(response.output)
-                if was_confirm_called() or was_cancel_called():
+                if was_confirm_called() or was_cancel_called() or was_time_slots_called():
                     voice_text = format_for_voice(retry_text)
-                    logger.info("Vapi retry succeeded — write tool was called")
+                    logger.info("Vapi retry succeeded — required tool was called")
                 else:
                     logger.warning("Vapi retry also failed to call the required tool")
         except Exception:
