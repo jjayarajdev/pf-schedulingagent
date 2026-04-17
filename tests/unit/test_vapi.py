@@ -1302,7 +1302,8 @@ class TestOutboundGreeting:
         greeting = _generate_outbound_greeting("Jane Doe", "FloorCo", "Flooring Installation")
         assert "Jane" in greeting
         assert "FloorCo" in greeting
-        assert "Flooring Installation" in greeting
+        assert "flooring installation" in greeting.lower()
+        assert "scheduling" in greeting.lower()
         assert "good time" in greeting.lower()
 
     def test_greeting_without_name(self):
@@ -1317,6 +1318,7 @@ class TestOutboundGreeting:
 
         greeting = _generate_outbound_greeting("Jane", "FloorCo", "")
         assert "Jane" in greeting
+        assert "scheduling" in greeting.lower()
         assert "upcoming project" in greeting.lower()
 
 

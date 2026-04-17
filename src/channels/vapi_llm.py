@@ -11,13 +11,11 @@ AFTER:  User → Vapi STT → POST /vapi/chat/completions → Our Claude → SSE
 import asyncio
 import json
 import logging
-import random
 import re
 import time
 import uuid
-from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from auth.context import AuthContext
@@ -231,29 +229,25 @@ def _extract_last_user_message(messages: list[dict]) -> str:
     "/chat/completions",
     summary="Vapi Custom LLM endpoint",
 )
-async def vapi_chat_completions(request: Request, secret: str = Query("")):
+async def vapi_chat_completions(request: Request):
     """Vapi Custom LLM — streams OpenAI-compatible SSE responses.
 
     Replaces GPT-4o-mini for authenticated customer calls.  Our Bedrock Claude
     handles all reasoning via the AgentSquad orchestrator, producing the same
     quality as web chat.
     """
-    # Validate secret query parameter (Vapi doesn't send x-vapi-secret to Custom LLM URLs)
-    # Vapi URL-encodes the query parameter value, so decode it before comparing
+    # Vapi sends the API key via Authorization header when a Custom LLM
+    # credential is configured (created via POST /credential with provider=custom-llm).
     expected = get_secrets().vapi_api_key
-    decoded_secret = unquote(secret) if secret else ""
-    logger.info(
-        "Custom LLM auth: raw_len=%d decoded_len=%d expected_len=%d match=%s",
-        len(secret),
-        len(decoded_secret),
-        len(expected),
-        decoded_secret == expected,
-    )
-    if not expected or not decoded_secret or decoded_secret != expected:
+    auth_header = request.headers.get("authorization", "")
+    # Vapi sends "Bearer <key>" — extract the key part
+    provided_key = auth_header.removeprefix("Bearer ").strip() if auth_header else ""
+    if not expected or not provided_key or provided_key != expected:
         logger.warning(
-            "Custom LLM auth FAILED: decoded_preview=%s expected_preview=%s",
-            repr(decoded_secret[:8]) if decoded_secret else "(empty)",
-            repr(expected[:8]) if expected else "(empty)",
+            "Custom LLM auth FAILED: header_present=%s key_len=%d expected_len=%d",
+            bool(auth_header),
+            len(provided_key),
+            len(expected),
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
 

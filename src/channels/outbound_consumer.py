@@ -16,6 +16,7 @@ Flow per message:
 import asyncio
 import json
 import logging
+import re
 
 import boto3
 
@@ -57,11 +58,24 @@ def _get_webhook_url() -> str:
     return _WEBHOOK_URLS.get(env, _WEBHOOK_URLS["dev"])
 
 
+def _normalize_e164(phone: str) -> str:
+    """Normalize a phone number to E.164 format (+1XXXXXXXXXX)."""
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if digits:
+        return f"+{digits}"
+    return ""
+
+
 def _extract_pf_payload(body: dict) -> dict:
     """Extract fields from PF backend nested payload format.
 
     PF sends: customer.primary_phone, customer.first_name/last_name,
-    tenant_info.category/type.  Used by both SQS consumer and trigger endpoint.
+    tenant_info.category/type, tenant_info.tenant_vapi_phone_number.
+    Used by both SQS consumer and trigger endpoint.
     """
     customer_obj = body.get("customer", {})
     tenant_info = body.get("tenant_info", {})
@@ -81,12 +95,23 @@ def _extract_pf_payload(body: dict) -> dict:
     if not vapi_phone_id:
         vapi_phone_id = get_settings().outbound_vapi_phone_id
 
+    # customer.primary_phone = to_phone (who to call)
+    customer_phone = _normalize_e164(customer_obj.get("primary_phone", ""))
+
+    # tenant_vapi_phone_number = from_phone (caller ID / Vapi number to call from)
+    # PF sends this as an array — take the first element
+    tenant_from = tenant_info.get("tenant_vapi_phone_number", "")
+    if isinstance(tenant_from, list):
+        tenant_from = tenant_from[0] if tenant_from else ""
+    from_phone = _normalize_e164(tenant_from)
+
     return {
-        "customer_phone": customer_obj.get("primary_phone", ""),
+        "customer_phone": customer_phone,
         "customer_phone_alt": customer_obj.get("alternate_phone", ""),
-        "project_id": body.get("project_id", ""),
-        "client_id": body.get("client_id", ""),
-        "customer_id": customer_obj.get("customer_id", "") or body.get("customer_id", ""),
+        "from_phone": from_phone,
+        "project_id": str(body.get("project_id", "")),
+        "client_id": str(body.get("client_id", "")),
+        "customer_id": str(customer_obj.get("customer_id", "") or body.get("customer_id", "")),
         "customer_name": f"{first} {last}".strip(),
         "project_type": project_type,
         "vapi_phone_number_id": vapi_phone_id,
@@ -115,8 +140,16 @@ def _build_assistant_for_call(call_data: dict) -> tuple[dict, dict | None]:
 
     customer_name = call_data.get("customer_name", "")
     client_name = call_data.get("client_name", "ProjectsForce")
-    project_type = call_data.get("project_type", "")
     support_number = (call_data.get("auth_creds") or {}).get("support_number", "")
+
+    # Use actual project type from prefetched data (e.g., "Flooring Installation")
+    # rather than SQS tenant_info metadata (which gives "project update")
+    prefetched_project = (call_data.get("prefetched") or {}).get("project", {})
+    project_type = (
+        prefetched_project.get("projectType", "")
+        or prefetched_project.get("category", "")
+        or call_data.get("project_type", "")
+    )
 
     greeting = _generate_outbound_greeting(
         customer_name=customer_name,
@@ -316,6 +349,7 @@ async def _process_outbound_message(
     customer_name = extracted["customer_name"]
     project_type = extracted["project_type"]
     vapi_phone_number_id = extracted["vapi_phone_number_id"]
+    from_phone = extracted["from_phone"]
 
     if not customer_phone or not project_id:
         logger.error(
@@ -326,13 +360,14 @@ async def _process_outbound_message(
         return
 
     logger.info(
-        "Processing outbound call: project=%s phone=***%s client=%s",
-        project_id, customer_phone[-4:], client_id,
+        "Processing outbound call: project=%s phone=***%s client=%s from=***%s",
+        project_id, customer_phone[-4:], client_id, from_phone[-4:] if from_phone else "default",
     )
 
     # Step 1: Authenticate customer via phone-call-login
-    # Pass system phone as to_phone (PF API requires it for validation)
-    system_phone = get_settings().vapi_phone_number
+    # from_phone (tenant Vapi number) is the to_phone in PF auth API;
+    # falls back to config vapi_phone_number if not provided
+    system_phone = from_phone or get_settings().vapi_phone_number
     try:
         creds = await get_or_authenticate(customer_phone, system_phone)
     except AuthenticationError:

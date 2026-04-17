@@ -16,8 +16,6 @@ import logging
 import re
 import time
 import uuid
-from urllib.parse import quote
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from auth.context import AuthContext
@@ -687,7 +685,7 @@ def _build_custom_llm_assistant_config(
         "model": {
             "provider": "custom-llm",
             "model": "scheduling-agent",
-            "url": f"{_get_base_url()}/vapi/chat/completions?secret={quote(server_secret, safe='')}",
+            "url": f"{_get_base_url()}/vapi/chat/completions",
             "metadataSendMode": "variable",
             "messages": [
                 {"role": "system", "content": system_content},
@@ -765,8 +763,15 @@ async def _handle_outbound_assistant_request(
     webhook_secret = get_secrets().vapi_api_key
     customer_name = outbound.get("customer_name", "")
     client_name = outbound.get("client_name", "ProjectsForce")
-    project_type = outbound.get("project_type", "")
     support_number = (outbound.get("auth_creds") or {}).get("support_number", "")
+
+    # Use actual project type from prefetched data (e.g., "Flooring Installation")
+    prefetched_project = (outbound.get("prefetched") or {}).get("project", {})
+    project_type = (
+        prefetched_project.get("projectType", "")
+        or prefetched_project.get("category", "")
+        or outbound.get("project_type", "")
+    )
 
     # Office hours
     office_hours = (outbound.get("auth_creds") or {}).get("office_hours", [])
@@ -794,9 +799,9 @@ def _generate_outbound_greeting(
 
     project_part = ""
     if project_type:
-        project_part = f" I'm calling about your {project_type} project."
+        project_part = f" I'm calling about scheduling your {project_type.lower()}."
     else:
-        project_part = " I'm calling about your upcoming project."
+        project_part = " I'm calling about scheduling your upcoming project."
 
     return (
         f'<break time="2000ms"/> {name_part} <break time="300ms"/> '

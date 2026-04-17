@@ -760,7 +760,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
             logger.exception("Failed to get reschedule available dates")
-            return f"Sorry, I couldn't check available dates for rescheduling. Error: {exc}"
+            return "Sorry, I couldn't check available dates for rescheduling. Please try again later."
     else:
         url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
         log_curl("GET", url, headers)
@@ -775,6 +775,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
                 if any(phrase in error_body for phrase in (
                     "already requested", "already scheduled",
                     "already contains a technician", "technician already assigned",
+                    "not allowed",
                 )):
                     logger.info("Project %s is already scheduled (API 400)", project_id)
                     result = {
@@ -792,7 +793,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
             logger.exception("Failed to get available dates")
-            return f"Sorry, I couldn't check available dates. Error: {exc}"
+            return "Sorry, I couldn't check available dates right now. Please try again later."
 
     dates = data.get("dates", data.get("availableDates", []))
     api_request_id = data.get("request_id")
@@ -928,7 +929,7 @@ async def get_time_slots(project_id: str, date: str) -> str:
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
             logger.exception("Failed to get reschedule time slots")
-            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Error: {exc}"
+            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Please try again later."
     else:
         # Get request_id from cache (populated by get_available_dates)
         request_id = _request_id_by_project.get(project_id)
@@ -951,7 +952,7 @@ async def get_time_slots(project_id: str, date: str) -> str:
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
             logger.exception("Failed to get time slots")
-            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Error: {exc}"
+            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Please try again later."
 
     slots = data.get("slots", data.get("timeSlots", []))
     if not slots:
@@ -1037,7 +1038,7 @@ async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwa
             return "This time slot has already been booked or there's a conflict. Please choose a different time."
         if status_code == 401:
             return "Authentication expired. Please log in again."
-        return f"Sorry, I couldn't schedule the appointment. Error: {exc}"
+        return "Sorry, I couldn't schedule the appointment. Please try again later."
 
     # Log the full response for debugging
     logger.info("Confirm appointment response body: %s", json.dumps(data, default=str))
@@ -1284,7 +1285,7 @@ async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.exception("Failed to cancel appointment")
-        return f"Sorry, I couldn't cancel the appointment. Error: {exc}"
+        return "Sorry, I couldn't cancel the appointment. Please try again later."
 
     # Invalidate project cache — status changed
     _invalidate_projects()
@@ -1368,7 +1369,7 @@ async def add_note(project_id: str, note_text: str) -> str:
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.exception("Failed to add note")
-        return f"Sorry, I couldn't add the note. Error: {exc}"
+        return "Sorry, I couldn't add the note. Please try again later."
 
     pnum = _get_project_number(project_id)
     return f"Note added successfully to project {pnum}."
@@ -1391,7 +1392,7 @@ async def list_notes(project_id: str) -> str:
         data = response.json()
     except httpx.HTTPError as exc:
         logger.exception("Failed to list notes")
-        return f"Sorry, I couldn't fetch notes. Error: {exc}"
+        return "Sorry, I couldn't fetch notes. Please try again later."
 
     notes = data if isinstance(data, list) else data.get("notes", data.get("data", []))
     if not notes:
@@ -1544,7 +1545,7 @@ async def get_business_hours() -> str:
         data = _unwrap(response.json())
     except httpx.HTTPError as exc:
         logger.exception("Failed to get business hours")
-        return f"Sorry, I couldn't fetch business hours. Error: {exc}"
+        return "Sorry, I couldn't fetch business hours. Please try again later."
 
     return json.dumps(data, indent=2, default=str)
 

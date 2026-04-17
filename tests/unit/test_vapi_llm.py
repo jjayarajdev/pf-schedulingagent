@@ -31,9 +31,9 @@ def _vapi_headers():
     return {"x-vapi-secret": "test-vapi-secret-123"}
 
 
-def _secret_param():
-    """Query parameter dict for Custom LLM auth."""
-    return {"secret": "test-vapi-secret-123"}
+def _auth_headers():
+    """Authorization header for Custom LLM auth (Vapi sends Bearer token)."""
+    return {"Authorization": "Bearer test-vapi-secret-123"}
 
 
 def _chat_completions_body(
@@ -98,7 +98,7 @@ class TestAuth:
         resp = client.post(
             "/vapi/chat/completions",
             json=_chat_completions_body(),
-            params={"secret": "wrong"},
+            headers={"Authorization": "Bearer wrong-key"},
         )
         assert resp.status_code == 401
 
@@ -115,7 +115,7 @@ class TestAuth:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
         assert resp.status_code == 200
 
@@ -165,7 +165,7 @@ class TestMessageExtraction:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         assert resp.status_code == 200
@@ -191,7 +191,7 @@ class TestSSEFormat:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         chunks = _parse_sse_chunks(resp.text)
@@ -218,7 +218,7 @@ class TestSSEFormat:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         chunks = _parse_sse_chunks(resp.text)
@@ -241,7 +241,7 @@ class TestSSEFormat:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         assert "data: [DONE]" in resp.text
@@ -259,7 +259,7 @@ class TestSSEFormat:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         chunks = _parse_sse_chunks(resp.text)
@@ -291,7 +291,7 @@ class TestOrchestratorIntegration:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         mock_orch.route_request.assert_called_once()
@@ -313,7 +313,7 @@ class TestOrchestratorIntegration:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         # Extract all content from chunks (skip filler and done)
@@ -373,7 +373,7 @@ class TestAuthContext:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         # AuthContext.set was called with the cached creds
@@ -398,7 +398,7 @@ class TestAuthContext:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         mock_logger.warning.assert_any_call("No cached auth for call_id=%s", "test-call-123")
@@ -429,7 +429,7 @@ class TestTransferDetection:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         chunks = _parse_sse_chunks(resp.text)
@@ -463,7 +463,7 @@ class TestTransferDetection:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         chunks = _parse_sse_chunks(resp.text)
@@ -500,7 +500,7 @@ class TestGuardrails:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         # route_request should have been called twice (original + retry)
@@ -531,7 +531,7 @@ class TestGuardrails:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         assert mock_orch.route_request.call_count == 2
@@ -555,7 +555,7 @@ class TestErrorHandling:
             resp = client.post(
                 "/vapi/chat/completions",
                 json=body,
-                params=_secret_param(),
+                headers=_auth_headers(),
             )
 
         assert resp.status_code == 200
@@ -620,6 +620,8 @@ class TestCustomLLMConfig:
         assert model["provider"] == "custom-llm"
         assert model["model"] == "scheduling-agent"
         assert "/vapi/chat/completions" in model["url"]
+        # Auth is via Vapi credential (Authorization header), not query param
+        assert "?secret=" not in model["url"]
 
     def test_config_has_transfer_tool_only(self):
         from channels.vapi import _build_custom_llm_assistant_config
