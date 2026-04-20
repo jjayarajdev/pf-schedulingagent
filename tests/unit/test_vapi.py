@@ -900,11 +900,11 @@ class TestCallSummaryNotes:
         mock_get_auth.assert_called_once()
 
     @patch("channels.vapi.get_cached_auth", return_value=None)
-    @patch("channels.vapi.clear_session_projects")
+    @patch("channels.vapi.cleanup_call_caches")
     def test_end_of_call_clears_session_when_no_creds(
-        self, mock_clear, mock_get_auth, client,
+        self, mock_cleanup, mock_get_auth, client,
     ):
-        """When no cached creds, session projects are cleaned up."""
+        """When no cached creds, call caches are cleaned up."""
         resp = client.post(
             "/vapi/webhook",
             json={
@@ -922,10 +922,10 @@ class TestCallSummaryNotes:
             headers=_vapi_headers(),
         )
         assert resp.status_code == 200
-        mock_clear.assert_called_with("vapi-call-notes-2")
+        mock_cleanup.assert_called_with("vapi-call-notes-2")
 
-    @patch("channels.vapi.clear_session_projects")
-    def test_end_of_call_no_summary_clears_session(self, mock_clear, client):
+    @patch("channels.vapi.cleanup_call_caches")
+    def test_end_of_call_no_summary_clears_session(self, mock_cleanup, client):
         """No summary → no note posting, just cleanup."""
         resp = client.post(
             "/vapi/webhook",
@@ -940,7 +940,7 @@ class TestCallSummaryNotes:
             headers=_vapi_headers(),
         )
         assert resp.status_code == 200
-        mock_clear.assert_called_with("vapi-call-notes-3")
+        mock_cleanup.assert_called_with("vapi-call-notes-3")
 
 
 class TestProjectTracking:

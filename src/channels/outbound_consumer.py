@@ -408,6 +408,33 @@ async def _process_outbound_message(
         client_id=resolved_client_id,
     )
 
+    # ── Gate: skip call if project is already scheduled or has no dates ──
+    dates_data = prefetched.get("dates", {})
+    if dates_data.get("already_scheduled"):
+        logger.info(
+            "Skipping outbound call — project %s is already scheduled",
+            project_id,
+        )
+        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        return
+
+    if not dates_data.get("available_dates"):
+        logger.warning(
+            "Skipping outbound call — no dates available for project %s",
+            project_id,
+        )
+        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        return
+
+    project_status = (prefetched.get("project", {}).get("status") or "").lower()
+    if project_status in ("completed", "cancelled", "closed", "scheduled"):
+        logger.info(
+            "Skipping outbound call — project %s status: %s",
+            project_id, project_status,
+        )
+        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        return
+
     # Step 2: Create outbound call record (status=pending)
     call_data = {
         "project_id": project_id,
@@ -605,6 +632,14 @@ async def process_trigger(request_data: dict) -> dict:
         customer_id=customer_id,
         client_id=resolved_client_id,
     )
+
+    # ── Gate: skip call if project is already scheduled or has no dates ──
+    dates_data = prefetched.get("dates", {})
+    if dates_data.get("already_scheduled"):
+        return {"status": "skipped", "reason": "already_scheduled", "project_id": project_id}
+
+    if not dates_data.get("available_dates"):
+        return {"status": "skipped", "reason": "no_dates_available", "project_id": project_id}
 
     call_data = {
         "project_id": project_id,

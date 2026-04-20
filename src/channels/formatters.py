@@ -10,6 +10,35 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# ── Ordinal number to words (for TTS clarity) ─────────────────────────────
+_ORDINALS = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth",
+    15: "fifteenth", 16: "sixteenth", 17: "seventeenth", 18: "eighteenth",
+    19: "nineteenth", 20: "twentieth", 21: "twenty-first", 22: "twenty-second",
+    23: "twenty-third", 24: "twenty-fourth", 25: "twenty-fifth",
+    26: "twenty-sixth", 27: "twenty-seventh", 28: "twenty-eighth",
+    29: "twenty-ninth", 30: "thirtieth", 31: "thirty-first",
+}
+
+_ORDINAL_SUFFIX_RE = re.compile(r"\b(\d{1,2})(st|nd|rd|th)\b")
+
+
+def _ordinal_to_words(match: re.Match) -> str:
+    """Convert '21st' → 'twenty-first', '3rd' → 'third', etc."""
+    num = int(match.group(1))
+    return _ORDINALS.get(num, match.group(0))
+
+
+# Years that TTS mangles — spoken form for voice channel
+_YEAR_WORDS = {
+    "2025": "twenty twenty-five",
+    "2026": "twenty twenty-six",
+    "2027": "twenty twenty-seven",
+    "2028": "twenty twenty-eight",
+}
+
 # ============================================================================
 # EMOJI TO TEXT MAPPINGS
 # Replace common emojis with text equivalents to preserve meaning
@@ -283,6 +312,13 @@ def format_for_voice(text: str) -> str:
     text = _RE_INLINE_CODE.sub(r"\1", text)
     # Clean up excessive newlines
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # ── TTS pronunciation fixes ──────────────────────────────────────
+    # Convert ordinal dates to words: "April 21st" → "April twenty-first"
+    text = _ORDINAL_SUFFIX_RE.sub(_ordinal_to_words, text)
+    # Convert years to spoken form: "2026" → "twenty twenty-six"
+    for year, words in _YEAR_WORDS.items():
+        text = text.replace(year, words)
 
     return text.strip()
 

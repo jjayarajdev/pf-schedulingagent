@@ -45,7 +45,12 @@ from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
 from tools.scheduling import add_note as sched_add_note
 from tools.scheduling import (
+    _reschedule_pending,
+    cleanup_call_caches,
+    clear_reschedule_old_appointment,
     clear_session_projects,
+    get_reschedule_old_appointment,
+    get_session_projects,
     post_call_summary_notes,
     post_store_call_notes,
     reset_action_flags,
@@ -355,9 +360,15 @@ async def _handle_assistant_request(body: dict) -> dict:
     hours_context = _build_office_hours_context(office_hours, tenant_timezone)
 
     if is_store_caller:
+        if not support_number:
+            logger.warning(
+                "No support_number for store caller — transfer disabled: "
+                "call_id=%s client=%s to_phone=***%s",
+                call_id, client_name, to_phone[-4:] if to_phone else "none",
+            )
         _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False, "support_number": support_number}
         greeting = _generate_store_greeting(client_name)
-        logger.info("Vapi unknown caller greeting: call_id=%s client=%s office_open=%s", call_id, client_name, hours_context.get("is_open"))
+        logger.info("Vapi unknown caller greeting: call_id=%s client=%s office_open=%s has_transfer=%s", call_id, client_name, hours_context.get("is_open"), bool(support_number))
         return {"assistant": _build_store_assistant_config(
             greeting, webhook_secret, client_name, support_number, hours_context,
         )}
@@ -1306,6 +1317,8 @@ def _build_store_assistant_config(
     for office transfers when a support number is available.
     """
     name = client_name or "ProjectsForce"
+    # TTS reads "ProjectsForce" as "Project Source" — use spaced version for speech
+    tts_name = name.replace("ProjectsForce", "Projects Force")
     has_transfer = bool(support_number)
     server_config: dict = {
         "url": _get_webhook_url(),
@@ -1328,18 +1341,18 @@ def _build_store_assistant_config(
     else:
         customer_instruction = (
             f"say 'I don't have your account on file right now. "
-            f"Someone from {name} will reach out to you regarding this. "
+            f"Our team at {tts_name} will reach out to you shortly. "
             "Is there anything else I can help you with?' "
             "Then end the call gracefully."
         )
         non_project_instruction = (
-            f"say 'Someone from {name} will reach out to you regarding this. "
+            f"say 'Our team at {tts_name} will reach out to you shortly. "
             "Is there anything else I can help you with?' "
             "Then end the call gracefully."
         )
 
     system_prompt = (
-        f"You are J, a friendly phone assistant for {name} "
+        f"You are J, a friendly phone assistant for {tts_name} "
         "— a home improvement scheduling service.\n\n"
         "You do NOT know who this caller is. Do NOT assume they are a "
         "retailer or a customer. You must qualify them first.\n\n"
@@ -1352,9 +1365,18 @@ def _build_store_assistant_config(
         "Home Depot, vendor, supplier, dealer, shop.\n"
         "   - Recognize these as CUSTOMER: customer, homeowner, "
         "I'm the customer, it's my project, I placed the order.\n"
-        "3. If RETAILER: ask for a project number or PO number "
-        "(do NOT ask for a customer name). Then call ask_store_bot "
-        "with lookup_type and lookup_value.\n"
+        "3. If RETAILER: ask for a project number or PO number. "
+        "ONLY accept a project number or PO number — nothing else. "
+        "Do NOT accept customer names, addresses, phone numbers, "
+        "project descriptions, or any other identifier. "
+        "If they give something else, say: 'I can only look up projects "
+        "by project number or PO number. Do you have either of those?' "
+        "Once they give a valid number, call ask_store_bot "
+        "with ALL THREE fields: question (what they said), "
+        "lookup_type ('project_number' or 'po_number'), and "
+        "lookup_value (the number they gave). "
+        "ALL THREE are REQUIRED — omitting lookup_type "
+        "or lookup_value will cause authentication to FAIL.\n"
         f"4. If CUSTOMER: {customer_instruction}\n"
         "5. If their request is NOT project-related (e.g., job inquiry, "
         f"sales call, wrong number): {non_project_instruction}\n\n"
@@ -1369,33 +1391,62 @@ def _build_store_assistant_config(
         f"{non_project_instruction}\n\n"
         "## AFTER RETAILER AUTHENTICATION\n"
         "Once authenticated via ask_store_bot, follow these rules:\n"
+        "- The first ask_store_bot response includes project info. "
+        "Present that info to the caller immediately, then ask "
+        "'Is there anything else you need?'\n"
         "- Use ask_store_bot for ALL subsequent queries. "
-        "You do NOT need lookup_type/lookup_value again.\n"
+        "The system remembers the project — just pass the caller's words "
+        "in the question field.\n"
         "- Pass the user's EXACT words in the \"question\" field. "
         "Do NOT rephrase.\n"
         "- NEVER share customer names, phone numbers, "
         "email addresses, or street addresses. "
-        "Only share project status, scheduled dates, technician names, "
-        "project numbers, and PO numbers.\n"
+        "Only share project status, scheduled dates, and technician names.\n"
         "- NEVER offer to schedule, reschedule, or cancel appointments. "
         "Retailer callers can ONLY check project status. If they ask, "
         "say: 'Scheduling is not available for retailer calls. "
-        "Please have the customer call us directly.'\n"
-        "- NEVER read out project numbers or IDs — they are long and "
-        "unintelligible. Identify projects by category/type and status.\n\n"
+        "Please have the customer call us directly.'\n\n"
+        "## CRITICAL: Never Read Numbers Aloud\n"
+        "NEVER read project numbers, order numbers, IDs, or PO numbers "
+        "aloud — they are long and unintelligible over the phone. "
+        "Instead say 'your flooring installation' or 'your window measurement'. "
+        "If the caller has one project, just say 'your project'.\n\n"
+        "## CRITICAL: NEVER Fabricate Information\n"
+        "ONLY share information that ask_store_bot returned in its response. "
+        "If the tool returns a vague answer like 'provide a project number' or "
+        "'I need more information', tell the caller exactly that — do NOT "
+        "make up an answer. NEVER invent project status, scheduled dates, "
+        "technician names, addresses, or any other details. "
+        "If you do not have data from the tool, say "
+        "'I don't have that information right now.'\n\n"
         "## GENERAL RULES\n"
         "- Keep responses concise — no bullet points, no markdown.\n"
-        "- Before calling a tool, say a brief natural filler. "
-        "Vary your phrasing — rotate between: "
-        '"Give me one moment while I check that", '
-        '"Let me pull that up", "One second", '
-        '"Let me take a look". '
-        "Do NOT repeat the same phrase back to back. "
-        'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
+        "- Say 'One moment.' ONLY when the caller asks a NEW question "
+        "that requires a tool call. Do NOT say any filler when the caller "
+        "is just replying to your question. "
+        "NEVER say 'Hold on', 'Wait', 'Hang on', 'Just a sec', "
+        "'Give me a moment', 'Let me check', 'Let me pull that up', "
+        "'One second', or 'Let me take a look'. "
+        "The ONLY allowed filler is 'One moment.' — nothing else.\n"
         "- NEVER say 'I'm transferring you now' unless you are actually "
         "invoking the transferCall tool in the same turn. If you cannot "
         "transfer, do NOT mention transferring at all.\n"
-        "- If the caller says 'just a second', 'hold on', 'let me check', "
+        + (
+            ""
+            if has_transfer
+            else (
+                "## CRITICAL: No Transfer Capability\n"
+                "You do NOT have a transferCall tool. You CANNOT transfer calls. "
+                "NEVER say 'I'm transferring you', 'Let me transfer you', "
+                "'Let me connect you', or anything about transferring. "
+                "You will ONLY hang up on the caller if you say these words. "
+                "Instead, when you cannot help, say: "
+                f"'Our team at {tts_name} will reach out to you shortly. "
+                "Is there anything else I can help you with?' "
+                "If they say no, end the call politely.\n"
+            )
+        )
+        + "- If the caller says 'just a second', 'hold on', 'let me check', "
         "or similar — say 'Take your time, I'll be right here' and wait "
         "patiently. Do NOT end the call or rush them.\n"
         "- NEVER ask clarifying questions before calling the tool. "
@@ -1426,13 +1477,13 @@ def _build_store_assistant_config(
                     "function": {
                         "name": "ask_store_bot",
                         "description": (
-                            "Use for retailer callers ONLY. On first call, include "
-                            "lookup_type and lookup_value to authenticate. After that, "
-                            "only question is needed."
+                            "Use for retailer callers ONLY. You MUST always include "
+                            "all three parameters. Auth FAILS without lookup_type "
+                            "and lookup_value."
                         ),
                         "parameters": {
                             "type": "object",
-                            "required": ["question"],
+                            "required": ["question", "lookup_type", "lookup_value"],
                             "properties": {
                                 "question": {
                                     "type": "string",
@@ -1447,14 +1498,13 @@ def _build_store_assistant_config(
                                         "po_number",
                                     ],
                                     "description": (
-                                        "Type of lookup value. Required on first call."
+                                        "Type of identifier. Use 'project_number' or 'po_number'."
                                     ),
                                 },
                                 "lookup_value": {
                                     "type": "string",
                                     "description": (
-                                        "The project number or PO number. "
-                                        "Required on first call."
+                                        "The project number or PO number the caller provided."
                                     ),
                                 },
                             },
@@ -1472,15 +1522,15 @@ def _build_store_assistant_config(
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            f"Thank you for calling {name}. Have a great day!"
+            f"Thank you for calling {tts_name}. Have a great day!"
         ),
         "endCallPhrases": [
-            "goodbye", "bye", "bye bye", "bye now",
+            "goodbye", "bye bye", "bye now",
             "talk to you later", "have a great day",
             "have a good day",
         ],
         "endCallFunctionEnabled": True,
-        "silenceTimeoutSeconds": 45,
+        "silenceTimeoutSeconds": 60,
         "maxDurationSeconds": 600,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -1670,6 +1720,21 @@ async def _handle_server_event(body: dict) -> dict:
             )
             return {"status": "ok"}
 
+        # ── Incomplete reschedule detection ────────────────────────
+        session_id_check = f"vapi-{call_id}"
+        session_projects = get_session_projects(session_id_check)
+        for pid in list(session_projects.keys()):
+            if pid in _reschedule_pending:
+                old_appt = get_reschedule_old_appointment(pid)
+                logger.error(
+                    "INCOMPLETE RESCHEDULE: project=%s old_appointment=%s "
+                    "call_id=%s — appointment was cancelled but new one "
+                    "was never booked. Manual recovery required.",
+                    pid, old_appt, call_id,
+                )
+                _reschedule_pending.discard(pid)
+                clear_reschedule_old_appointment(pid)
+
         # ── Inbound call end-of-call handling (existing) ────────────
         # Post call summary notes to discussed projects (fire-and-forget)
         session_id = f"vapi-{call_id}"
@@ -1713,11 +1778,9 @@ async def _handle_server_event(body: dict) -> dict:
                         "No cached creds for call notes (call_id=%s phone=***%s)",
                         call_id, phone_number[-4:] if phone_number else "none",
                     )
-                    clear_session_projects(session_id)
-            else:
-                clear_session_projects(session_id)
 
-        # Clean up store session + call auth cache
+        # Clean up all caches for this call
+        cleanup_call_caches(session_id)
         _store_sessions.pop(session_key, None)
         _call_auth_cache.pop(call_id, None)
     elif event_type == "status-update":

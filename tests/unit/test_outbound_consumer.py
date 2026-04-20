@@ -44,7 +44,7 @@ def _make_sqs_message(body: dict, message_id: str = "msg-1") -> dict:
 
 class TestProcessOutboundMessage:
     @pytest.mark.asyncio
-    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={})
+    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={"dates": {"available_dates": ["2026-04-21"]}, "project": {"status": "Ready to Schedule"}})
     @patch("channels.outbound_consumer.get_settings")
     @patch("channels.outbound_consumer.cache_active_call")
     @patch("channels.outbound_consumer.update_outbound_call", new_callable=AsyncMock)
@@ -94,7 +94,7 @@ class TestProcessOutboundMessage:
         mock_sqs.delete_message.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={})
+    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={"dates": {"available_dates": ["2026-04-21"]}, "project": {"status": "Ready to Schedule"}})
     @patch("channels.outbound_consumer.get_settings")
     @patch("channels.outbound_consumer.cache_active_call")
     @patch("channels.outbound_consumer.update_outbound_call", new_callable=AsyncMock)
@@ -272,7 +272,7 @@ class TestRetryOutboundCall:
 
 class TestProcessTrigger:
     @pytest.mark.asyncio
-    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={})
+    @patch("channels.outbound_consumer._prefetch_project_data", new_callable=AsyncMock, return_value={"dates": {"available_dates": ["2026-04-21"]}, "project": {"status": "Ready to Schedule"}})
     @patch("channels.outbound_consumer.get_settings")
     @patch("channels.outbound_consumer.cache_active_call")
     @patch("channels.outbound_consumer.update_outbound_call", new_callable=AsyncMock)

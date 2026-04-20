@@ -50,6 +50,10 @@ _request_id_by_project: dict[str, int] = {}
 # already cancelled the old appointment.
 _reschedule_pending: set[str] = set()  # project_ids with reschedule in progress
 
+# Cache of old appointment details for recovery if reschedule is incomplete.
+# project_id → {"date": "...", "time": "...", "project_type": "...", "project_number": "..."}
+_reschedule_old_appointment: dict[str, dict] = {}
+
 # Per-request caches for server-side injection — the LLM truncates large arrays,
 # so chat.py injects the full data from these caches.  ContextVar ensures each
 # concurrent request gets its own value (no cross-customer data leakage).
@@ -65,6 +69,34 @@ def get_last_weather_dates() -> list:
 def get_last_projects_list() -> list:
     """Return the last list_projects result for server-side injection."""
     return _last_projects_list.get()
+
+
+def get_reschedule_old_appointment(project_id: str) -> dict | None:
+    """Return cached old appointment details for incomplete reschedule detection."""
+    return _reschedule_old_appointment.get(project_id)
+
+
+def clear_reschedule_old_appointment(project_id: str) -> None:
+    """Clear cached old appointment after successful reschedule or end-of-call."""
+    _reschedule_old_appointment.pop(project_id, None)
+
+
+def cleanup_call_caches(session_id: str) -> None:
+    """Clean up all module-level caches for a completed call.
+
+    Called from the end-of-call handler to free memory and prevent
+    stale data from leaking into future calls on the same process.
+    """
+    # Clear session project tracking
+    projects = _session_projects.pop(session_id, {})
+
+    # Clear reschedule state for any projects discussed in this call
+    for pid in projects:
+        _reschedule_pending.discard(pid)
+        _reschedule_old_appointment.pop(pid, None)
+        _request_id_by_project.pop(pid, None)
+
+    logger.debug("Cleaned up call caches: session=%s projects=%s", session_id, list(projects.keys()))
 
 # Lock to prevent concurrent API fetches for the same customer
 _load_lock = asyncio.Lock()
@@ -759,7 +791,13 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             response.raise_for_status()
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
-            logger.exception("Failed to get reschedule available dates")
+            resp = getattr(exc, "response", None)
+            logger.exception(
+                "Failed to get reschedule available dates: project=%s url=%s status=%s body=%s",
+                project_id, url,
+                resp.status_code if resp is not None else "N/A",
+                resp.text[:500] if resp is not None and resp.text else "N/A",
+            )
             return "Sorry, I couldn't check available dates for rescheduling. Please try again later."
     else:
         url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
@@ -792,7 +830,13 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             response.raise_for_status()
             data = _unwrap(response.json())
         except httpx.HTTPError as exc:
-            logger.exception("Failed to get available dates")
+            resp = getattr(exc, "response", None)
+            logger.exception(
+                "Failed to get available dates: project=%s url=%s status=%s body=%s",
+                project_id, url,
+                resp.status_code if resp is not None else "N/A",
+                resp.text[:500] if resp is not None and resp.text else "N/A",
+            )
             return "Sorry, I couldn't check available dates right now. Please try again later."
 
     dates = data.get("dates", data.get("availableDates", []))
@@ -815,6 +859,14 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             logger.exception("Failed on expanded date search")
 
     if not dates:
+        project = _get_cached_project(project_id)
+        logger.warning(
+            "No dates returned after retry: project=%s project_type=%s url=%s response_keys=%s",
+            project_id,
+            project.get("projectType", "unknown") if project else "unknown",
+            url,
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        )
         return f"No available dates found between {start_date} and {end_date}. Try a different date range."
 
     # Weather enrichment for outdoor projects
@@ -1110,6 +1162,22 @@ async def _reschedule_appointment_impl(project_id: str) -> str:
         can_reschedule, reason = ProjectStatusRules.can_reschedule(status, has_date)
         if not can_reschedule:
             return reason
+
+    # Cache old appointment details for recovery if reschedule flow is incomplete
+    old_date = project.get("scheduledDate", "")
+    old_time = project.get("scheduledTime", "")
+    project_type = project.get("projectType", project.get("category", ""))
+    if old_date:
+        _reschedule_old_appointment[project_id] = {
+            "date": old_date,
+            "time": old_time,
+            "project_type": project_type,
+            "project_number": project.get("projectNumber", project_id),
+        }
+        logger.info(
+            "Cached old appointment before reschedule: project=%s date=%s time=%s",
+            project_id, old_date, old_time,
+        )
 
     # PF's reschedule endpoint handles cancel + new slots atomically.
     # Do NOT call cancel_appointment separately — if the customer declines
