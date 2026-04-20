@@ -537,13 +537,13 @@ def _build_assistant_config(
                         "No bullet points, no markdown. "
                         "NEVER read out project numbers or IDs — they are long and unintelligible. "
                         "Instead, identify projects by their category/type and status.\n"
-                        "9. Before calling ask_scheduling_bot, say a brief natural filler. "
-                        "Vary your phrasing — rotate between: "
-                        '"Give me one moment while I check that for you", '
-                        '"Let me pull that up", "One second", '
-                        '"Let me take a look". '
-                        "Do NOT repeat the same phrase back to back. "
-                        'NEVER say "Hold on", "Wait", or "Hang on" — these sound rude.\n'
+                        "9. FILLER RULES: Say 'One moment.' ONLY when the user asks a NEW question "
+                        "that requires a tool call (e.g. 'what are my projects?', 'what dates are available?'). "
+                        "Do NOT say any filler when the user is just replying to your question "
+                        "(e.g. picking a date, saying 'yes', choosing a time slot). "
+                        "NEVER say 'Hold on', 'Wait', 'Hang on', 'Just a sec', 'Give me a moment', "
+                        "'Let me check', 'Let me pull that up', or 'One second'. "
+                        "The ONLY allowed filler is 'One moment.' — nothing else, and only once per tool call.\n"
                         "10. If the tool call fails or times out, say: "
                         '"Let me try that again." and retry once. '
                         "NEVER say 'I'm having trouble looking that up' or fabricate an error "
@@ -1046,8 +1046,17 @@ def _build_outbound_scheduling_config(
     """
     name = client_name or "ProjectsForce"
     customer_name = outbound_call.get("customer_name", "")
-    project_type = outbound_call.get("project_type", "")
     first_name = customer_name.split()[0] if customer_name and customer_name.strip() else "the customer"
+
+    # Resolve actual project type from prefetched data (e.g., "Flooring Installation")
+    # rather than SQS tenant_info metadata (which gives "project update")
+    prefetched = outbound_call.get("prefetched", {})
+    prefetched_project = prefetched.get("project", {})
+    project_type = (
+        prefetched_project.get("projectType", "")
+        or prefetched_project.get("category", "")
+        or outbound_call.get("project_type", "")
+    )
 
     support_speech = ""
     if support_number:
@@ -1061,17 +1070,16 @@ def _build_outbound_scheduling_config(
         server_config["secret"] = server_secret
 
     # Check for pre-fetched data
-    prefetched = outbound_call.get("prefetched", {})
     dates_data = prefetched.get("dates", {})
     has_dates = bool(dates_data.get("available_dates"))
 
     # Build the pre-loaded data section for the prompt
     preloaded_section = ""
     if has_dates:
-        preloaded_section = "\n## PRE-LOADED PROJECT DATA\n"
+        preloaded_section = "\n## PRE-LOADED PROJECT DATA (already fetched — DO NOT call any tool for this)\n"
         preloaded_section += (
-            "You already have the customer's project data. "
-            "Present it directly — no tool call needed to look it up.\n\n"
+            "IMPORTANT: This data is ALREADY loaded. DO NOT call get_available_dates "
+            "or any other tool to look up dates. Present this data DIRECTLY.\n\n"
         )
         preloaded_section += _format_prefetched_dates(dates_data) + "\n"
 
@@ -1079,24 +1087,27 @@ def _build_outbound_scheduling_config(
     if has_dates:
         step3 = (
             "### Step 3 — Scheduling\n"
-            "You already have the available dates from PRE-LOADED DATA above.\n"
-            "- Present dates as a SUMMARY, not a list. Example:\n"
-            "  'We have dates available from [first] through [last]. "
-            "Weather looks [summary]. I'd recommend [best date] — "
-            "it's expected to be [condition] and [temp]. Would that work for you?'\n"
-            "- Do NOT read every date one by one.\n"
-            "- If they agree with the recommendation, proceed to time slots.\n"
+            "CRITICAL: You ALREADY have the dates in PRE-LOADED DATA above. "
+            "DO NOT call get_available_dates — it is NOT available as a tool. "
+            "Present the dates IMMEDIATELY with NO delay and NO filler phrases.\n\n"
+            "**How to present dates (MANDATORY format):**\n"
+            "Say ONE sentence summarizing the range and recommend the best date. Example:\n"
+            "  'We have dates available from Monday the twentieth through "
+            "Friday the twenty-fifth. Weather looks good throughout. "
+            "I'd recommend Tuesday the twenty-first — clear skies and seventy-one degrees. "
+            "Would that work for you?'\n\n"
+            "**Rules:**\n"
+            "- NEVER list dates one by one. Only summarize the range.\n"
+            "- ALWAYS recommend the best weather date.\n"
+            "- Speak dates as words: 'the twenty-first', NOT '21st' or 'April 21'.\n"
+            "- If they agree, call get_time_slots with that date (YYYY-MM-DD format).\n"
             "- If they want a different date, accommodate if it's in the range.\n"
-            "- If they pick a date NOT in the list, say: "
-            "'I'm sorry, that date isn't available. The closest options are [X] and [Y].'\n"
-            "- Once they pick a valid date, call get_time_slots with that date "
-            "(YYYY-MM-DD format).\n"
-            "- Read the time slots: 'I have [X] and [Y]. Which works better?'\n"
-            "- Customer picks a time → SUMMARIZE before booking:\n"
-            "  'Just to confirm — I'll schedule your appointment for [date] "
-            "between [time slot]. Shall I go ahead and book that?'\n"
-            "- Wait for the customer to say YES before calling confirm_appointment.\n"
-            "- The appointment is NOT booked until confirm_appointment returns 'confirmed'.\n"
+            "- If they pick a date NOT in the list: "
+            "'That date isn't available. The closest options are [X] and [Y].'\n"
+            "- Read time slots briefly: 'I have [X] and [Y]. Which works better?'\n"
+            "- Customer picks a time → confirm before booking:\n"
+            "  'I'll schedule that for [day] the [date] at [time]. Sound good?'\n"
+            "- Wait for YES before calling confirm_appointment.\n"
         )
     else:
         step3 = (
@@ -1129,7 +1140,7 @@ def _build_outbound_scheduling_config(
     system_prompt = (
         f"You are J, a friendly and concise phone assistant for {name}.\n\n"
         "## YOUR MISSION\n"
-        f"Schedule {first_name}'s {project_type or 'home improvement'} project. "
+        f"Schedule {first_name}'s {project_type or 'upcoming'} project. "
         "Be natural, brief, and conversational — like a human scheduler.\n"
         + preloaded_section
         + "\n## CALL FLOW\n\n"
@@ -1146,14 +1157,16 @@ def _build_outbound_scheduling_config(
         + "\n"
         "## STYLE RULES\n"
         "- Speak naturally and concisely, like a human scheduler.\n"
+        "- Keep every response to 1-2 sentences MAX. Do not monologue.\n"
         "- Only discuss THIS project ("
         + (project_type or "the one you called about")
         + "). Do NOT mention other projects the customer may have.\n"
         "- Do NOT proactively ask for the installation address. But if the customer "
         "volunteers an address correction, capture it with add_note.\n"
-        "- If a tool call takes time, say ONE short phrase: 'One moment while I "
-        "confirm that.' Do NOT repeat fillers. NEVER say 'Hold on', 'Wait', "
-        "'Hang on', or 'Just a sec'.\n"
+        "- FILLER RULES: When a tool call is running, say 'One moment.' and NOTHING else. "
+        "NEVER say 'Just a sec', 'Give me a moment', 'Hold on', 'Wait', "
+        "'Hang on', 'Let me check', or any other filler. One filler per tool call MAX.\n"
+        "- Speak dates as ordinal words: 'the twenty-first', NOT '21st'.\n"
         "- Call each tool ONCE per action. If the tool already returned "
         "a result, do NOT call it again for the same thing.\n\n"
         "## TOOL RULES\n"
@@ -1179,8 +1192,8 @@ def _build_outbound_scheduling_config(
 
     voicemail_msg = (
         f"Hello {first_name}, this is J from {name}. "
-        f"I'm calling about your {project_type or 'home improvement'} project. "
-        "We'd like to schedule your installation at a convenient time. "
+        f"I'm calling about scheduling your {project_type.lower() if project_type else 'upcoming project'}. "
+        "We'd like to find a convenient time for you. "
     )
     if support_speech:
         voicemail_msg += f"Please call us back at {support_speech}. "

@@ -1354,7 +1354,7 @@ class TestOutboundSchedulingConfig:
 
         assert "voicemailMessage" in config
         assert "Jane" in config["voicemailMessage"]
-        assert "Windows" in config["voicemailMessage"]
+        assert "windows" in config["voicemailMessage"].lower()
 
     def test_config_has_transfer_tool_with_support_number(self):
         from channels.vapi import _build_outbound_scheduling_config
@@ -1441,10 +1441,11 @@ class TestOutboundPrefetchPrompt:
 
         # Step 3 should NOT say "Show available dates"
         assert "Show available dates" not in prompt
-        # Step 3 should say dates are already available
-        assert "already have the available dates" in prompt
-        # Step 3 should instruct summary presentation
-        assert "SUMMARY" in prompt
+        # Step 3 should say dates are already loaded — DO NOT call tool
+        assert "ALREADY have the dates" in prompt
+        assert "DO NOT call get_available_dates" in prompt
+        # Step 3 should instruct summary presentation, not listing
+        assert "NEVER list dates one by one" in prompt
 
     def test_prefetched_weather_dates_in_prompt(self):
         from channels.vapi import _build_outbound_scheduling_config
@@ -1531,8 +1532,8 @@ class TestOutboundPrefetchPrompt:
         }
         config = _build_outbound_scheduling_config("Hi!", "secret", outbound, "")
         prompt = config["model"]["messages"][0]["content"]
-        assert "Shall I go ahead and book that" in prompt
-        assert "Wait for the customer to say YES before calling confirm_appointment" in prompt
+        assert "Sound good?" in prompt
+        assert "Wait for YES before calling confirm_appointment" in prompt
 
     def test_style_rules_present(self):
         from channels.vapi import _build_outbound_scheduling_config
