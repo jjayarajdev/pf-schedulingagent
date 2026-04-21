@@ -1968,6 +1968,7 @@ async def _handle_store_bot(
             return _build_tool_result(msg, tool_call_id)
         store_session["creds"] = creds
         store_session["authenticated"] = True
+        store_session["just_authenticated"] = True
         store_session["support_number"] = creds.get("support_number", "")
         store_session["client_name"] = creds.get("client_name", "")
         _store_sessions[session_key] = store_session
@@ -1998,11 +1999,21 @@ async def _handle_store_bot(
     )
 
     # Step 3: Route through orchestrator with store context
-    # Prepend store instruction so the scheduling agent restricts its response
-    store_question = (
-        "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
-        + question
-    )
+    # On first call after auth, override question to list projects —
+    # the caller's original question was "PO is 74356" which the scheduling
+    # agent can't act on.  Show all projects + status immediately.
+    just_authed = store_session.pop("just_authenticated", False)
+    if just_authed:
+        store_question = (
+            "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
+            "List all projects for this customer and show their current status. "
+            "The caller originally asked: " + question
+        )
+    else:
+        store_question = (
+            "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
+            + question
+        )
     agent_name = ""
     start_time = time.monotonic()
     try:
