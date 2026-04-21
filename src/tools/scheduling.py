@@ -303,8 +303,10 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
         "status": _safe_get(item, "status_info_status", default=""),
     }
 
-    # Store callers: only status, scheduled date/time, technician name
+    # Store callers: status, project type, scheduled date/time, technician name
     if is_store:
+        project["projectType"] = project_type
+
         scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
         if scheduled_date:
             project["scheduledDate"] = scheduled_date

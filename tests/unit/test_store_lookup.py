@@ -251,10 +251,11 @@ class TestProjectMinimalStoreFilter:
         assert result["status"] == "Scheduled"
         assert result["scheduledDate"] == "2026-03-25"
         assert result["installer"]["name"] == "John Doe"
-        # NOT allowed: address, category, projectType, store, installer id
+        # projectType IS allowed (agent needs it to identify projects)
+        assert "projectType" in result
+        # NOT allowed: address, category, store, installer id
         assert "address" not in result
         assert "category" not in result
-        assert "projectType" not in result
         assert "store" not in result
         assert "id" not in result.get("installer", {})
 

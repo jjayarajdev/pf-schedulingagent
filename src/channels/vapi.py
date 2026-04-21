@@ -1969,6 +1969,8 @@ async def _handle_store_bot(
         store_session["creds"] = creds
         store_session["authenticated"] = True
         store_session["just_authenticated"] = True
+        store_session["lookup_type"] = lookup_type
+        store_session["lookup_value"] = lookup_value
         store_session["support_number"] = creds.get("support_number", "")
         store_session["client_name"] = creds.get("client_name", "")
         _store_sessions[session_key] = store_session
@@ -2004,10 +2006,20 @@ async def _handle_store_bot(
     # agent can't act on.  Show all projects + status immediately.
     just_authed = store_session.pop("just_authenticated", False)
     if just_authed:
+        # Include lookup info so the agent can find the specific project
+        lookup_hint = ""
+        auth_lookup_type = store_session.get("lookup_type", "")
+        auth_lookup_value = store_session.get("lookup_value", "")
+        if auth_lookup_type and auth_lookup_value:
+            lookup_hint = (
+                f" The caller authenticated with {auth_lookup_type.replace('_', ' ')} "
+                f"{auth_lookup_value} — find the matching project and show its details "
+                f"(status, scheduled date, technician). "
+                f"If multiple projects exist, focus on the one matching this identifier."
+            )
         store_question = (
             "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
-            "List all projects for this customer and show their current status. "
-            "The caller originally asked: " + question
+            "List this customer's projects and show their current status." + lookup_hint
         )
     else:
         store_question = (
