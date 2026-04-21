@@ -313,13 +313,6 @@ def format_for_voice(text: str) -> str:
     # Clean up excessive newlines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # ── TTS pronunciation fixes ──────────────────────────────────────
-    # Convert ordinal dates to words: "April 21st" → "April twenty-first"
-    text = _ORDINAL_SUFFIX_RE.sub(_ordinal_to_words, text)
-    # Convert years to spoken form: "2026" → "twenty twenty-six"
-    for year, words in _YEAR_WORDS.items():
-        text = text.replace(year, words)
-
     return text.strip()
 
 

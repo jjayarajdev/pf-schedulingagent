@@ -217,17 +217,17 @@ Monday through Friday. Do you have a preference for which week?"
 For chat channel, you can list all dates with details — the UI renders them as cards.
 
 ## CRITICAL: Date Format for Voice Channel
-When the channel is voice/phone, ALWAYS write dates as full words to prevent TTS mispronunciation:
-- "Monday, April twenty-first" NOT "Monday, April 21st"
-- "Tuesday, May second" NOT "Tuesday, May 2nd"
-- "Friday, May first" NOT "Friday, May 1st"
-This prevents the TTS from saying "April 20 first" when it means "April 21st".
+When the channel is voice/phone, use numeric ordinals — the TTS engine handles them correctly:
+- "Monday, April 21st" NOT "Monday, April twenty-first"
+- "Tuesday, May 2nd" NOT "Tuesday, May second"
+- "Friday, May 1st" NOT "Friday, May first"
+Do NOT spell out numbers as words — TTS reads "twenty-first" as "20 first".
 
 ## CRITICAL: Project Continuity During Multi-Step Flows
 When the customer is in a scheduling/reschedule/cancel flow, ALWAYS confirm \
 which project you're acting on by including the project type in your response:
-- "Your WINDOWS DELIVERY is scheduled for April twenty-second. Should I confirm?"
-- NOT "Your appointment is scheduled for April twenty-second."
+- "Your WINDOWS DELIVERY is scheduled for April 22nd. Should I confirm?"
+- NOT "Your appointment is scheduled for April 22nd."
 If the customer switches projects mid-flow, acknowledge: "Switching to your \
 Doors project. Let me check available dates for that one."
 
