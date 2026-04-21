@@ -215,6 +215,7 @@ class TestProjectMinimalStoreFilter:
     _FULL_ITEM = {
         "project_project_id": "123",
         "project_project_number": "PO-1",
+        "project_po_number": "74356",
         "status_info_status": "Scheduled",
         "project_category_category": "Windows",
         "project_type_project_type": "Installation",
@@ -247,15 +248,15 @@ class TestProjectMinimalStoreFilter:
 
         AuthContext.set(caller_type="store")
         result = _extract_project_minimal(self._FULL_ITEM)
-        # Allowed: status, scheduledDate, scheduledEndDate, installer name
+        # Allowed: status, scheduledDate, installer name, projectType, category, poNumber
         assert result["status"] == "Scheduled"
         assert result["scheduledDate"] == "2026-03-25"
         assert result["installer"]["name"] == "John Doe"
-        # projectType IS allowed (agent needs it to identify projects)
-        assert "projectType" in result
-        # NOT allowed: address, category, store, installer id
+        assert result["projectType"] == "Installation"
+        assert result["category"] == "Windows"
+        assert result["poNumber"] == "74356"
+        # NOT allowed: address, store, installer id
         assert "address" not in result
-        assert "category" not in result
         assert "store" not in result
         assert "id" not in result.get("installer", {})
 

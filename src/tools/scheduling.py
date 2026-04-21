@@ -297,15 +297,22 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
 
     is_store = AuthContext.get_caller_type() == "store"
 
+    po_number = _safe_get(item, "project_po_number", default="") or ""
+    category = _safe_get(item, "project_category_category", default="")
+
     project: dict[str, Any] = {
         "id": str(_safe_get(item, "project_project_id", default="")),
         "projectNumber": _safe_get(item, "project_project_number", default=""),
         "status": _safe_get(item, "status_info_status", default=""),
     }
+    if po_number:
+        project["poNumber"] = po_number
 
-    # Store callers: status, project type, scheduled date/time, technician name
+    # Store callers: status, project type, category, scheduled date/time, technician name
     if is_store:
         project["projectType"] = project_type
+        if category:
+            project["category"] = category
 
         scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
         if scheduled_date:
@@ -320,7 +327,7 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
         return project
 
     # Customer callers: full project data
-    project["category"] = _safe_get(item, "project_category_category", default="")
+    project["category"] = category
     project["projectType"] = project_type
 
     scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
