@@ -44,6 +44,10 @@ class RequestContext:
         return _session_id.get()
 
     @staticmethod
+    def get_channel() -> str:
+        return _channel.get()
+
+    @staticmethod
     def new_request_id() -> str:
         rid = str(uuid.uuid4())
         _request_id.set(rid)

@@ -59,6 +59,7 @@ _reschedule_old_appointment: dict[str, dict] = {}
 # concurrent request gets its own value (no cross-customer data leakage).
 _last_weather_dates: ContextVar[list] = ContextVar("last_weather_dates", default=[])
 _last_projects_list: ContextVar[list] = ContextVar("last_projects_list", default=[])
+_last_time_slots: ContextVar[list] = ContextVar("last_time_slots", default=[])
 
 
 def get_last_weather_dates() -> list:
@@ -69,6 +70,11 @@ def get_last_weather_dates() -> list:
 def get_last_projects_list() -> list:
     """Return the last list_projects result for server-side injection."""
     return _last_projects_list.get()
+
+
+def get_last_time_slots() -> list:
+    """Return the last time slots array for server-side injection."""
+    return _last_time_slots.get()
 
 
 def get_reschedule_old_appointment(project_id: str) -> dict | None:
@@ -90,6 +96,9 @@ def cleanup_call_caches(session_id: str) -> None:
     # Clear session project tracking
     projects = _session_projects.pop(session_id, {})
 
+    # Clear deferred notes cache
+    _session_notes.pop(session_id, None)
+
     # Clear reschedule state for any projects discussed in this call
     for pid in projects:
         _reschedule_pending.discard(pid)
@@ -109,9 +118,27 @@ _load_lock = asyncio.Lock()
 # session_id → {project_id: [action_names]}
 _session_projects: dict[str, dict[str, list[str]]] = {}
 
+# Human-readable labels for action names used in end-of-call notes
+_ACTION_LABELS: dict[str, str] = {
+    "viewed_projects": "Viewed projects",
+    "get_project_details": "Viewed project details",
+    "get_available_dates": "Checked available dates",
+    "get_time_slots": "Checked time slots",
+    "confirm_appointment": "Scheduled appointment",
+    "reschedule_appointment": "Rescheduled appointment",
+    "cancel_appointment": "Cancelled appointment",
+    "add_project_note": "Added note",
+    "add_customer_note": "Added note",
+    "get_installation_address": "Checked installation address",
+    "update_installation_address": "Requested address update",
+}
+
 
 def _track_project_action(project_id: str, action: str) -> None:
     """Record that a project was accessed by a tool in the current session."""
+    # Track last project for guardrail retry pinning
+    if project_id:
+        _last_project_id_in_request.set(str(project_id))
     session_id = RequestContext.get_session_id()
     if not session_id:
         return
@@ -135,6 +162,37 @@ def clear_session_projects(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+#  Per-session note cache (deferred posting at end-of-call)
+# ---------------------------------------------------------------------------
+
+# session_id → {project_id: [note_text, ...]}
+_session_notes: dict[str, dict[str, list[str]]] = {}
+
+
+def cache_session_note(project_id: str, note_text: str) -> None:
+    """Cache a note for deferred posting at end-of-call."""
+    session_id = RequestContext.get_session_id()
+    if not session_id:
+        return
+    if session_id not in _session_notes:
+        _session_notes[session_id] = {}
+    notes = _session_notes[session_id]
+    if project_id not in notes:
+        notes[project_id] = []
+    notes[project_id].append(note_text)
+
+
+def get_session_notes(session_id: str) -> dict[str, list[str]]:
+    """Return {project_id: [note_text, ...]} for a session."""
+    return _session_notes.get(session_id, {})
+
+
+def clear_session_notes(session_id: str) -> None:
+    """Remove cached notes for a completed session."""
+    _session_notes.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
 #  Request-scoped tool-call tracking (hallucination guardrail)
 #
 #  Tracks which write operations were ACTUALLY called by the LLM in the
@@ -143,9 +201,18 @@ def clear_session_projects(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 _confirm_called_in_request: ContextVar[bool] = ContextVar("confirm_called", default=False)
+_confirm_success_result: ContextVar[str] = ContextVar("confirm_success_result", default="")
 _cancel_called_in_request: ContextVar[bool] = ContextVar("cancel_called", default=False)
+_cancel_success_result: ContextVar[str] = ContextVar("cancel_success_result", default="")
 _reschedule_called_in_request: ContextVar[bool] = ContextVar("reschedule_called", default=False)
+_reschedule_success_result: ContextVar[str] = ContextVar("reschedule_success_result", default="")
 _time_slots_called_in_request: ContextVar[bool] = ContextVar("time_slots_called", default=False)
+_address_updated_in_request: ContextVar[bool] = ContextVar("address_updated", default=False)
+
+# Tracks the last project_id used by any tool in this request.
+# Used by guardrail retry prompts to pin the project and prevent GPT from
+# switching to a different project during the retry.
+_last_project_id_in_request: ContextVar[str] = ContextVar("last_project_id", default="")
 
 
 def reset_confirm_flag() -> None:
@@ -154,20 +221,37 @@ def reset_confirm_flag() -> None:
 
 
 def reset_action_flags() -> None:
-    """Reset ALL write-action flags before each orchestrator call."""
+    """Reset ALL write-action flags before each orchestrator call.
+
+    Note: _last_project_id_in_request is intentionally NOT reset here.
+    The guardrail retry needs to read it AFTER the first call fails,
+    so it persists across the reset_action_flags() → retry cycle.
+    """
     _confirm_called_in_request.set(False)
     _cancel_called_in_request.set(False)
     _reschedule_called_in_request.set(False)
     _time_slots_called_in_request.set(False)
+    _address_updated_in_request.set(False)
+    # NOTE: _confirm_success_result, _cancel_success_result, and
+    # _reschedule_success_result are intentionally NOT reset here.
+    # The guardrail retry calls reset_action_flags() before re-invoking
+    # the orchestrator.  If the first call already booked/cancelled/rescheduled
+    # successfully, we must return the cached result on retry — otherwise the
+    # second API call gets a 400 and the LLM tells the customer it failed.
 
 
 def reset_request_caches() -> None:
     """Reset per-request injection caches before each orchestrator call.
 
     Prevents stale data from a previous request leaking into the current one.
+    Also resets write-action success caches so they don't leak across requests.
     """
     _last_weather_dates.set([])
     _last_projects_list.set([])
+    _last_time_slots.set([])
+    _confirm_success_result.set("")
+    _cancel_success_result.set("")
+    _reschedule_success_result.set("")
 
 
 def was_confirm_called() -> bool:
@@ -188,6 +272,20 @@ def was_reschedule_called() -> bool:
 def was_time_slots_called() -> bool:
     """Check if get_time_slots was actually called in this request."""
     return _time_slots_called_in_request.get()
+
+
+def was_address_updated() -> bool:
+    """Check if update_installation_address was actually called in this request."""
+    return _address_updated_in_request.get()
+
+
+def get_last_project_id() -> str:
+    """Return the last project_id used by any tool in this request.
+
+    Used by guardrail retry prompts to pin the correct project so GPT
+    cannot drift to a different project during the retry.
+    """
+    return _last_project_id_in_request.get()
 
 
 # ---------------------------------------------------------------------------
@@ -466,23 +564,33 @@ def _get_cached_project(project_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _resolve_project_id(project_id: str) -> str:
+async def _resolve_project_id(project_id: str) -> str:
     """Resolve a project identifier to the canonical project_id for API calls.
 
     The LLM may pass either ``project_id`` (e.g. "90000149") or
     ``project_number`` (e.g. "74356_1").  The PF scheduler API requires
     ``project_id``.  This function looks up the cache and returns the
     correct ``project_id`` regardless of which identifier was provided.
+
+    If the cache is empty (e.g. invalidated after a cancel), reloads it
+    before giving up — but only when the input looks like a project_number
+    (non-numeric), since numeric IDs don't need resolution.
     """
-    project = _get_cached_project(project_id)
-    if project and project["id"] != str(project_id):
+    pid = str(project_id)
+    project = _get_cached_project(pid)
+    if not project and not pid.isdigit():
+        # Non-numeric identifier (project_number) needs resolution.
+        # Cache may have been invalidated — reload and retry.
+        await _load_projects()
+        project = _get_cached_project(pid)
+    if project and project["id"] != pid:
         logger.info(
             "Resolved project_number %s → project_id %s",
             project_id,
             project["id"],
         )
         return project["id"]
-    return str(project_id)
+    return pid
 
 
 def _invalidate_projects() -> None:
@@ -631,7 +739,7 @@ async def list_projects(
     if status:
         status_lower = status.lower()
         if status_lower == "schedulable":
-            schedulable = {"new", "pending reschedule", "not scheduled", "ready to schedule"}
+            schedulable = {"new", "pending reschedule", "not scheduled", "ready to schedule", "ready for auto call"}
             filtered = [p for p in filtered if p.get("status", "").lower() in schedulable]
         else:
             filtered = [p for p in filtered if status_lower in p.get("status", "").lower()]
@@ -664,13 +772,11 @@ async def list_projects(
         # Intelligent fallback — only reference active projects, never completed/cancelled
         return _build_intelligent_fallback(active_projects)
 
-    # Store callers: track all returned projects so end-of-call notes get posted.
-    # Customer callers: only track via specific tool calls (get_project_details, etc.)
-    if AuthContext.get_caller_type() == "store":
-        for p in filtered:
-            pid = str(p.get("id", ""))
-            if pid:
-                _track_project_action(pid, "viewed_projects")
+    # Track all returned projects so end-of-call notes get posted for every caller type.
+    for p in filtered:
+        pid = str(p.get("id", ""))
+        if pid:
+            _track_project_action(pid, "viewed_projects")
 
     # Cache for server-side injection — the LLM truncates large JSON arrays
     _last_projects_list.set(filtered)
@@ -696,6 +802,23 @@ def _match_scheduled_date(scheduled_date: str, target_date: str) -> bool:
     return scheduled_date[:10] == target_date[:10]
 
 
+def _annotate_day_names(dates: list[str]) -> list[dict[str, str]]:
+    """Convert date strings to dicts with the correct day name.
+
+    ["2026-04-24"] → [{"date": "2026-04-24", "day": "Friday"}]
+
+    This prevents the LLM from hallucinating incorrect day-of-week names.
+    """
+    result = []
+    for d in dates:
+        try:
+            dt = datetime.strptime(d[:10], "%Y-%m-%d")
+            result.append({"date": d[:10], "day": dt.strftime("%A")})
+        except (ValueError, TypeError):
+            result.append({"date": d, "day": ""})
+    return result
+
+
 def _get_project_number(project_id: str) -> str:
     """Return the user-facing project number for a project_id.
 
@@ -713,7 +836,7 @@ async def get_project_details(project_id: str) -> str:
     Reads from the project cache.  If not found, forces a cache refresh
     and retries once.
     """
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "get_project_details")
     customer_id = AuthContext.get_customer_id()
     if not customer_id:
@@ -739,7 +862,7 @@ async def get_project_details(project_id: str) -> str:
 
 async def get_available_dates(project_id: str, start_date: str = "", end_date: str = "") -> str:
     """Get available scheduling dates. Returns dates + request_id (critical for downstream calls)."""
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "get_available_dates")
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
@@ -789,74 +912,51 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
 
     headers = build_headers()
 
-    # Use reschedule-specific endpoint when a reschedule is in progress
-    if project_id in _reschedule_pending:
-        url = f"{base_url}/date/{start_date}/selected/{start_date}/get-reschedule-slotsChatBot"
-        log_curl("GET", url, headers)
-        try:
-            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-                response = await client.get(url, headers=headers)
-            log_response(response, "get_reschedule_available_dates")
-            response.raise_for_status()
-            data = _unwrap(response.json())
-        except httpx.HTTPError as exc:
-            resp = getattr(exc, "response", None)
-            logger.exception(
-                "Failed to get reschedule available dates: project=%s url=%s status=%s body=%s",
-                project_id, url,
-                resp.status_code if resp is not None else "N/A",
-                resp.text[:500] if resp is not None and resp.text else "N/A",
-            )
-            return "Sorry, I couldn't check available dates for rescheduling. Please try again later."
-    else:
-        url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
-        log_curl("GET", url, headers)
-        try:
-            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-                response = await client.get(url, headers=headers)
-            log_response(response, "get_available_dates")
+    url = f"{base_url}/startDate/{start_date}/endDate/{end_date}/slotsChatbot"
+    log_curl("GET", url, headers)
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+        log_response(response, "get_available_dates")
 
-            # Check for "already scheduled" errors BEFORE raise_for_status
-            if response.status_code == 400:
-                error_body = response.text.lower()
-                if any(phrase in error_body for phrase in (
-                    "already requested", "already scheduled",
-                    "already contains a technician", "technician already assigned",
-                    "not allowed",
-                )):
-                    logger.info("Project %s is already scheduled (API 400)", project_id)
-                    result = {
-                        "project_number": _get_project_number(project_id),
-                        "already_scheduled": True,
-                        "available_dates": [],
-                        "message": (
-                            "This project is already scheduled. "
-                            "Would you like to reschedule to a different date?"
-                        ),
-                    }
-                    return json.dumps(result, indent=2)
+        # Check for "already scheduled" errors BEFORE raise_for_status
+        if response.status_code == 400:
+            error_body = response.text.lower()
+            if any(phrase in error_body for phrase in (
+                "already requested", "already scheduled",
+                "already contains a technician", "technician already assigned",
+                "not allowed",
+            )):
+                logger.info("Project %s is already scheduled (API 400)", project_id)
+                result = {
+                    "project_number": _get_project_number(project_id),
+                    "already_scheduled": True,
+                    "available_dates": [],
+                    "message": (
+                        "This project is already scheduled. "
+                        "Would you like to reschedule to a different date?"
+                    ),
+                }
+                return json.dumps(result, indent=2)
 
-            response.raise_for_status()
-            data = _unwrap(response.json())
-        except httpx.HTTPError as exc:
-            resp = getattr(exc, "response", None)
-            logger.exception(
-                "Failed to get available dates: project=%s url=%s status=%s body=%s",
-                project_id, url,
-                resp.status_code if resp is not None else "N/A",
-                resp.text[:500] if resp is not None and resp.text else "N/A",
-            )
-            return "Sorry, I couldn't check available dates right now. Please try again later."
+        response.raise_for_status()
+        data = _unwrap(response.json())
+    except httpx.HTTPError as exc:
+        resp = getattr(exc, "response", None)
+        logger.exception(
+            "Failed to get available dates: project=%s url=%s status=%s body=%s",
+            project_id, url,
+            resp.status_code if resp is not None else "N/A",
+            resp.text[:500] if resp is not None and resp.text else "N/A",
+        )
+        return "Sorry, I couldn't check available dates right now. Please try again later."
 
     dates = data.get("dates", data.get("availableDates", []))
     api_request_id = data.get("request_id")
 
     if not dates:
         expanded_end = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=21)).strftime("%Y-%m-%d")
-        if project_id in _reschedule_pending:
-            url = f"{base_url}/date/{start_date}/selected/{start_date}/get-reschedule-slotsChatBot"
-        else:
-            url = f"{base_url}/startDate/{start_date}/endDate/{expanded_end}/slotsChatbot"
+        url = f"{base_url}/startDate/{start_date}/endDate/{expanded_end}/slotsChatbot"
         try:
             async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
                 response = await client.get(url, headers=headers)
@@ -894,6 +994,9 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
     # Sort dates chronologically
     sorted_dates = sorted(dates)
 
+    # Annotate each date with its day name so the LLM doesn't hallucinate it
+    dated_with_days = _annotate_day_names(sorted_dates)
+
     # IMPORTANT: Never include time slots in the dates response.
     # The slotsChatbot endpoint may return generic slots alongside dates,
     # but including them causes the LLM to fabricate additional 30-min
@@ -904,13 +1007,13 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
     pnum = _get_project_number(project_id)
     result: dict[str, Any] = {
         "project_number": pnum,
-        "available_dates": sorted_dates,
+        "available_dates": dated_with_days,
         "date_range": {"start": start_date, "end": end_date},
-        "message": (
-            f"Found {len(sorted_dates)} available date(s)."
-            " Present these dates to the customer. Once they pick a date,"
-            " you MUST call get_time_slots to get the actual available time slots."
-            " Do NOT guess, fabricate, or infer time slots — ONLY use what get_time_slots returns."
+        "message": f"Found {len(sorted_dates)} available date(s). Which date works best for you?",
+        "_llm_instruction": (
+            "Once the customer picks a date, you MUST call get_time_slots "
+            "to get the actual available time slots. Do NOT guess, fabricate, "
+            "or infer time slots — ONLY use what get_time_slots returns."
         ),
     }
 
@@ -941,7 +1044,7 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
 async def get_time_slots(project_id: str, date: str) -> str:
     """Get available time slots for a specific date."""
     _time_slots_called_in_request.set(True)
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "get_time_slots")
     # Fix common LLM date errors: wrong year
     try:
@@ -977,43 +1080,28 @@ async def get_time_slots(project_id: str, date: str) -> str:
     base_url = _build_scheduler_url(client_id, project_id)
     headers = build_headers()
 
-    # Use reschedule-specific endpoint when a reschedule is in progress,
-    # otherwise use the standard slotsChatbot endpoint.
-    if project_id in _reschedule_pending:
-        url = f"{base_url}/date/{date}/selected/{date}/get-reschedule-slotsChatBot"
-        log_curl("GET", url, headers)
-        try:
-            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-                response = await client.get(url, headers=headers)
-            log_response(response, "get_reschedule_time_slots")
-            response.raise_for_status()
-            data = _unwrap(response.json())
-        except httpx.HTTPError as exc:
-            logger.exception("Failed to get reschedule time slots")
-            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Please try again later."
-    else:
-        # Get request_id from cache (populated by get_available_dates)
+    # Get request_id from cache (populated by get_available_dates)
+    request_id = _request_id_by_project.get(project_id)
+    if not request_id:
+        logger.warning("No cached request_id for project %s — calling get_available_dates first", project_id)
+        await get_available_dates(project_id)
         request_id = _request_id_by_project.get(project_id)
-        if not request_id:
-            logger.warning("No cached request_id for project %s — calling get_available_dates first", project_id)
-            await get_available_dates(project_id)
-            request_id = _request_id_by_project.get(project_id)
-        if not request_id:
-            pnum = _get_project_number(project_id)
-            return f"Could not get request_id for project {pnum}. Please call get_available_dates first."
+    if not request_id:
+        pnum = _get_project_number(project_id)
+        return f"Could not get request_id for project {pnum}. Please call get_available_dates first."
 
-        url = f"{base_url}/startDate/{date}/endDate/{date}/slotsChatbot"
-        params = {"request_id": str(request_id)}
-        log_curl("GET", url, headers)
-        try:
-            async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-                response = await client.get(url, headers=headers, params=params)
-            log_response(response, "get_time_slots")
-            response.raise_for_status()
-            data = _unwrap(response.json())
-        except httpx.HTTPError as exc:
-            logger.exception("Failed to get time slots")
-            return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Please try again later."
+    url = f"{base_url}/startDate/{date}/endDate/{date}/slotsChatbot"
+    params = {"request_id": str(request_id)}
+    log_curl("GET", url, headers)
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.get(url, headers=headers, params=params)
+        log_response(response, "get_time_slots")
+        response.raise_for_status()
+        data = _unwrap(response.json())
+    except httpx.HTTPError as exc:
+        logger.exception("Failed to get time slots")
+        return f"Sorry, I couldn't fetch time slots for {_format_date_display(date)}. Please try again later."
 
     slots = data.get("slots", data.get("timeSlots", []))
     if not slots:
@@ -1024,6 +1112,10 @@ async def get_time_slots(project_id: str, date: str) -> str:
     api_rid = data.get("request_id", request_id)
     if api_rid:
         _request_id_by_project[project_id] = api_rid
+    # Cache the real time slots for server-side injection — prevents the LLM
+    # from fabricating additional slots beyond what the API returned.
+    _last_time_slots.set(list(slots))
+
     pnum = _get_project_number(project_id)
     date_display = _format_date_display(date)
     result = {
@@ -1038,6 +1130,15 @@ async def get_time_slots(project_id: str, date: str) -> str:
 async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -> str:
     """Schedule an appointment. Only call AFTER the customer has confirmed."""
     _confirm_called_in_request.set(True)
+    # Guard against duplicate confirm calls in the same request — the LLM
+    # sometimes calls confirm_appointment twice in a single tool-use loop.
+    # The second call hits a 400 "Invalid process step" and the LLM then
+    # tells the customer "already scheduled, want to reschedule?" instead
+    # of showing the success message.
+    cached = _confirm_success_result.get()
+    if cached:
+        logger.warning("confirm_appointment called again in same request — returning cached success")
+        return cached
     try:
         return await _confirm_appointment_impl(project_id, date, time, **kwargs)
     except (httpx.HTTPError, json.JSONDecodeError):
@@ -1049,7 +1150,7 @@ async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -
 
 async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwargs) -> str:
     """Internal implementation of confirm_appointment."""
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "confirm_appointment")
 
     # Validate status from cache (no extra API call).
@@ -1133,16 +1234,21 @@ async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwa
     if confirmation_number:
         msg += f" Confirmation number: {confirmation_number}."
     msg += " You will receive a confirmation to your registered email and phone number."
+    _confirm_success_result.set(msg)
     return msg
 
 
 async def reschedule_appointment(project_id: str) -> str:
     """Start reschedule flow — cancels existing appointment and fetches new dates.
 
-    Uses the dedicated ``get-reschedule-slotsChatBot`` API endpoint which
-    ignores current appointment status and returns alternative availability.
+    Uses ``cancel-reschedule`` to cancel the current appointment, then the
+    standard ``slotsChatbot`` endpoint for new date/slot availability.
     """
     _reschedule_called_in_request.set(True)
+    cached = _reschedule_success_result.get()
+    if cached:
+        logger.warning("reschedule_appointment called again in same request — returning cached success")
+        return cached
     try:
         return await _reschedule_appointment_impl(project_id)
     except Exception:
@@ -1152,7 +1258,7 @@ async def reschedule_appointment(project_id: str) -> str:
 
 async def _reschedule_appointment_impl(project_id: str) -> str:
     """Internal implementation of reschedule_appointment."""
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "reschedule_appointment")
     # Read from cache (no extra API call)
     project = _get_cached_project(project_id)
@@ -1196,16 +1302,19 @@ async def _reschedule_appointment_impl(project_id: str) -> str:
     if reschedule_dates:
         _invalidate_projects()
         _reschedule_pending.add(project_id)
+        _reschedule_success_result.set(reschedule_dates)
         return reschedule_dates
 
     # _get_reschedule_slots may have successfully cancelled but returned no
     # dates (API returns only a message).  If it set _reschedule_pending,
     # guide the LLM to fetch dates via the normal flow.
     if project_id in _reschedule_pending:
-        return (
+        msg = (
             "The existing appointment has been cancelled. "
             "Now call get_available_dates to fetch available dates for rescheduling."
         )
+        _reschedule_success_result.set(msg)
+        return msg
 
     return (
         "Couldn't fetch reschedule availability. "
@@ -1276,39 +1385,24 @@ async def _get_reschedule_slots(project_id: str) -> str | None:
             except Exception:
                 logger.exception("Weather enrichment failed during reschedule (non-fatal)")
 
-    # Include time slots from the API response
-    raw_slots = data.get("slots", [])
-    formatted_slots = []
-    for s in raw_slots:
-        try:
-            h, m, *_ = s.split(":")
-            hour = int(h)
-            minute = m
-            period = "AM" if hour < 12 else "PM"
-            display_hour = hour if hour <= 12 else hour - 12
-            if display_hour == 0:
-                display_hour = 12
-            formatted_slots.append(f"{display_hour}:{minute} {period}")
-        except (ValueError, IndexError):
-            formatted_slots.append(s)
-
-    slots_msg = ""
-    if formatted_slots:
-        slots_msg = f" Available time slots on each date: {', '.join(formatted_slots)}."
+    # IMPORTANT: Do NOT include time slots from the cancel-reschedule API.
+    # The slots returned are generic per-day slots, not date-specific availability.
+    # Including them causes the LLM to present fabricated slots before the customer
+    # picks a date.  The correct flow is: dates → customer picks → get_time_slots.
 
     pnum = _get_project_number(project_id)
     result: dict[str, Any] = {
         "project_number": pnum,
         "is_reschedule": True,
-        "available_dates": dates,
+        "available_dates": _annotate_day_names(dates),
         "message": (
             f"The existing appointment has been cancelled. "
-            f"Found {len(dates)} new date(s) for rescheduling.{slots_msg}"
+            f"Found {len(dates)} new date(s) for rescheduling."
+            " Present these dates to the customer. Once they pick a date,"
+            " you MUST call get_time_slots to get the actual available time slots."
+            " Do NOT guess, fabricate, or infer time slots."
         ),
     }
-
-    if formatted_slots:
-        result["available_time_slots"] = formatted_slots
 
     if weather_dates:
         result["dates_with_weather"] = weather_dates
@@ -1328,6 +1422,10 @@ async def cancel_appointment(project_id: str, reason: str = "") -> str:
             If provided, a cancellation note is automatically saved.
     """
     _cancel_called_in_request.set(True)
+    cached = _cancel_success_result.get()
+    if cached:
+        logger.warning("cancel_appointment called again in same request — returning cached success")
+        return cached
     try:
         return await _cancel_appointment_impl(project_id, reason)
     except Exception:
@@ -1337,7 +1435,7 @@ async def cancel_appointment(project_id: str, reason: str = "") -> str:
 
 async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
     """Internal implementation of cancel_appointment."""
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "cancel_appointment")
     # Validate from cache (no extra API call)
     project = _get_cached_project(project_id)
@@ -1375,77 +1473,154 @@ async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
             note_result = await add_note(project_id, note_text)
             logger.info("Cancel note saved for project %s: %s", project_id, note_result)
             if "sorry" in note_result.lower() or "couldn't" in note_result.lower():
-                return (
+                msg = (
                     "Appointment has been cancelled successfully. "
                     "However, I was unable to save the cancellation reason note. "
                     "Please try adding the note manually."
                 )
+                _cancel_success_result.set(msg)
+                return msg
         except Exception:
             logger.exception("Failed to save cancellation note for project %s", project_id)
-            return (
+            msg = (
                 "Appointment has been cancelled successfully. "
                 "However, I was unable to save the cancellation reason note. "
                 "Please try adding the note manually."
             )
+            _cancel_success_result.set(msg)
+            return msg
 
-    return "Appointment has been cancelled successfully."
+    msg = "Appointment has been cancelled successfully."
+    _cancel_success_result.set(msg)
+    return msg
 
 
 async def add_note(project_id: str, note_text: str) -> str:
-    """Add a note to a project."""
-    project_id = _resolve_project_id(project_id)
-    _track_project_action(project_id, "add_note")
-    client_id = AuthContext.get_client_id()
+    """Add a note to a project. Routes to the correct API based on caller type and note content."""
+    project_id = await _resolve_project_id(project_id)
     caller_type = AuthContext.get_caller_type()
-    base = get_pf_api_base()
-    headers = build_headers()
 
-    # Cancel/reschedule reason notes always use /project-notes/add-note
-    # (both store and customer). All other store notes also use it.
-    # Customer general notes use /communication/.../note.
-    # Address corrections use /project-notes/update-address-note.
     is_cancel_note = any(
         prefix in note_text.upper()
         for prefix in ("CANCELLATION REASON:", "CANCELLATION:", "RESCHEDULE REASON:")
     )
-    is_address_note = "ADDRESS CORRECTION:" in note_text.upper()
+    is_address_note = "CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE" in note_text.upper()
+
+    if is_address_note:
+        return await _add_address_note(project_id, note_text)
+    elif caller_type == "store" or is_cancel_note:
+        return await _add_project_note(project_id, note_text)
+    else:
+        return await _add_customer_note(project_id, note_text)
+
+
+async def _add_address_note(project_id: str, note_text: str) -> str:
+    """Post an address update note via POST /project-notes/update-address-note.
+
+    Used for: customer address update requests.
+    """
+    _track_project_action(project_id, "add_address_note")
+    client_id = AuthContext.get_client_id()
+    base = get_pf_api_base()
+    headers = build_headers()
 
     try:
         pid = int(project_id)
     except (ValueError, TypeError):
         pid = project_id
 
-    if is_address_note and caller_type != "store":
-        # Customer address corrections (VAPI inbound/outbound):
-        # POST /project-notes/update-address-note
-        url = f"{base}/project-notes/update-address-note"
-        payload = {
-            "client_id": client_id,
-            "project_id": pid,
-            "note_text": note_text,
-        }
-    elif caller_type == "store" or is_cancel_note:
-        # Store callers OR cancel/reschedule reasons: POST /project-notes/add-note
-        url = f"{base}/project-notes/add-note"
-        payload = {
-            "client_id": client_id,
-            "project_id": pid,
-            "note_text": note_text,
-        }
-    else:
-        # Customer general notes: POST /communication/client/{cid}/project/{pid}/note
-        url = f"{base}/communication/client/{client_id}/project/{project_id}/note"
-        payload = {"note_text": note_text}
+    url = f"{base}/project-notes/update-address-note"
+    payload = {
+        "client_id": client_id,
+        "project_id": pid,
+        "note_text": note_text,
+    }
 
+    logger.info("add_address_note (project-notes/update-address-note) for project %s", project_id)
     log_curl("POST", url, headers, payload)
 
     try:
         async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
             response = await client.post(url, headers=headers, json=payload)
-        log_response(response, "add_note")
+        log_response(response, "add_address_note")
         response.raise_for_status()
-    except httpx.HTTPError as exc:
-        logger.exception("Failed to add note")
+    except httpx.HTTPError:
+        logger.exception("Failed to add address note")
+        return "Sorry, I couldn't add the note. Please try again later."
+
+    pnum = _get_project_number(project_id)
+    return f"Address update note added successfully to project {pnum}."
+
+
+async def _add_project_note(project_id: str, note_text: str) -> str:
+    """Post a note via POST /project-notes/add-note.
+
+    Used for: store callers, cancel/reschedule reasons, address update requests.
+    """
+    _track_project_action(project_id, "add_project_note")
+    client_id = AuthContext.get_client_id()
+    base = get_pf_api_base()
+    headers = build_headers()
+
+    try:
+        pid = int(project_id)
+    except (ValueError, TypeError):
+        pid = project_id
+
+    url = f"{base}/project-notes/add-note"
+    payload = {
+        "client_id": client_id,
+        "project_id": pid,
+        "note_text": note_text,
+    }
+
+    logger.info("add_project_note (project-notes/add-note) for project %s", project_id)
+    log_curl("POST", url, headers, payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        log_response(response, "add_project_note")
+        response.raise_for_status()
+    except httpx.HTTPError:
+        logger.exception("Failed to add project note")
+        return "Sorry, I couldn't add the note. Please try again later."
+
+    pnum = _get_project_number(project_id)
+    return f"Note added successfully to project {pnum}."
+
+
+async def _add_customer_note(project_id: str, note_text: str) -> str:
+    """Add a customer note — cached for phone calls, posted immediately for chat.
+
+    Phone (vapi): notes are collected during the call and posted in bulk at
+    end-of-call via POST /customer-project-notes/add-customer-notes/.
+    Chat: notes are posted immediately via POST /communication/.../note.
+    """
+    _track_project_action(project_id, "add_customer_note")
+    channel = RequestContext.get_channel()
+
+    # Phone calls: cache for deferred posting at end-of-call
+    if channel == "vapi":
+        cache_session_note(project_id, note_text)
+        pnum = _get_project_number(project_id)
+        logger.info("Customer note cached for project %s (deferred to end-of-call)", project_id)
+        return f"Note added successfully to project {pnum}."
+
+    # Chat/other channels: post immediately to /communication/.../note
+    client_id = AuthContext.get_client_id()
+    url = f"{get_pf_api_base()}/communication/client/{client_id}/project/{project_id}/note"
+    headers = build_headers()
+    payload = {"note_text": note_text}
+    log_curl("POST", url, headers, payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        log_response(response, "add_customer_note")
+        response.raise_for_status()
+    except httpx.HTTPError:
+        logger.exception("Failed to add customer note for project %s", project_id)
         return "Sorry, I couldn't add the note. Please try again later."
 
     pnum = _get_project_number(project_id)
@@ -1454,7 +1629,7 @@ async def add_note(project_id: str, note_text: str) -> str:
 
 async def list_notes(project_id: str) -> str:
     """List notes for a project."""
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     client_id = AuthContext.get_client_id()
     customer_id = AuthContext.get_customer_id()
     url = f"{get_pf_api_base()}/communication/client/{client_id}/customer/{customer_id}/project/{project_id}/notes"
@@ -1513,33 +1688,64 @@ async def post_call_summary_notes(
         "client_id": client_id,
     }
 
-    truncated_summary = (summary[:200] + "...") if len(summary) > 200 else summary
+    # Collect cached notes for deferred posting
+    cached_notes = get_session_notes(session_id)
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for project_id, actions in projects_discussed.items():
-            action_list = ", ".join(actions) if actions else "general inquiry"
+            # ── 1. Conversation summary → /communication/.../note ──
             note_text = (
                 f"Customer called on {call_time} via AI Scheduling Assistant (J). "
-                f"Duration: {duration_str}. Actions: {action_list}."
+                f"Duration: {duration_str}."
             )
-            if truncated_summary:
-                note_text += f" Summary: {truncated_summary}"
+            if summary:
+                note_text += f" {summary}"
 
             url = f"{base_url}/communication/client/{client_id}/project/{project_id}/note"
-            payload = {"note_text": note_text}
+            viewed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = {
+                "note_text": f"{note_text}\n\n— AI Scheduling Assistant (J)",
+                "viewed_by": "6fb91b7b-f5bf-11ec-8fa1-0a924d8c6a19",
+                "reviewed_by": "6fb91b7b-f5bf-11ec-8fa1-0a924d8c6a19",
+                "viewed_at": viewed_at,
+                "reviewed_at": viewed_at,
+            }
             try:
+                log_curl("POST", url, headers, payload)
                 resp = await client.post(url, headers=headers, json=payload)
+                log_response(resp, "post_call_summary_notes (communication/note)")
                 logger.info(
-                    "Call note posted: project=%s status=%d session=%s",
+                    "Call summary posted: project=%s status=%d session=%s",
                     project_id, resp.status_code, session_id,
                 )
             except Exception:
                 logger.exception(
-                    "Failed to post call note for project %s (session=%s)",
+                    "Failed to post call summary for project %s (session=%s)",
                     project_id, session_id,
                 )
 
+            # ── 2. Project notes → /project-notes/add/{client_id}/{project_id} ──
+            project_notes = cached_notes.get(project_id, [])
+            if project_notes:
+                combined_notes = "\n".join(project_notes)
+                notes_url = f"{base_url}/customer-project-notes/add-customer-notes/{client_id}/{project_id}"
+                notes_payload = {"note_text": combined_notes}
+                try:
+                    log_curl("POST", notes_url, headers, notes_payload)
+                    resp = await client.post(notes_url, headers=headers, json=notes_payload)
+                    log_response(resp, "post_call_project_notes (project-notes/add)")
+                    logger.info(
+                        "Project notes posted: project=%s notes=%d status=%d session=%s",
+                        project_id, len(project_notes), resp.status_code, session_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to post project notes for project %s (session=%s)",
+                        project_id, session_id,
+                    )
+
     clear_session_projects(session_id)
+    clear_session_notes(session_id)
 
 
 async def post_store_call_notes(
@@ -1574,17 +1780,14 @@ async def post_store_call_notes(
         "Content-Type": "application/json",
     }
 
-    truncated_summary = (summary[:200] + "...") if len(summary) > 200 else summary
-
     async with httpx.AsyncClient(timeout=15.0) as client:
         for project_id, actions in projects_discussed.items():
-            action_list = ", ".join(actions) if actions else "general inquiry"
             note_text = (
                 f"Store called on {call_time} via AI Scheduling Assistant (J). "
-                f"Duration: {duration_str}. Actions: {action_list}."
+                f"Duration: {duration_str}."
             )
-            if truncated_summary:
-                note_text += f" Summary: {truncated_summary}"
+            if summary:
+                note_text += f" {summary}"
 
             url = f"{base_url}/project-notes/add-note"
             payload = {
@@ -1593,7 +1796,9 @@ async def post_store_call_notes(
                 "note_text": note_text,
             }
             try:
+                log_curl("POST", url, headers, payload)
                 resp = await client.post(url, headers=headers, json=payload)
+                log_response(resp, "post_store_call_notes (project-notes/add-note)")
                 logger.info(
                     "Store call note posted: project=%s status=%d session=%s",
                     project_id, resp.status_code, session_id,
@@ -1724,7 +1929,7 @@ async def get_installation_address(project_id: str, **kwargs) -> str:
 
     TODO: uncomment API call when /authentication/get-installation-address is ready.
     """
-    project_id = _resolve_project_id(project_id)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "get_installation_address")
 
     # --- API call commented out for now ---
@@ -1807,102 +2012,94 @@ async def update_installation_address(
 ) -> str:
     """Update the installation address for a project.
 
-    Currently returns a simulated success response.
-
-    TODO: uncomment API call when /authentication/update-installation-address is ready.
+    Calls PUT /authentication/update-installation-address to update the address.
+    Also saves a note on the project for audit trail.
     """
     _confirm_called_in_request.set(True)
-    project_id = _resolve_project_id(project_id)
+    _address_updated_in_request.set(True)
+    project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "update_installation_address")
 
-    # --- API call commented out for now ---
-    # # Get address_id from cache
-    # cached = _get_cached_project(project_id)
-    # address_id = ""
-    # if cached and cached.get("address"):
-    #     address_id = str(cached["address"].get("address_id", ""))
-    #
-    # # If no address_id cached, fetch it via the get API
-    # if not address_id:
-    #     logger.info("No cached address_id for project %s — fetching", project_id)
-    #     get_result = await get_installation_address(project_id)
-    #     try:
-    #         get_data = json.loads(get_result)
-    #         address_id = str(get_data.get("address", {}).get("address_id", ""))
-    #     except (json.JSONDecodeError, TypeError):
-    #         pass
-    #
-    # if not address_id:
-    #     return (
-    #         f"Cannot update address for project {project_id}: "
-    #         "no address_id found. The project may not have an address on file."
-    #     )
-    #
-    # client_id = AuthContext.get_client_id()
-    # base_url = get_pf_api_base()
-    # url = f"{base_url}/authentication/update-installation-address"
-    # headers = build_headers()
-    # body: dict[str, Any] = {
-    #     "address_id": int(address_id),
-    #     "client_id": client_id,
-    #     "address1": address1,
-    #     "city": city,
-    # }
-    # if state:
-    #     body["state"] = state
-    # if zipcode:
-    #     body["zipcode"] = zipcode
-    #
-    # try:
-    #     async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-    #         log_curl("PUT", url, headers, body)
-    #         resp = await client.put(url, headers=headers, json=body)
-    #         log_response(resp, "update-installation-address")
-    #         resp.raise_for_status()
-    #
-    #         _invalidate_projects()
-    #         updated_address = {
-    #             "address1": address1,
-    #             "city": city,
-    #             "state": state,
-    #             "zipcode": zipcode,
-    #         }
-    #         return json.dumps({
-    #             "project_id": project_id,
-    #             "updated_address": {k: v for k, v in updated_address.items() if v},
-    #             "message": f"Installation address updated for project {project_id}.",
-    #         })
-    # except httpx.HTTPStatusError as exc:
-    #     logger.error(
-    #         "update-installation-address failed: %d %s",
-    #         exc.response.status_code,
-    #         exc.response.text[:500],
-    #     )
-    #     return (
-    #         f"Failed to update the address for project {project_id}. "
-    #         "Please try again or contact support."
-    #     )
-    # except Exception:
-    #     logger.exception("update-installation-address error for project %s", project_id)
-    #     return (
-    #         f"Failed to update the address for project {project_id}. "
-    #         "Please try again or contact support."
-    #     )
+    # Get address_id from cache
+    cached = _get_cached_project(project_id)
+    address_id = ""
+    if cached and cached.get("address"):
+        address_id = str(cached["address"].get("address_id", ""))
 
-    # Feature not yet available — offer transfer or number on phone, contact office on chat
-    logger.info("update_installation_address (not available) for project %s", project_id)
+    # If no address_id cached, fetch it via the get API
+    if not address_id:
+        logger.info("No cached address_id for project %s — fetching", project_id)
+        get_result = await get_installation_address(project_id)
+        try:
+            get_data = json.loads(get_result)
+            address_id = str(get_data.get("address", {}).get("address_id", ""))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    support_number = AuthContext.get_support_number()
+    if not address_id:
+        return (
+            f"Cannot update address for project {project_id}: "
+            "no address_id found. The project may not have an address on file."
+        )
 
-    result: dict = {
-        "project_number": _get_project_number(project_id),
-        "feature_unavailable": True,
-        "message": (
-            "Updating the installation address through the bot is not available yet. "
-            "The office can help with address updates."
-        ),
+    client_id = AuthContext.get_client_id()
+    base_url = get_pf_api_base()
+    url = f"{base_url}/authentication/update-installation-address"
+    headers = build_headers()
+    body: dict[str, Any] = {
+        "address_id": int(address_id),
+        "client_id": client_id,
+        "address1": address1,
+        "city": city,
     }
-    if support_number:
-        result["support_number"] = support_number
+    if state:
+        body["state"] = state
+    if zipcode:
+        body["zipcode"] = zipcode
 
-    return json.dumps(result)
+    pnum = _get_project_number(project_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            log_curl("PUT", url, headers, body)
+            resp = await client.put(url, headers=headers, json=body)
+            log_response(resp, "update_installation_address")
+            resp.raise_for_status()
+
+            _invalidate_projects()
+            updated_address = {
+                "address1": address1,
+                "city": city,
+                "state": state,
+                "zipcode": zipcode,
+            }
+
+            # Save a note for audit trail
+            address_parts = [v for v in [address1, city, state, zipcode] if v]
+            note_text = f"Customer requested installation address update. New address is {', '.join(address_parts)}"
+            try:
+                await add_note(project_id, note_text)
+            except Exception:
+                logger.exception("Failed to save address update note for project %s", project_id)
+
+            return json.dumps({
+                "project_number": pnum,
+                "updated_address": {k: v for k, v in updated_address.items() if v},
+                "message": f"Installation address updated for project {pnum}.",
+            })
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "update_installation_address failed: %d %s",
+            exc.response.status_code,
+            exc.response.text[:500],
+        )
+        return (
+            f"Failed to update the address for project {pnum}. "
+            "Please try again or contact support."
+        )
+    except Exception:
+        logger.exception("update_installation_address error for project %s", project_id)
+        return (
+            f"Failed to update the address for project {pnum}. "
+            "Please try again or contact support."
+        )
