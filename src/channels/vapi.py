@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from auth.context import AuthContext
@@ -49,6 +50,7 @@ from tools.scheduling import (
     cleanup_call_caches,
     clear_reschedule_old_appointment,
     clear_session_projects,
+    get_last_project_id,
     get_reschedule_old_appointment,
     get_session_projects,
     post_call_summary_notes,
@@ -56,6 +58,7 @@ from tools.scheduling import (
     reset_action_flags,
     reset_confirm_flag,
     reset_request_caches,
+    was_address_updated,
     was_cancel_called,
     was_confirm_called,
     was_time_slots_called,
@@ -123,6 +126,12 @@ _store_sessions: dict[str, dict] = {}
 # without re-authenticating on every request.
 _call_auth_cache: dict[str, dict] = {}
 
+# Call-level project pinning: call_id → project_id.
+# Once the scheduling agent starts working on a project during a call,
+# that project_id is locked for the entire call.  Prevents GPT-4o-mini
+# from drifting to a different project (especially during guardrail retries).
+_call_project_pin: dict[str, str] = {}
+
 
 def get_call_auth(call_id: str) -> dict | None:
     """Retrieve cached auth credentials for a call."""
@@ -138,16 +147,17 @@ def remove_call_auth(call_id: str) -> None:
 _BOOKING_CONFIRMATION_PATTERNS = [
     "appointment confirmed",
     "appointment is now confirmed",
-    "is now scheduled",
-    "has been scheduled",
-    "has been successfully scheduled",
-    "successfully scheduled",
+    "appointment is now scheduled",
+    "appointment has been scheduled",
+    "appointment has been successfully scheduled",
+    "installation is now scheduled",
+    "installation has been scheduled",
+    "successfully scheduled your",
     "appointment has been booked",
     "you're all set",
-    "all set",
     "your appointment is confirmed",
     "booking confirmed",
-    "is booked",
+    "appointment is booked",
     "you're scheduled",
     "have been booked",
 ]
@@ -181,11 +191,95 @@ def _looks_like_cancel_confirmation(text: str) -> bool:
 # indicates the LLM is presenting time slots (which must come from get_time_slots).
 _TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
 
+# Scheduling context phrases that indicate the LLM is presenting time slots
+# (vs. project data that happens to mention scheduled times).
+_TIME_SLOT_CONTEXT_PHRASES = [
+    "available time", "time slot", "choose a time", "pick a time",
+    "select a time", "available slot", "open slot", "schedule for",
+    "available for scheduling", "here are the time", "following time",
+]
+
 
 def _looks_like_time_slot_list(text: str) -> bool:
-    """Detect if the response contains a list of time slots (3+ AM/PM times)."""
+    """Detect if the response contains a fabricated list of time slots.
+
+    Requires BOTH 3+ AM/PM times AND scheduling context phrases to avoid
+    false positives on project data that contains scheduled times.
+    """
     matches = _TIME_SLOT_PATTERN.findall(text)
-    return len(matches) >= 3
+    if len(matches) < 3:
+        return False
+    lower = text.lower()
+    return any(phrase in lower for phrase in _TIME_SLOT_CONTEXT_PHRASES)
+
+
+# Patterns the scheduling agent uses when it claims an address was saved/noted
+# without actually calling update_installation_address.
+_ADDRESS_UPDATE_PATTERNS = [
+    "address has been noted",
+    "address has been saved",
+    "address has been updated",
+    "address change has been noted",
+    "address change has been saved",
+    "address update has been noted",
+    "address update has been saved",
+    "i've noted your address",
+    "i've saved your address",
+    "i've updated your address",
+    "your new address",
+    "address will be updated",
+    "office will review and update",
+]
+
+
+def _looks_like_address_update(text: str) -> bool:
+    """Detect if the response claims an address was saved/noted."""
+    lower = text.lower()
+    return any(p in lower for p in _ADDRESS_UPDATE_PATTERNS)
+
+
+# Pattern to strip fabricated time slot sentences (e.g., "Available times are 8 AM, 9 AM, ...")
+_TIME_SLOT_SENTENCE = re.compile(
+    r"[^.!?\n]*\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b[^.!?\n]*(?:[.!?]|\n|$)",
+    re.IGNORECASE,
+)
+
+
+def _strip_time_slots(text: str) -> str:
+    """Remove sentences containing time-slot patterns from a response.
+
+    Used as a last-resort fallback when the LLM fabricates time slots
+    and the retry also fails.
+    """
+    cleaned = _TIME_SLOT_SENTENCE.sub("", text).strip()
+    # If stripping removed everything, keep the original minus the slots list
+    if not cleaned:
+        cleaned = _TIME_SLOT_PATTERN.sub("", text).strip()
+    # Collapse multiple spaces / newlines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"  +", " ", cleaned)
+    return cleaned.strip()
+
+
+# Pattern to detect if a user utterance is a date selection (e.g., "April 29", "the 23rd", "next Monday")
+_DATE_SELECTION_PATTERN = re.compile(
+    r"(?:"
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+\d{1,2}"                       # "April 29"
+    r"|"
+    r"\d{1,2}(?:st|nd|rd|th)"           # "29th", "23rd"
+    r"|"
+    r"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"  # "next Monday"
+    r"|"
+    r"\d{1,2}[/-]\d{1,2}"              # "4/29", "04-29"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_date_selection(text: str) -> bool:
+    """Check if the user's question looks like they're picking a specific date."""
+    return bool(_DATE_SELECTION_PATTERN.search(text))
 
 
 # ── Auth dependency ──────────────────────────────────────────────────────
@@ -559,15 +653,17 @@ def _build_assistant_config(
                         '"Let me try that again." and retry once. '
                         "NEVER say 'I'm having trouble looking that up' or fabricate an error "
                         "message. Only report a problem if the tool fails TWICE.\n"
-                        "11. CRITICAL — YOU CANNOT BOOK APPOINTMENTS YOURSELF. EVERY scheduling step "
-                        "MUST go through ask_scheduling_bot. This includes:\n"
+                        "11. CRITICAL — YOU CANNOT BOOK, CANCEL, OR RESCHEDULE APPOINTMENTS YOURSELF. "
+                        "EVERY scheduling step MUST go through ask_scheduling_bot. This includes:\n"
                         "   - Getting available dates → call ask_scheduling_bot\n"
                         "   - User picks a date/time → call ask_scheduling_bot with their choice\n"
                         "   - User confirms 'yes, book it' → call ask_scheduling_bot with 'yes'\n"
-                        "   The appointment is NOT booked until ask_scheduling_bot returns a message "
-                        "containing 'confirmed' or 'scheduled'. If you haven't received that, "
-                        "the booking DID NOT HAPPEN. Never tell the user their appointment is "
-                        "confirmed unless ask_scheduling_bot explicitly said so.\n"
+                        "   - User wants to cancel → call ask_scheduling_bot with their cancel request\n"
+                        "   - User wants to reschedule → call ask_scheduling_bot with their reschedule request\n"
+                        "   The action is NOT done until ask_scheduling_bot returns a SUCCESS message. "
+                        "NEVER say 'your appointment is booked/cancelled/rescheduled' unless "
+                        "ask_scheduling_bot explicitly said so in its response. "
+                        "If you haven't received confirmation from the tool, THE ACTION DID NOT HAPPEN.\n"
                         "12. Do NOT end the call until ask_scheduling_bot has returned a confirmation "
                         "message OR the user explicitly says goodbye/bye/that's all I need. "
                         "If the user says 'yes' or 'go ahead' to book, you MUST call "
@@ -789,10 +885,15 @@ async def _handle_outbound_assistant_request(
     timezone = (outbound.get("auth_creds") or {}).get("timezone", "US/Eastern")
     hours_context = _build_office_hours_context(office_hours, timezone)
 
+    # Pin project for the entire outbound call (known from SQS message)
+    project_id = outbound.get("project_id", "")
+    if project_id and vapi_call_id:
+        _call_project_pin[vapi_call_id] = project_id
+
     greeting = _generate_outbound_greeting(customer_name, client_name, project_type)
     logger.info(
-        "Outbound config: call_id=%s customer=%s client=%s project_type=%s",
-        our_call_id, customer_name, client_name, project_type,
+        "Outbound config: call_id=%s customer=%s client=%s project_type=%s project_id=%s",
+        our_call_id, customer_name, client_name, project_type, project_id,
     )
 
     return {"assistant": _build_outbound_scheduling_config(
@@ -850,7 +951,8 @@ def _format_prefetched_dates(dates_data: dict) -> str:
     parsed_dates = []
     for d in all_dates:
         try:
-            parsed_dates.append(dt.strptime(d, "%Y-%m-%d"))
+            raw = d["date"] if isinstance(d, dict) else d
+            parsed_dates.append(dt.strptime(raw, "%Y-%m-%d"))
         except (ValueError, TypeError):
             pass
 
@@ -1001,9 +1103,9 @@ def _outbound_scheduling_tools(
             "function": {
                 "name": "add_note",
                 "description": (
-                    "Add a note to the project. For address corrections, "
-                    "start with 'ADDRESS CORRECTION:'. For customer notes, "
-                    "start with 'CUSTOMER NOTE:'."
+                    "Add a note to the project. For address update requests, "
+                    "start with 'Customer requested installation address update. New address is'. "
+                    "For customer notes, start with 'CUSTOMER NOTE:'."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1012,8 +1114,9 @@ def _outbound_scheduling_tools(
                         "note_text": {
                             "type": "string",
                             "description": (
-                                "The note text. Must start with 'ADDRESS CORRECTION:' "
-                                "or 'CUSTOMER NOTE:' as appropriate."
+                                "The note text. For address changes start with "
+                                "'Customer requested installation address update. New address is'. "
+                                "For general notes start with 'CUSTOMER NOTE:'."
                             ),
                         },
                     },
@@ -1185,7 +1288,7 @@ def _build_outbound_scheduling_config(
         "2. confirm_appointment: Call with date and time ONLY after you have "
         "summarized the appointment and the customer has said YES. "
         "NEVER call this without verbal confirmation first.\n"
-        "3. add_note: For address corrections, start note_text with 'ADDRESS CORRECTION:'. "
+        "3. add_note: For address changes, start note_text with 'Customer requested installation address update. New address is'. "
         "For customer notes (gate codes, pets, parking, etc.), start with 'CUSTOMER NOTE:'.\n"
         "4. NEVER read project numbers or IDs aloud to the customer.\n"
         "5. If the customer wants a person, use transferCall.\n"
@@ -1714,24 +1817,52 @@ async def _handle_server_event(body: dict) -> dict:
                 _background_tasks.add(retry_task)
                 retry_task.add_done_callback(_background_tasks.discard)
 
+            _call_project_pin.pop(call_id, None)
             logger.info(
                 "Outbound call ended: our_call_id=%s status=%s reason=%s",
                 our_call_id, outcome["status"], reason,
             )
             return {"status": "ok"}
 
-        # ── Incomplete reschedule detection ────────────────────────
+        # ── Incomplete reschedule detection + auto-recovery ─────────
         session_id_check = f"vapi-{call_id}"
         session_projects = get_session_projects(session_id_check)
+        phone_number = _extract_phone_number(call_data)
         for pid in list(session_projects.keys()):
             if pid in _reschedule_pending:
                 old_appt = get_reschedule_old_appointment(pid)
-                logger.error(
-                    "INCOMPLETE RESCHEDULE: project=%s old_appointment=%s "
-                    "call_id=%s — appointment was cancelled but new one "
-                    "was never booked. Manual recovery required.",
-                    pid, old_appt, call_id,
-                )
+                if old_appt and old_appt.get("date"):
+                    # Try to get creds for auto-recovery
+                    recovery_creds = None
+                    if phone_number:
+                        recovery_creds = get_cached_auth(normalize_phone(phone_number))
+                    if not recovery_creds:
+                        recovery_creds = _call_auth_cache.get(call_id)
+
+                    if recovery_creds and recovery_creds.get("bearer_token"):
+                        logger.warning(
+                            "INCOMPLETE RESCHEDULE — attempting auto-recovery: "
+                            "project=%s old=%s call_id=%s",
+                            pid, old_appt, call_id,
+                        )
+                        task = asyncio.create_task(
+                            _attempt_reschedule_recovery(pid, old_appt, recovery_creds, call_id)
+                        )
+                        _background_tasks.add(task)
+                        task.add_done_callback(_background_tasks.discard)
+                    else:
+                        logger.error(
+                            "INCOMPLETE RESCHEDULE — no creds for recovery: "
+                            "project=%s old_appointment=%s call_id=%s "
+                            "— manual recovery required.",
+                            pid, old_appt, call_id,
+                        )
+                else:
+                    logger.error(
+                        "INCOMPLETE RESCHEDULE — no old appointment cached: "
+                        "project=%s call_id=%s — manual recovery required.",
+                        pid, call_id,
+                    )
                 _reschedule_pending.discard(pid)
                 clear_reschedule_old_appointment(pid)
 
@@ -1783,6 +1914,7 @@ async def _handle_server_event(body: dict) -> dict:
         cleanup_call_caches(session_id)
         _store_sessions.pop(session_key, None)
         _call_auth_cache.pop(call_id, None)
+        _call_project_pin.pop(call_id, None)
     elif event_type == "status-update":
         status = message.get("status", "unknown")
         logger.info("Vapi status-update: call_id=%s status=%s", call_id, status)
@@ -1810,6 +1942,28 @@ async def _process_tool(
             logger.warning("Empty question in %s (call_id=%s)", tool_name, call_id)
             return _build_tool_result(_FALLBACK_MESSAGE, tool_call_id)
 
+        # Inject pinned project context so our Claude agent stays on track.
+        # Once a project is identified in a call, every subsequent question
+        # includes it — preventing GPT/Claude from drifting to another project.
+        pinned = _call_project_pin.get(call_id)
+        if pinned:
+            # Outbound calls are always about ONE project (from SQS).
+            # Inbound calls may involve multiple projects — guide but don't lock.
+            outbound = get_active_call(call_id)
+            if outbound:
+                question = (
+                    f"[CONTEXT: This call is about project_id={pinned}. "
+                    f"Use ONLY this project for all tool calls.]\n{question}"
+                )
+            else:
+                question = (
+                    f"[CONTEXT: The customer was last discussing project_id={pinned}. "
+                    f"When they say 'this project', 'same project', 'cancel this', "
+                    f"'schedule this', etc. — use project_id={pinned}. "
+                    f"Only switch if they explicitly mention a different project "
+                    f"by name or number.]\n{question}"
+                )
+
         logger.info(
             "Vapi ask_scheduling_bot question: call_id=%s q=%s",
             call_id, question[:500],
@@ -1830,6 +1984,27 @@ async def _process_tool(
             response_text = extract_response_text(response.output)
             voice_text = format_for_voice(response_text)
             agent_name = response.metadata.agent_name if response.metadata else ""
+
+            # Pin/update project for the call when any tool uses a project_id.
+            # - Outbound calls: pinned at assistant-request, never overwritten here.
+            # - Inbound calls: tracks the active project. Updates if the customer
+            #   explicitly switches to a different project (e.g., "now schedule
+            #   my other project"). Context injection guides vague references
+            #   ("this project", "same project") to the pinned project.
+            used_project = get_last_project_id()
+            if used_project:
+                is_outbound = bool(get_active_call(call_id))
+                prev_pin = _call_project_pin.get(call_id)
+                if not prev_pin:
+                    _call_project_pin[call_id] = used_project
+                    logger.info("Pinned project_id=%s for call_id=%s", used_project, call_id)
+                elif not is_outbound and prev_pin != used_project:
+                    # Inbound: customer switched projects explicitly
+                    logger.info(
+                        "Project switch %s → %s for call_id=%s",
+                        prev_pin, used_project, call_id,
+                    )
+                    _call_project_pin[call_id] = used_project
 
             # Guardrail: detect hallucinated booking confirmations.
             # If the scheduling agent says "confirmed" without calling
@@ -1861,14 +2036,52 @@ async def _process_tool(
                     "Fabricated time slots in Vapi call (call_id=%s) — retrying",
                     call_id,
                 )
+                # Check if the user's question was a date selection — if so,
+                # the retry should call get_time_slots for that date, not re-list dates.
+                if _looks_like_date_selection(question):
+                    retry_prompt = (
+                        f"You fabricated time slots. The customer selected '{question}'. "
+                        "You MUST call get_time_slots NOW for that date to get the REAL "
+                        "available time slots. Do NOT re-list dates — the customer already "
+                        "chose a date. Call get_time_slots and present ONLY the slots it returns."
+                    )
+                else:
+                    retry_prompt = (
+                        "You listed time slots but you did NOT call the get_time_slots tool. "
+                        "Those time slots are FABRICATED and WRONG. Remove ALL time slot "
+                        "mentions from your response. Present ONLY the available dates. "
+                        "Once the customer picks a date, THEN call get_time_slots to get "
+                        "real time slots."
+                    )
+            elif not was_address_updated() and _looks_like_address_update(voice_text):
+                logger.warning(
+                    "Hallucinated address update in Vapi call (call_id=%s) — retrying",
+                    call_id,
+                )
                 retry_prompt = (
-                    "You listed time slots but you did NOT call the get_time_slots tool. "
-                    "Those time slots are FABRICATED and WRONG. You MUST call "
-                    "get_time_slots(project_id, date) NOW to get the real available "
-                    "time slots. NEVER guess or make up time slots."
+                    "You told the customer the address was saved/noted but you did NOT call "
+                    "update_installation_address. The address is NOT saved. "
+                    "You MUST call update_installation_address NOW with the address details "
+                    "the customer provided. After that, call add_note starting with "
+                    "'CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE'. "
+                    "Do NOT tell the customer the address is saved until BOTH tools succeed."
                 )
 
             if retry_prompt:
+                # Pin the project so GPT cannot drift to a different project
+                # during the retry (fixes project-switching bug).
+                pinned_project = get_last_project_id()
+                if pinned_project:
+                    retry_prompt = (
+                        f"IMPORTANT: You are working on project_id={pinned_project}. "
+                        f"Do NOT switch to any other project. Use ONLY project_id="
+                        f"{pinned_project} for all tool calls. " + retry_prompt
+                    )
+                # Suppress LLM self-correction text
+                retry_prompt += (
+                    " Respond ONLY with the correct answer. "
+                    "Do NOT apologize or explain what went wrong."
+                )
                 reset_action_flags()
                 response = await orchestrator.route_request(
                     user_input=retry_prompt,
@@ -1877,11 +2090,17 @@ async def _process_tool(
                     additional_params={"channel": "vapi"},
                 )
                 retry_text = extract_response_text(response.output)
-                if was_confirm_called() or was_cancel_called() or was_time_slots_called():
+                if was_confirm_called() or was_cancel_called() or was_time_slots_called() or was_address_updated():
                     voice_text = format_for_voice(retry_text)
                     logger.info("Vapi retry succeeded — required tool was called")
+                elif not _looks_like_time_slot_list(retry_text):
+                    # Retry didn't call the tool but also didn't fabricate — accept it
+                    voice_text = format_for_voice(retry_text)
+                    logger.info("Vapi retry succeeded — no fabricated slots in response")
                 else:
-                    logger.warning("Vapi retry also failed to call the required tool")
+                    # Retry still has fabricated slots — strip them as last resort
+                    logger.warning("Vapi retry also fabricated slots — stripping them")
+                    voice_text = _strip_time_slots(voice_text)
         except Exception:
             logger.exception("Orchestrator error during Vapi call (call_id=%s)", call_id)
             voice_text = _FALLBACK_MESSAGE
@@ -2222,6 +2441,93 @@ async def _set_auth_context_from_phone(call_data: dict, session_id: str) -> None
         )
     except Exception:
         logger.exception("Phone auth failed for session %s", session_id)
+
+
+async def _attempt_reschedule_recovery(
+    project_id: str,
+    old_appt: dict,
+    creds: dict,
+    call_id: str,
+) -> None:
+    """Attempt to rebook the original appointment after an incomplete reschedule.
+
+    When a reschedule flow is interrupted (caller hangs up, call drops),
+    the old appointment has already been cancelled.  This function tries to
+    rebook the original date/time so the customer doesn't lose their slot.
+    """
+    AuthContext.set(
+        auth_token=creds.get("bearer_token", ""),
+        client_id=creds.get("client_id", ""),
+        customer_id=str(creds.get("customer_id", "")),
+    )
+    raw_date = old_appt.get("date", "")
+    old_time = old_appt.get("time", "")
+
+    if not raw_date:
+        logger.error(
+            "RESCHEDULE RECOVERY SKIP: project=%s — no date in old appointment",
+            project_id,
+        )
+        return
+
+    # Parse the cached date — may be "04-24-2026 08:00 AM" or "2026-04-24"
+    old_date = raw_date
+    for fmt in ("%m-%d-%Y %I:%M %p", "%m-%d-%Y", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(raw_date.strip(), fmt)
+            old_date = parsed.strftime("%Y-%m-%d")
+            if not old_time and fmt == "%m-%d-%Y %I:%M %p":
+                old_time = parsed.strftime("%I:%M %p").lstrip("0")
+            break
+        except ValueError:
+            continue
+
+    logger.info(
+        "RESCHEDULE RECOVERY: parsed date=%s time=%s from raw=%s",
+        old_date, old_time, raw_date,
+    )
+
+    try:
+        # Ensure we have available dates cached (primes _request_id_by_project)
+        await sched_get_available_dates(project_id)
+
+        result = await sched_confirm_appointment(project_id, old_date, old_time)
+        result_lower = result.lower() if isinstance(result, str) else ""
+
+        if "submit" in result_lower or "schedul" in result_lower or "confirm" in result_lower:
+            logger.info(
+                "RESCHEDULE RECOVERY SUCCESS: project=%s rebooked at %s %s call_id=%s",
+                project_id, old_date, old_time, call_id,
+            )
+            await sched_add_note(
+                project_id,
+                f"AUTO-RECOVERY: Original appointment ({old_date} {old_time}) "
+                "was restored after incomplete reschedule during phone call.",
+            )
+        else:
+            logger.error(
+                "RESCHEDULE RECOVERY FAILED: project=%s result=%s call_id=%s",
+                project_id, result, call_id,
+            )
+            await sched_add_note(
+                project_id,
+                f"INCOMPLETE RESCHEDULE: Original appointment ({old_date} {old_time}) "
+                f"was cancelled but could not be restored. "
+                f"Recovery result: {result[:200]}. Manual recovery required.",
+            )
+    except Exception:
+        logger.exception(
+            "RESCHEDULE RECOVERY ERROR: project=%s call_id=%s", project_id, call_id,
+        )
+        try:
+            await sched_add_note(
+                project_id,
+                f"INCOMPLETE RESCHEDULE: Original appointment ({old_date} {old_time}) "
+                "was cancelled but auto-recovery failed with an error. "
+                "Manual recovery required.",
+            )
+        except Exception:
+            logger.exception("Failed to add recovery-failure note for project=%s", project_id)
 
 
 def _extract_phone_number(call_data: dict) -> str:

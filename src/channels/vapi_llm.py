@@ -92,16 +92,17 @@ def _wants_transfer(text: str) -> bool:
 _BOOKING_CONFIRMATION_PATTERNS = [
     "appointment confirmed",
     "appointment is now confirmed",
-    "is now scheduled",
-    "has been scheduled",
-    "has been successfully scheduled",
-    "successfully scheduled",
+    "appointment is now scheduled",
+    "appointment has been scheduled",
+    "appointment has been successfully scheduled",
+    "installation is now scheduled",
+    "installation has been scheduled",
+    "successfully scheduled your",
     "appointment has been booked",
     "you're all set",
-    "all set",
     "your appointment is confirmed",
     "booking confirmed",
-    "is booked",
+    "appointment is booked",
     "you're scheduled",
     "have been booked",
 ]
@@ -121,6 +122,12 @@ _CANCEL_CONFIRMATION_PATTERNS = [
 
 _TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
 
+_TIME_SLOT_CONTEXT_PHRASES = [
+    "available time", "time slot", "choose a time", "pick a time",
+    "select a time", "available slot", "open slot", "schedule for",
+    "available for scheduling", "here are the time", "following time",
+]
+
 
 def _looks_like_booking_confirmation(text: str) -> bool:
     lower = text.lower()
@@ -133,9 +140,16 @@ def _looks_like_cancel_confirmation(text: str) -> bool:
 
 
 def _looks_like_time_slot_list(text: str) -> bool:
-    """Detect if the response contains a list of time slots (3+ AM/PM times)."""
+    """Detect if the response contains a fabricated list of time slots.
+
+    Requires BOTH 3+ AM/PM times AND scheduling context phrases to avoid
+    false positives on project data that contains scheduled times.
+    """
     matches = _TIME_SLOT_PATTERN.findall(text)
-    return len(matches) >= 3
+    if len(matches) < 3:
+        return False
+    lower = text.lower()
+    return any(phrase in lower for phrase in _TIME_SLOT_CONTEXT_PHRASES)
 
 
 # ── OpenAI SSE chunk builders ─────────────────────────────────────────────

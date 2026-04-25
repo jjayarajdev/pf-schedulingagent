@@ -24,6 +24,7 @@ from tools.scheduling import (
     reset_action_flags,
     reset_confirm_flag,
     reset_request_caches,
+    was_address_updated,
     was_cancel_called,
     was_confirm_called,
     was_time_slots_called,
@@ -37,6 +38,13 @@ router = APIRouter(prefix="", tags=["chat"])
 _background_tasks: set[asyncio.Task] = set()
 
 _WELCOME_TRIGGER = "__WELCOME__"
+
+# Session-keyed cache of pending confirmation details.
+# When the LLM returns confirmation_required=true, we store the appointment
+# details here so that when the user clicks Confirm, we can inject context
+# telling the LLM exactly which confirm_appointment call to make.
+# Keyed by session_id → {"project_id": ..., "date": ..., "time": ...}
+_pending_confirmations: dict[str, dict] = {}
 
 # Maps AgentSquad agent names → v1.2.9 intent values
 _AGENT_TO_INTENT = {
@@ -217,16 +225,17 @@ def _close_truncated_json(json_str: str) -> str | None:
 _BOOKING_CONFIRMATION_PATTERNS = [
     "appointment confirmed",
     "appointment is now confirmed",
-    "is now scheduled",
-    "has been scheduled",
-    "has been successfully scheduled",
-    "successfully scheduled",
+    "appointment is now scheduled",
+    "appointment has been scheduled",
+    "appointment has been successfully scheduled",
+    "installation is now scheduled",
+    "installation has been scheduled",
+    "successfully scheduled your",
     "appointment has been booked",
     "you're all set",
-    "all set",
     "your appointment is confirmed",
     "booking confirmed",
-    "is booked",
+    "appointment is booked",
     "you're scheduled",
     "have been booked",
     "address has been updated",
@@ -288,14 +297,74 @@ def _looks_like_fabricated_failure(text: str, user_message: str) -> bool:
     return any(p in lower for p in _FABRICATED_FAILURE_PATTERNS)
 
 
-# Regex to detect fabricated time slots: 3+ AM/PM time patterns in a response
-_TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
+# Regex to detect fabricated time slots: 3+ AM/PM time patterns in a response.
+# Only AM/PM — 24h format ("08:00:00") in JSON project data is NOT a fabricated slot.
+_TIME_SLOT_PATTERN_AMPM = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
+
+# Scheduling context phrases that indicate the LLM is presenting time slots
+# (vs. project data that happens to mention scheduled times).
+_TIME_SLOT_CONTEXT_PHRASES = [
+    "available time", "time slot", "choose a time", "pick a time",
+    "select a time", "available slot", "open slot", "schedule for",
+    "available for scheduling", "here are the time", "following time",
+]
 
 
 def _looks_like_time_slot_list(text: str) -> bool:
-    """Detect if the response contains a list of time slots (3+ AM/PM times)."""
-    matches = _TIME_SLOT_PATTERN.findall(text)
-    return len(matches) >= 3
+    """Detect if the response contains a fabricated list of time slots.
+
+    Requires BOTH 3+ AM/PM times AND scheduling context phrases to avoid
+    false positives on project data that contains scheduled times.
+    """
+    matches = _TIME_SLOT_PATTERN_AMPM.findall(text)
+    if len(matches) < 3:
+        return False
+    lower = text.lower()
+    return any(phrase in lower for phrase in _TIME_SLOT_CONTEXT_PHRASES)
+
+
+# Pattern to detect if a user message is a date selection
+_DATE_SELECTION_PATTERN = re.compile(
+    r"(?:"
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+\d{1,2}"
+    r"|"
+    r"\d{1,2}(?:st|nd|rd|th)"
+    r"|"
+    r"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|"
+    r"\d{1,2}[/-]\d{1,2}"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_date_selection(text: str) -> bool:
+    """Check if the user's message looks like they're picking a specific date."""
+    return bool(_DATE_SELECTION_PATTERN.search(text))
+
+
+_ADDRESS_UPDATE_PATTERNS = [
+    "address has been noted",
+    "address has been saved",
+    "address has been updated",
+    "address change has been noted",
+    "address change has been saved",
+    "address update has been noted",
+    "address update has been saved",
+    "i've noted your address",
+    "i've saved your address",
+    "i've updated your address",
+    "your new address",
+    "address will be updated",
+    "office will review and update",
+]
+
+
+def _looks_like_address_update(text: str) -> bool:
+    """Detect if the response claims an address was saved/noted."""
+    lower = text.lower()
+    return any(p in lower for p in _ADDRESS_UPDATE_PATTERNS)
 
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
@@ -326,6 +395,32 @@ def _strip_markdown_bold(text: str) -> str:
             parts[i] = re.sub(r"\*\*(.+?)\*\*", r"\1", part)
             parts[i] = re.sub(r"__(.+?)__", r"\1", parts[i])
     return "".join(parts)
+
+
+# Patterns that indicate the LLM is explaining its own mistake to the customer
+_SELF_CORRECTION_PATTERNS = [
+    r"I apologize for that error.*?(?:\.|$)",
+    r"Let me correct my approach.*?(?:\.|$)",
+    r"I should (?:ONLY|only|never|always).*?(?:\.|$)",
+    r"I must (?:call|always|never).*?(?:\.|$)",
+    r"I should never fabricate.*?(?:\.|$)",
+    r"Thank you for the correction.*?(?:\.|$)",
+    r"You'?re absolutely right.*?(?:\.|$)",
+]
+_SELF_CORRECTION_RE = re.compile("|".join(_SELF_CORRECTION_PATTERNS), re.IGNORECASE)
+
+
+def _strip_self_correction(text: str) -> str:
+    """Remove LLM self-correction sentences that leak internal guardrail logic.
+
+    These occur when the guardrail retry triggers and the LLM acknowledges
+    the correction instead of just providing the right answer.
+    """
+    cleaned = _SELF_CORRECTION_RE.sub("", text)
+    # Collapse whitespace
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"  +", " ", cleaned)
+    return cleaned.strip()
 
 
 def _group_time_slots(display_slots: list[str]) -> dict:
@@ -405,11 +500,17 @@ def _enrich_json_block(response_text: str) -> str:
     is_dates_response = bool(data.get("available_dates"))
 
     # Convert available_dates from ISO (YYYY-MM-DD) to US format (MM/DD/YYYY)
+    # Dates may be strings ("2026-04-24") or dicts ({"date": "2026-04-24", "day": "Friday"})
     if is_dates_response:
         us_dates = []
         for d in data["available_dates"]:
-            parts = d.split("-") if isinstance(d, str) else []
-            us_dates.append(f"{parts[1]}/{parts[2]}/{parts[0]}" if len(parts) == 3 else d)
+            raw = d["date"] if isinstance(d, dict) else d
+            parts = raw.split("-") if isinstance(raw, str) else []
+            converted = f"{parts[1]}/{parts[2]}/{parts[0]}" if len(parts) == 3 else raw
+            if isinstance(d, dict):
+                us_dates.append({**d, "date": converted})
+            else:
+                us_dates.append(converted)
         data["available_dates"] = us_dates
         modified = True
 
@@ -429,16 +530,17 @@ def _enrich_json_block(response_text: str) -> str:
             elif isinstance(entry, dict) and "date" in entry:
                 cached_iso_dates.add(entry["date"])
 
-        # Convert available_dates back to ISO for comparison (may already be MM/DD/YYYY)
+        # Convert available_dates back to ISO for comparison (may already be MM/DD/YYYY or dict)
         response_iso_dates: set[str] = set()
         for d in data.get("available_dates", []):
-            if isinstance(d, str):
-                parts = d.split("/")
+            raw = d["date"] if isinstance(d, dict) else d
+            if isinstance(raw, str):
+                parts = raw.split("/")
                 if len(parts) == 3 and len(parts[2]) == 4:
                     # MM/DD/YYYY → YYYY-MM-DD
                     response_iso_dates.add(f"{parts[2]}-{parts[0]}-{parts[1]}")
                 else:
-                    response_iso_dates.add(d)
+                    response_iso_dates.add(raw)
 
         # Only inject if there's meaningful overlap (at least 1 shared date)
         weather_matches = bool(cached_iso_dates & response_iso_dates)
@@ -498,6 +600,29 @@ def _enrich_json_block(response_text: str) -> str:
             or data.get("slots")
             or []
         )
+
+        # Server-side injection: replace LLM-fabricated slots with the real
+        # ones from get_time_slots.  The LLM often adds hourly business-hour
+        # slots on top of the 2 real slots the API returned.
+        if slots:
+            from tools.scheduling import get_last_time_slots
+
+            cached_slots = get_last_time_slots()
+            if cached_slots and len(slots) != len(cached_slots):
+                logger.warning(
+                    "Time slot injection: LLM has %d slots, API returned %d — replacing",
+                    len(slots),
+                    len(cached_slots),
+                )
+                # Normalize keys to time_slots for downstream processing
+                for variant in ("time_slots", "timeSlots", "available_slots",
+                                "available_time_slots", "available_times", "times", "slots"):
+                    data.pop(variant, None)
+                data["time_slots"] = cached_slots
+                slots = cached_slots
+                data["message"] = f"Found {len(cached_slots)} available time slot(s) for {data.get('date', 'the selected date')}."
+                modified = True
+
         if slots and "timeSlotsGrouped" not in data:
             # Build display names from slot objects or strings
             display: list[str] = []
@@ -563,6 +688,8 @@ def _detect_response_signals(response_text: str) -> dict:
                 if pending:
                     signals["pending_action"] = pending
                     signals["action"] = "confirm_appointment_preview"
+                # Extract raw confirm params for session-level injection
+                _extract_confirm_params(data, signals)
         except (json.JSONDecodeError, AttributeError):
             signals["confirmation_required"] = False
     else:
@@ -649,6 +776,33 @@ def _build_pending_action(json_data: dict) -> dict | None:
     }
 
     return pending if any(v for v in pending.values()) else None
+
+
+def _extract_confirm_params(json_data: dict, signals: dict) -> None:
+    """Extract raw confirm_appointment parameters from the LLM's JSON block.
+
+    These are stored in ``signals["confirm_params"]`` and later cached in
+    ``_pending_confirmations`` so the next user message ("Confirm") can
+    inject them into the prompt, preventing the LLM from restarting the
+    scheduling flow instead of calling confirm_appointment.
+    """
+    d = json_data
+    for nested_key in ("appointment_details", "appointment", "details",
+                       "project_details", "scheduling_details"):
+        if nested_key in d and isinstance(d[nested_key], dict):
+            d = {**d, **d[nested_key]}
+            break
+
+    project_id = str(d.get("project_id", "") or d.get("project_number", ""))
+    raw_date = d.get("date", "") or d.get("scheduled_date", "")
+    raw_time = d.get("time", "") or d.get("scheduled_time", "")
+
+    if project_id and raw_date and raw_time:
+        signals["confirm_params"] = {
+            "project_id": project_id,
+            "date": raw_date,
+            "time": raw_time,
+        }
 
 
 def _infer_intent(agent_name: str) -> str:
@@ -740,9 +894,25 @@ async def chat(request: ChatRequest, raw_request: Request):
     start_time = time.monotonic()
     reset_action_flags()
     reset_request_caches()
+
+    # If the user is confirming a pending appointment, inject the exact
+    # parameters so the LLM calls confirm_appointment instead of restarting
+    # the scheduling flow (e.g. calling get_available_dates again).
+    user_input = request.message
+    pending = _pending_confirmations.get(session_id)
+    if pending and _AFFIRMATIVE_PATTERNS.match(user_input.strip()):
+        user_input = (
+            f"[CONTEXT: The customer confirmed the appointment. "
+            f"Call confirm_appointment NOW with project_id={pending['project_id']}, "
+            f"date={pending['date']}, time={pending['time']}. "
+            f"Do NOT call get_available_dates or any other tool — just confirm.]\n"
+            f"{user_input}"
+        )
+        logger.info("Injected confirm context for session %s", session_id)
+
     try:
         response = await orchestrator.route_request(
-            user_input=request.message,
+            user_input=user_input,
             user_id=user_id,
             session_id=session_id,
             additional_params={"channel": "chat"},
@@ -789,14 +959,39 @@ async def chat(request: ChatRequest, raw_request: Request):
     elif not was_time_slots_called() and _looks_like_time_slot_list(response_text):
         logger.warning("Fabricated time slots detected — retrying with forced tool call")
         should_retry = True
+        if _looks_like_date_selection(request.message):
+            retry_prompt = (
+                f"You fabricated time slots. The customer selected '{request.message}'. "
+                "You MUST call get_time_slots NOW for that date to get the REAL "
+                "available time slots. Do NOT re-list dates — the customer already "
+                "chose a date. Call get_time_slots and present ONLY the slots it returns."
+            )
+        else:
+            retry_prompt = (
+                "You listed time slots but you did NOT call the get_time_slots tool. "
+                "Those time slots are FABRICATED and WRONG. Remove ALL time slot "
+                "mentions from your response. Present ONLY the available dates. "
+                "Once the customer picks a date, THEN call get_time_slots to get "
+                "real time slots."
+            )
+    elif not was_address_updated() and _looks_like_address_update(response_text):
+        logger.warning("Hallucinated address update detected — retrying with forced tool call")
+        should_retry = True
         retry_prompt = (
-            "You listed time slots but you did NOT call the get_time_slots tool. "
-            "Those time slots are FABRICATED and WRONG. You MUST call "
-            "get_time_slots(project_id, date) NOW to get the real available "
-            "time slots. NEVER guess or make up time slots."
+            "You told the customer the address was saved/noted but you did NOT call "
+            "update_installation_address. The address is NOT saved. "
+            "You MUST call update_installation_address NOW with the address details "
+            "the customer provided. After that, call add_note starting with "
+            "'CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE'. "
+            "Do NOT tell the customer the address is saved until BOTH tools succeed."
         )
 
     if should_retry:
+        # Suppress LLM self-correction text ("I apologize for that error...")
+        retry_prompt += (
+            " Respond ONLY with the correct answer for the customer. "
+            "Do NOT apologize, acknowledge mistakes, or explain what went wrong."
+        )
         reset_action_flags()
         try:
             response = await orchestrator.route_request(
@@ -806,17 +1001,22 @@ async def chat(request: ChatRequest, raw_request: Request):
                 additional_params={"channel": "chat"},
             )
             retry_text = extract_response_text(response.output)
-            if was_confirm_called() or was_cancel_called() or was_time_slots_called():
+            if was_confirm_called() or was_cancel_called() or was_time_slots_called() or was_address_updated():
                 response_text = retry_text
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
                 logger.info("Retry succeeded — required tool was called")
+            elif not _looks_like_time_slot_list(retry_text):
+                response_text = retry_text
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                logger.info("Retry succeeded — no fabricated slots in response")
             else:
-                logger.warning("Retry also failed to call the required tool")
+                logger.warning("Retry also fabricated slots")
         except Exception:
             logger.exception("Retry failed")
 
     response_text = _repair_json_blocks(response_text)
     response_text = _strip_markdown_bold(response_text)
+    response_text = _strip_self_correction(response_text)
     agent_name = response.metadata.agent_name
 
     logger.info(
@@ -832,6 +1032,13 @@ async def chat(request: ChatRequest, raw_request: Request):
     # Detect confirmation requests and PF API errors from response text
     signals = _detect_response_signals(response_text)
     intent = _infer_intent(agent_name)
+
+    # Cache or clear pending confirmation for this session
+    if signals.get("confirmation_required") and signals.get("confirm_params"):
+        _pending_confirmations[session_id] = signals["confirm_params"]
+        logger.info("Cached pending confirmation for session %s: %s", session_id, signals["confirm_params"])
+    else:
+        _pending_confirmations.pop(session_id, None)
 
     # Strip JSON block for confirmation responses — frontend uses pending_action instead
     response_text = _strip_json_block_for_confirmation(response_text, signals)
@@ -922,9 +1129,23 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
 
     orchestrator = get_orchestrator()
     start_time = time.monotonic()
+
+    # Inject confirm context for streaming endpoint too
+    user_input = request.message
+    pending = _pending_confirmations.get(session_id)
+    if pending and _AFFIRMATIVE_PATTERNS.match(user_input.strip()):
+        user_input = (
+            f"[CONTEXT: The customer confirmed the appointment. "
+            f"Call confirm_appointment NOW with project_id={pending['project_id']}, "
+            f"date={pending['date']}, time={pending['time']}. "
+            f"Do NOT call get_available_dates or any other tool — just confirm.]\n"
+            f"{user_input}"
+        )
+        logger.info("Injected confirm context for session %s (stream)", session_id)
+
     try:
         response = await orchestrator.route_request(
-            user_input=request.message,
+            user_input=user_input,
             user_id=user_id,
             session_id=session_id,
             stream_response=True,
@@ -963,6 +1184,12 @@ async def chat_stream(request: ChatRequest, raw_request: Request):
         full_text = _enrich_json_block(full_text)
         signals = _detect_response_signals(full_text)
         intent = _infer_intent(agent_name)
+
+        # Cache or clear pending confirmation for this session
+        if signals.get("confirmation_required") and signals.get("confirm_params"):
+            _pending_confirmations[session_id] = signals["confirm_params"]
+        else:
+            _pending_confirmations.pop(session_id, None)
 
         # Strip JSON block for confirmation responses
         display_text = _strip_json_block_for_confirmation(full_text, signals)
