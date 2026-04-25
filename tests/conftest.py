@@ -47,15 +47,24 @@ def _clear_auth_context():
 @pytest.fixture(autouse=True)
 def _clear_scheduling_caches():
     """Clear scheduling tool caches between tests."""
-    from tools.scheduling import _projects_cache, _request_id_by_project
+    from tools.scheduling import (
+        _projects_cache,
+        _request_id_by_project,
+        _session_notes,
+        _session_projects,
+    )
 
     _projects_cache.clear()
     _request_id_by_project.clear()
+    _session_notes.clear()
+    _session_projects.clear()
     # Pre-populate for unit tests that call get_time_slots/confirm_appointment directly
     _request_id_by_project["123"] = 90001234
     yield
     _projects_cache.clear()
     _request_id_by_project.clear()
+    _session_notes.clear()
+    _session_projects.clear()
 
 
 @pytest.fixture()

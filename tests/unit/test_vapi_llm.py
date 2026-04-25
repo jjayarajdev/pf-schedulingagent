@@ -761,10 +761,19 @@ class TestHelpers:
 
         assert _looks_like_booking_confirmation("Your appointment is confirmed for Tuesday!")
         assert _looks_like_booking_confirmation("You're all set!")
+        assert _looks_like_booking_confirmation("Your appointment is now scheduled for April 27th")
         assert not _looks_like_booking_confirmation("Would you like to confirm?")
+        # Project status text should NOT trigger (false positive fix)
+        assert not _looks_like_booking_confirmation("This project is now scheduled for April 27th")
+        assert not _looks_like_booking_confirmation("The project has been scheduled for next week")
 
     def test_looks_like_time_slot_list(self):
         from channels.vapi_llm import _looks_like_time_slot_list
 
-        assert _looks_like_time_slot_list("Available: 8:00 AM, 9:00 AM, 10:00 AM")
+        # Fabricated time slots with scheduling context → detected
+        assert _looks_like_time_slot_list("Available time slots: 8:00 AM, 9:00 AM, 10:00 AM")
+        assert _looks_like_time_slot_list("Here are the time slots: 8 AM, 9 AM, 10 AM, 11 AM")
+        # Single time → not detected
         assert not _looks_like_time_slot_list("Your appointment is at 9:00 AM")
+        # Multiple times but no scheduling context (e.g., project data) → not detected
+        assert not _looks_like_time_slot_list("Project scheduled 8:00 AM, next at 9:00 AM, third at 10:00 AM")

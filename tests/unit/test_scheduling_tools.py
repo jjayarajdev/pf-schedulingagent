@@ -19,6 +19,7 @@ from tools.scheduling import (
     get_business_hours,
     get_installation_address,
     get_project_details,
+    get_session_notes,
     get_time_slots,
     list_notes,
     list_projects,
@@ -344,8 +345,11 @@ class TestGetAvailableDates:
             result = await get_available_dates("123")
         data = json.loads(result)
         assert "available_time_slots" not in data
-        assert "MUST call get_time_slots" in data["message"]
-        assert "Do NOT guess" in data["message"]
+        # LLM instructions are in _llm_instruction, not in the customer-facing message
+        assert "MUST call get_time_slots" in data["_llm_instruction"]
+        assert "Do NOT guess" in data["_llm_instruction"]
+        # Customer-facing message should be clean
+        assert "MUST call" not in data["message"]
 
     async def test_empty_slots_also_instructs_get_time_slots(self, mock_httpx_client, mock_httpx_response):
         """Even with empty slots, response tells LLM to call get_time_slots."""
@@ -357,7 +361,7 @@ class TestGetAvailableDates:
             result = await get_available_dates("123")
         data = json.loads(result)
         assert "available_time_slots" not in data
-        assert "MUST call get_time_slots" in data["message"]
+        assert "MUST call get_time_slots" in data["_llm_instruction"]
 
     async def test_past_date_clamped_to_tomorrow(self, mock_httpx_client, mock_httpx_response):
         """Past start_date is silently clamped to tomorrow — API still called."""
@@ -560,26 +564,48 @@ class TestAddNote:
             result = await add_note("123", "Test note")
         assert "successfully" in result.lower()
 
-    async def test_customer_general_note_uses_communication_endpoint(self):
-        """Customer general notes route to /communication/client/.../project/.../note."""
-        mock_resp = MagicMock(status_code=200)
-        mock_resp.json.return_value = {"status": "ok"}
-        mock_resp.raise_for_status = MagicMock()
-        mock_resp.request = MagicMock(method="POST")
-        mock_resp.url = "https://test.com"
+    async def test_customer_note_posts_immediately_for_chat(self):
+        """Chat channel: customer notes post immediately to /communication/.../note."""
+        from observability.logging import RequestContext
 
-        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_cls.return_value = mock_client
+        RequestContext.set(session_id="test-session", channel="chat")
+        try:
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = {"status": "ok"}
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.request = MagicMock(method="POST")
+            mock_resp.url = "https://test.com"
 
-            await add_note("123", "General customer note")
+            with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_client.post.return_value = mock_resp
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_cls.return_value = mock_client
 
-        url = mock_client.post.call_args[0][0]
-        assert "/communication/client/" in url
-        assert "/project/123/note" in url
+                result = await add_note("123", "General customer note")
+
+            assert "Note added successfully" in result
+            url = mock_client.post.call_args[0][0]
+            assert "/communication/client/" in url
+            assert "/project/123/note" in url
+        finally:
+            RequestContext.clear()
+
+    async def test_customer_note_caches_for_vapi_channel(self):
+        """Vapi channel: customer notes are cached for deferred end-of-call posting."""
+        from observability.logging import RequestContext
+
+        RequestContext.set(session_id="test-session", channel="vapi")
+        try:
+            result = await add_note("123", "General customer note")
+            assert "Note added successfully" in result
+
+            notes = get_session_notes("test-session")
+            assert "123" in notes
+            assert "General customer note" in notes["123"]
+        finally:
+            RequestContext.clear()
 
     async def test_customer_cancel_note_uses_add_note_endpoint(self):
         """Customer cancel/reschedule reason notes route to /project-notes/add-note."""
@@ -646,14 +672,14 @@ class TestAddNote:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_cls.return_value = mock_client
 
-            await add_note("123", "ADDRESS CORRECTION: 910 North Harbor Drive, San Diego, CA 92101")
+            await add_note("123", "CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE. New address is 910 North Harbor Drive, San Diego, CA 92101")
 
         url = mock_client.post.call_args[0][0]
         payload = mock_client.post.call_args[1].get("json", {})
         assert "/project-notes/update-address-note" in url
         assert payload["client_id"] == "test-client-123"
         assert payload["project_id"] == 123
-        assert "ADDRESS CORRECTION:" in payload["note_text"]
+        assert "CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE" in payload["note_text"]
 
     async def test_store_address_correction_uses_add_note_endpoint(self):
         """Store caller address corrections route to /project-notes/add-note, not update-address."""
@@ -855,21 +881,23 @@ class TestGetInstallationAddress:
 
 
 class TestUpdateInstallationAddress:
-    async def test_returns_feature_unavailable(self):
-        """Update returns feature unavailable message directing user to call office."""
-        result = await update_installation_address(
-            "123", address1="123 New St", city="New City",
-        )
-        data = json.loads(result)
-        assert data["project_number"] == "123"
-        assert data["feature_unavailable"] is True
-        assert "not available" in data["message"].lower()
-        assert "office" in data["message"].lower()
+    async def test_returns_error_when_no_address_id(self, mock_httpx_client, mock_httpx_response):
+        """Update returns error when no address_id can be found."""
+        # get_installation_address returns no address_id
+        response = mock_httpx_response(200, {"data": {}})
+        with mock_httpx_client(response=response):
+            result = await update_installation_address(
+                "123", address1="123 New St", city="New City",
+            )
+        assert "cannot update address" in result.lower()
+        assert "no address_id" in result.lower()
 
-    async def test_sets_confirm_flag(self):
+    async def test_sets_confirm_flag(self, mock_httpx_client, mock_httpx_response):
         """update_installation_address sets the confirm flag for guardrail."""
         from tools.scheduling import was_confirm_called, reset_confirm_flag
 
         reset_confirm_flag()
-        await update_installation_address("123", address1="Test", city="City")
+        response = mock_httpx_response(200, {"data": {}})
+        with mock_httpx_client(response=response):
+            await update_installation_address("123", address1="Test", city="City")
         assert was_confirm_called() is True
