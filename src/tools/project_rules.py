@@ -17,7 +17,7 @@ class ProjectStatusRules:
     """
 
     # Status categories (lowercase for comparison)
-    SCHEDULABLE: set[str] = {"new", "pending reschedule", "not scheduled", "ready to schedule"}
+    SCHEDULABLE: set[str] = {"new", "pending reschedule", "not scheduled", "ready to schedule", "ready for auto call"}
     SCHEDULED: set[str] = {
         "scheduled", "tentatively scheduled", "customer scheduled",
         "store scheduled", "install scheduled", "hdms scheduled",

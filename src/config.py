@@ -28,7 +28,7 @@ _VAPI_PHONE_NUMBERS = {
 # Vapi phone number UUIDs for outbound calls per environment
 _OUTBOUND_VAPI_PHONE_IDS = {
     "dev": "f089f8dc-5886-464b-a615-236064f43956",   # SchedulingBot-Dev +19566699322
-    "qa": "4b958ae7-d662-47f3-ace5-fcfa14c3060c",    # SchedulingBot-QA  +14588990940
+    "qa": "d57a879f-b6af-4549-8179-222bd86ee6c5",    # Twilio +17155004798 (new account)
 }
 
 

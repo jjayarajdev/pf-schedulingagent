@@ -32,6 +32,7 @@ from channels.outbound_store import (
 )
 from channels.outbound_vapi import create_vapi_call
 from config import get_settings
+from tools.project_rules import ProjectStatusRules
 from tools.scheduling import (
     get_available_dates,
     get_installation_address,
@@ -99,10 +100,14 @@ def _extract_pf_payload(body: dict) -> dict:
     customer_phone = _normalize_e164(customer_obj.get("primary_phone", ""))
 
     # tenant_vapi_phone_number = from_phone (caller ID / Vapi number to call from)
-    # PF sends this as an array — take the first element
+    # PF sends this as an array — take the first element.
+    # PF may send ["undefined"] or "undefined" when not configured.
+    _EMPTY_SENTINELS = {"undefined", "null", "none", ""}
     tenant_from = tenant_info.get("tenant_vapi_phone_number", "")
     if isinstance(tenant_from, list):
         tenant_from = tenant_from[0] if tenant_from else ""
+    if str(tenant_from).lower().strip() in _EMPTY_SENTINELS:
+        tenant_from = ""
     from_phone = _normalize_e164(tenant_from)
 
     return {
@@ -364,9 +369,25 @@ async def _process_outbound_message(
         project_id, customer_phone[-4:], client_id, from_phone[-4:] if from_phone else "default",
     )
 
+    # Guard: vapi_phone_number_id is required for Vapi POST /call
+    if not vapi_phone_number_id:
+        logger.error(
+            "No Vapi phone number ID for outbound call: project=%s client=%s "
+            "— neither tenant payload nor config default available. Skipping.",
+            project_id, client_id,
+        )
+        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        return
+
     # Step 1: Authenticate customer via phone-call-login
     # from_phone (tenant Vapi number) is the to_phone in PF auth API;
     # falls back to config vapi_phone_number if not provided
+    if not from_phone:
+        logger.info(
+            "No tenant_vapi_phone_number in SQS message for project=%s "
+            "— using config default for auth",
+            project_id,
+        )
     system_phone = from_phone or get_settings().vapi_phone_number
     try:
         creds = await get_or_authenticate(customer_phone, system_phone)
@@ -408,32 +429,34 @@ async def _process_outbound_message(
         client_id=resolved_client_id,
     )
 
-    # ── Gate: skip call if project is already scheduled or has no dates ──
-    dates_data = prefetched.get("dates", {})
-    if dates_data.get("already_scheduled"):
-        logger.info(
-            "Skipping outbound call — project %s is already scheduled",
-            project_id,
-        )
-        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        return
-
-    if not dates_data.get("available_dates"):
-        logger.warning(
-            "Skipping outbound call — no dates available for project %s",
-            project_id,
-        )
-        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        return
-
+    # ── Gate: only proceed if project status is schedulable ──
+    # PF API may return "Ready to Schedule" even when UI shows "Ready for Auto Call"
+    # (race condition from slotsChatbot call). Accept all SCHEDULABLE statuses.
     project_status = (prefetched.get("project", {}).get("status") or "").lower()
-    if project_status in ("completed", "cancelled", "closed", "scheduled"):
+    if project_status and project_status not in ProjectStatusRules.SCHEDULABLE:
         logger.info(
-            "Skipping outbound call — project %s status: %s",
+            "Skipping outbound call — project %s status '%s' is not schedulable",
             project_id, project_status,
         )
         sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
         return
+
+    # Dates are prefetched as a nice-to-have (injected into system prompt).
+    # If the PF API rejected the request or returned no dates, log it but
+    # still make the call — the AI can fetch dates during the conversation.
+    dates_data = prefetched.get("dates", {})
+    if dates_data.get("already_scheduled"):
+        logger.warning(
+            "Pre-fetch dates returned 'already_scheduled' for project %s "
+            "but status is '%s' — proceeding with call anyway",
+            project_id, project_status,
+        )
+    elif not dates_data.get("available_dates"):
+        logger.warning(
+            "Pre-fetch returned no dates for project %s — "
+            "AI will fetch dates during the conversation",
+            project_id,
+        )
 
     # Step 2: Create outbound call record (status=pending)
     call_data = {
