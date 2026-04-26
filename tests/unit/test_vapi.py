@@ -1946,3 +1946,56 @@ class TestSessionCompletedActions:
         cleanup_call_caches(sid)
 
         assert not session_action_completed(sid, "confirm", "P1")
+
+
+class TestNoteAddedGuardrail:
+    """Tests for the add_note hallucination guardrail."""
+
+    def test_looks_like_note_added_positive(self):
+        from channels.vapi import _looks_like_note_added
+
+        assert _looks_like_note_added("I've added that note to your project.")
+        assert _looks_like_note_added("The note has been added successfully.")
+        assert _looks_like_note_added("I've noted that for you.")
+        assert _looks_like_note_added("Your notes have been saved.")
+        assert _looks_like_note_added("I've made a note about the big dog.")
+        assert _looks_like_note_added("That's been noted on your project.")
+        assert _looks_like_note_added("I'll add that note for you.")
+        assert _looks_like_note_added("The note has been recorded on the project.")
+
+    def test_looks_like_note_added_negative(self):
+        from channels.vapi import _looks_like_note_added
+
+        assert not _looks_like_note_added("Your appointment is confirmed.")
+        assert not _looks_like_note_added("Here are your available time slots.")
+        assert not _looks_like_note_added("What would you like to schedule?")
+        assert not _looks_like_note_added("Can you tell me more about the note?")
+        assert not _looks_like_note_added("Do you want me to add a note?")
+
+    def test_was_note_added_flag(self):
+        from tools.scheduling import _note_added_in_request, was_note_added
+
+        # Initially false
+        _note_added_in_request.set(False)
+        assert not was_note_added()
+
+        # Set flag
+        _note_added_in_request.set(True)
+        assert was_note_added()
+
+        # Reset
+        _note_added_in_request.set(False)
+        assert not was_note_added()
+
+    def test_reset_action_flags_resets_note(self):
+        from tools.scheduling import (
+            _note_added_in_request,
+            reset_action_flags,
+            was_note_added,
+        )
+
+        _note_added_in_request.set(True)
+        assert was_note_added()
+
+        reset_action_flags()
+        assert not was_note_added()

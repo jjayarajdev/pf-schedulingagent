@@ -264,6 +264,7 @@ _reschedule_called_in_request: ContextVar[bool] = ContextVar("reschedule_called"
 _reschedule_success_result: ContextVar[str] = ContextVar("reschedule_success_result", default="")
 _time_slots_called_in_request: ContextVar[bool] = ContextVar("time_slots_called", default=False)
 _address_updated_in_request: ContextVar[bool] = ContextVar("address_updated", default=False)
+_note_added_in_request: ContextVar[bool] = ContextVar("note_added", default=False)
 
 # Tracks the last project_id used by any tool in this request.
 # Used by guardrail retry prompts to pin the project and prevent GPT from
@@ -288,6 +289,7 @@ def reset_action_flags() -> None:
     _reschedule_called_in_request.set(False)
     _time_slots_called_in_request.set(False)
     _address_updated_in_request.set(False)
+    _note_added_in_request.set(False)
     # NOTE: _confirm_success_result, _cancel_success_result, and
     # _reschedule_success_result are intentionally NOT reset here.
     # The guardrail retry calls reset_action_flags() before re-invoking
@@ -333,6 +335,11 @@ def was_time_slots_called() -> bool:
 def was_address_updated() -> bool:
     """Check if update_installation_address was actually called in this request."""
     return _address_updated_in_request.get()
+
+
+def was_note_added() -> bool:
+    """Check if add_note was actually called in this request."""
+    return _note_added_in_request.get()
 
 
 def get_last_project_id() -> str:
@@ -1557,6 +1564,7 @@ async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
 
 async def add_note(project_id: str, note_text: str) -> str:
     """Add a note to a project. Routes to the correct API based on caller type and note content."""
+    _note_added_in_request.set(True)
     project_id = await _resolve_project_id(project_id)
     caller_type = AuthContext.get_caller_type()
 

@@ -64,6 +64,7 @@ from tools.scheduling import (
     was_address_updated,
     was_cancel_called,
     was_confirm_called,
+    was_note_added,
     was_time_slots_called,
 )
 from tools.scheduling import confirm_appointment as sched_confirm_appointment
@@ -239,6 +240,34 @@ def _looks_like_address_update(text: str) -> bool:
     """Detect if the response claims an address was saved/noted."""
     lower = text.lower()
     return any(p in lower for p in _ADDRESS_UPDATE_PATTERNS)
+
+
+# Patterns GPT uses when it claims a note was added without calling add_note.
+_NOTE_ADDED_PATTERNS = [
+    "note has been added",
+    "note has been saved",
+    "i've added that note",
+    "i've added the note",
+    "i've noted that",
+    "i've made a note",
+    "note has been recorded",
+    "i've recorded that",
+    "i've added your note",
+    "notes have been added",
+    "notes have been saved",
+    "i added the note",
+    "i added that note",
+    "note is saved",
+    "that's been noted",
+    "i'll add that note",
+    "i'll note that",
+]
+
+
+def _looks_like_note_added(text: str) -> bool:
+    """Detect if the response claims a note was added/saved."""
+    lower = text.lower()
+    return any(p in lower for p in _NOTE_ADDED_PATTERNS)
 
 
 # Pattern to strip fabricated time slot sentences (e.g., "Available times are 8 AM, 9 AM, ...")
@@ -2100,6 +2129,21 @@ async def _process_tool(
                     "'CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE'. "
                     "Do NOT tell the customer the address is saved until BOTH tools succeed."
                 )
+            elif (
+                not was_note_added()
+                and _looks_like_note_added(voice_text)
+            ):
+                logger.warning(
+                    "Hallucinated note addition in Vapi call (call_id=%s) — retrying",
+                    call_id,
+                )
+                retry_prompt = (
+                    "You told the customer the note was added/saved but you did NOT call "
+                    "add_note. The note is NOT saved. "
+                    "You MUST call add_note NOW with the note text "
+                    "the customer provided. Do NOT tell the customer the note is saved "
+                    "until add_note succeeds."
+                )
 
             if retry_prompt:
                 # Pin the project so GPT cannot drift to a different project
@@ -2124,7 +2168,7 @@ async def _process_tool(
                     additional_params={"channel": "vapi"},
                 )
                 retry_text = extract_response_text(response.output)
-                if was_confirm_called() or was_cancel_called() or was_time_slots_called() or was_address_updated():
+                if was_confirm_called() or was_cancel_called() or was_time_slots_called() or was_address_updated() or was_note_added():
                     voice_text = format_for_voice(retry_text)
                     logger.info("Vapi retry succeeded — required tool was called")
                 elif not _looks_like_time_slot_list(retry_text):
