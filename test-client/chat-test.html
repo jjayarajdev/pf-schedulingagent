@@ -1003,7 +1003,10 @@
     </svg>`;
 
     // ── Config ───────────────────────────────────────────────
-    const API_BASE = window.location.origin;
+    // If opened locally (file://), default to prod; otherwise use current origin
+    const API_BASE = window.location.protocol === 'file:'
+        ? 'https://schedulingagent.apps.projectsforce.com'
+        : window.location.origin;
     let sessionId = 'session-' + Date.now();
     let useStreaming = false;
 
