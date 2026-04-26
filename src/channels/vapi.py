@@ -199,6 +199,7 @@ def _classify_claimed_actions(text: str) -> set[str]:
     if not text or len(text) < 10:
         return set()
 
+    result_text = ""
     try:
         client = _get_guardrail_bedrock_client()
         settings = get_settings()
@@ -209,13 +210,15 @@ def _classify_claimed_actions(text: str) -> set[str]:
             inferenceConfig={"maxTokens": 50, "temperature": 0.0},
         )
         result_text = response["output"]["message"]["content"][0]["text"].strip()
-        # Parse JSON array from response
-        claimed = json.loads(result_text)
-        if isinstance(claimed, list):
-            valid = {"confirm", "cancel", "note", "address"}
-            return {a for a in claimed if a in valid}
+        # Extract JSON array — LLM sometimes adds explanation text after the array
+        match = re.search(r"\[.*?\]", result_text, re.DOTALL)
+        if match:
+            claimed = json.loads(match.group())
+            if isinstance(claimed, list):
+                valid = {"confirm", "cancel", "note", "address"}
+                return {a for a in claimed if a in valid}
     except Exception:
-        logger.exception("Guardrail classifier failed — skipping")
+        logger.exception("Guardrail classifier failed (raw=%s) — skipping", result_text or "N/A")
     return set()
 
 
