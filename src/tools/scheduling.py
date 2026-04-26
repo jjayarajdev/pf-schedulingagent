@@ -2169,19 +2169,30 @@ async def update_installation_address(
                 "updated_address": {k: v for k, v in updated_address.items() if v},
                 "message": f"Installation address updated for project {pnum}.",
             })
-    except httpx.HTTPStatusError as exc:
+    except (httpx.HTTPStatusError, Exception) as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", "N/A")
+        resp_text = getattr(getattr(exc, "response", None), "text", "")[:500]
         logger.error(
-            "update_installation_address failed: %d %s",
-            exc.response.status_code,
-            exc.response.text[:500],
+            "update_installation_address failed: %s %s — saving as note instead",
+            status, resp_text,
         )
-        return (
-            f"Failed to update the address for project {pnum}. "
-            "Please try again or contact support."
+        # Fallback: save the address change request as a note so the office can act on it
+        address_parts = [v for v in [address1, city, state, zipcode] if v]
+        note_text = (
+            f"CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE. "
+            f"New address: {', '.join(address_parts)}. "
+            f"(Automatic update failed — needs manual review.)"
         )
-    except Exception:
-        logger.exception("update_installation_address error for project %s", project_id)
-        return (
-            f"Failed to update the address for project {pnum}. "
-            "Please try again or contact support."
-        )
+        try:
+            await add_note(project_id, note_text)
+            mark_session_action("address_update", project_id)
+            return (
+                f"I wasn't able to update the address directly for project {pnum}, "
+                "but I've noted your request and the office will review and update it."
+            )
+        except Exception:
+            logger.exception("Fallback note also failed for project %s", project_id)
+            return (
+                f"I wasn't able to update the address for project {pnum} right now. "
+                "Please contact the office directly to request the change."
+            )
