@@ -17,6 +17,9 @@ import re
 import time
 import uuid
 from datetime import datetime
+from functools import lru_cache
+
+import boto3
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from auth.context import AuthContext
@@ -146,57 +149,86 @@ def remove_call_auth(call_id: str) -> None:
     """Remove cached auth credentials when a call ends."""
     _call_auth_cache.pop(call_id, None)
 
-# Patterns the scheduling agent uses when it hallucinated a booking confirmation
-# without actually calling confirm_appointment.
-_BOOKING_CONFIRMATION_PATTERNS = [
-    "appointment confirmed",
-    "appointment is now confirmed",
-    "appointment is now scheduled",
-    "appointment has been scheduled",
-    "appointment has been successfully scheduled",
-    "installation is now scheduled",
-    "installation has been scheduled",
-    "successfully scheduled your",
-    "appointment has been booked",
-    "you're all set",
-    "your appointment is confirmed",
-    "booking confirmed",
-    "appointment is booked",
-    "you're scheduled",
-    "have been booked",
-]
+# ---------------------------------------------------------------------------
+#  Intent-based guardrail classifier
+#
+#  Replaces fragile pattern lists with a single LLM call that detects
+#  whether the response *claims* a write action was completed.  Only
+#  invoked when at least one write-action ContextVar flag is False.
+# ---------------------------------------------------------------------------
+
+_GUARDRAIL_CLASSIFIER_PROMPT = """\
+You are a guardrail classifier for a phone scheduling assistant.
+
+Analyze the assistant's response and determine if it CLAIMS any of these \
+actions were already completed:
+
+- **confirm**: The assistant says an appointment/installation was booked, \
+confirmed, or scheduled.
+- **cancel**: The assistant says an appointment was cancelled or removed.
+- **note**: The assistant says a note was added, saved, recorded, or noted.
+- **address**: The assistant says an address was updated, saved, noted, or \
+will be reviewed.
+
+Return ONLY a JSON array of the claimed action names. If none are claimed, \
+return an empty array.
+
+Examples:
+- "Your appointment is confirmed for Tuesday at 9 AM." → ["confirm"]
+- "I've added that note about the big dog." → ["note"]
+- "The appointment has been cancelled and I've noted the reason." → ["cancel", "note"]
+- "Here are your available dates: April 28, 29, 30." → []
+- "Would you like me to schedule that for you?" → []
+- "I'll add that note for you right away." → ["note"]
+"""
 
 
-def _looks_like_booking_confirmation(text: str) -> bool:
-    lower = text.lower()
-    return any(p in lower for p in _BOOKING_CONFIRMATION_PATTERNS)
+@lru_cache(maxsize=1)
+def _get_guardrail_bedrock_client():
+    """Bedrock client for guardrail classifier (cached singleton)."""
+    settings = get_settings()
+    return boto3.client("bedrock-runtime", region_name=settings.aws_region)
 
 
-_CANCEL_CONFIRMATION_PATTERNS = [
-    "has been cancelled",
-    "has been canceled",
-    "appointment cancelled",
-    "appointment canceled",
-    "successfully cancelled",
-    "successfully canceled",
-    "i've cancelled",
-    "i've canceled",
-    "cancellation is complete",
-    "appointment has been removed",
-]
+def _classify_claimed_actions(text: str) -> set[str]:
+    """Use LLM to detect which write actions the response claims were completed.
+
+    Returns a set of claimed action names: {"confirm", "cancel", "note", "address"}.
+    Falls back to empty set on any error (fail-open — no false guardrail triggers).
+    """
+    if not text or len(text) < 10:
+        return set()
+
+    try:
+        client = _get_guardrail_bedrock_client()
+        settings = get_settings()
+        response = client.converse(
+            modelId=settings.bedrock_model_id,
+            messages=[{"role": "user", "content": [{"text": text}]}],
+            system=[{"text": _GUARDRAIL_CLASSIFIER_PROMPT}],
+            inferenceConfig={"maxTokens": 50, "temperature": 0.0},
+        )
+        result_text = response["output"]["message"]["content"][0]["text"].strip()
+        # Parse JSON array from response
+        claimed = json.loads(result_text)
+        if isinstance(claimed, list):
+            valid = {"confirm", "cancel", "note", "address"}
+            return {a for a in claimed if a in valid}
+    except Exception:
+        logger.exception("Guardrail classifier failed — skipping")
+    return set()
 
 
-def _looks_like_cancel_confirmation(text: str) -> bool:
-    lower = text.lower()
-    return any(p in lower for p in _CANCEL_CONFIRMATION_PATTERNS)
+async def _classify_claimed_actions_async(text: str) -> set[str]:
+    """Async wrapper — runs the sync Bedrock call in a thread."""
+    return await asyncio.to_thread(_classify_claimed_actions, text)
 
 
 # Regex to detect fabricated time slots: 3+ AM/PM time patterns in a response
 # indicates the LLM is presenting time slots (which must come from get_time_slots).
+# Kept as pattern-based detection — this checks data structure, not intent.
 _TIME_SLOT_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b")
 
-# Scheduling context phrases that indicate the LLM is presenting time slots
-# (vs. project data that happens to mention scheduled times).
 _TIME_SLOT_CONTEXT_PHRASES = [
     "available time", "time slot", "choose a time", "pick a time",
     "select a time", "available slot", "open slot", "schedule for",
@@ -215,59 +247,6 @@ def _looks_like_time_slot_list(text: str) -> bool:
         return False
     lower = text.lower()
     return any(phrase in lower for phrase in _TIME_SLOT_CONTEXT_PHRASES)
-
-
-# Patterns the scheduling agent uses when it claims an address was saved/noted
-# without actually calling update_installation_address.
-_ADDRESS_UPDATE_PATTERNS = [
-    "address has been noted",
-    "address has been saved",
-    "address has been updated",
-    "address change has been noted",
-    "address change has been saved",
-    "address update has been noted",
-    "address update has been saved",
-    "i've noted your address",
-    "i've saved your address",
-    "i've updated your address",
-    "your new address",
-    "address will be updated",
-    "office will review and update",
-]
-
-
-def _looks_like_address_update(text: str) -> bool:
-    """Detect if the response claims an address was saved/noted."""
-    lower = text.lower()
-    return any(p in lower for p in _ADDRESS_UPDATE_PATTERNS)
-
-
-# Patterns GPT uses when it claims a note was added without calling add_note.
-_NOTE_ADDED_PATTERNS = [
-    "note has been added",
-    "note has been saved",
-    "i've added that note",
-    "i've added the note",
-    "i've noted that",
-    "i've made a note",
-    "note has been recorded",
-    "i've recorded that",
-    "i've added your note",
-    "notes have been added",
-    "notes have been saved",
-    "i added the note",
-    "i added that note",
-    "note is saved",
-    "that's been noted",
-    "i'll add that note",
-    "i'll note that",
-]
-
-
-def _looks_like_note_added(text: str) -> bool:
-    """Detect if the response claims a note was added/saved."""
-    lower = text.lower()
-    return any(p in lower for p in _NOTE_ADDED_PATTERNS)
 
 
 # Pattern to strip fabricated time slot sentences (e.g., "Available times are 8 AM, 9 AM, ...")
@@ -2047,9 +2026,11 @@ async def _process_tool(
                     )
                     _call_project_pin[call_id] = used_project
 
-            # Guardrail: detect hallucinated booking confirmations.
-            # If the scheduling agent says "confirmed" without calling
-            # confirm_appointment, retry with an explicit instruction.
+            # Guardrail: detect hallucinated write actions via intent classifier.
+            #
+            # Instead of brittle pattern lists, we ask the LLM to classify
+            # whether the response claims a write action was completed.
+            # Only invoked when at least one write-action flag is False.
             #
             # IMPORTANT: Skip the guardrail if the action already succeeded
             # for this project earlier in the same call session.  The per-
@@ -2058,44 +2039,24 @@ async def _process_tool(
             # false-positive retry that creates duplicate bookings.
             retry_prompt = ""
             pinned = get_last_project_id() or _call_project_pin.get(call_id, "")
-            if (
-                not was_confirm_called()
-                and _looks_like_booking_confirmation(voice_text)
-                and not session_action_completed(session_id, "confirm", pinned)
-                and not session_has_any_completed(session_id, "confirm")
-            ):
-                logger.warning(
-                    "Hallucinated booking in Vapi call (call_id=%s) — retrying",
-                    call_id,
-                )
-                retry_prompt = (
-                    "The customer confirmed. You MUST call the confirm_appointment "
-                    "tool NOW to actually book the appointment. Do NOT respond "
-                    "without calling the tool."
-                )
-            elif (
-                not was_cancel_called()
-                and _looks_like_cancel_confirmation(voice_text)
-                and not session_action_completed(session_id, "cancel", pinned)
-                and not session_has_any_completed(session_id, "cancel")
-            ):
-                logger.warning(
-                    "Hallucinated cancellation in Vapi call (call_id=%s) — retrying",
-                    call_id,
-                )
-                retry_prompt = (
-                    "You said the appointment was cancelled but you did NOT call "
-                    "cancel_appointment. The appointment is NOT actually cancelled. "
-                    "You MUST call cancel_appointment(project_id, reason) NOW. "
-                    "Use the reason the customer already provided."
-                )
-            elif not was_time_slots_called() and _looks_like_time_slot_list(voice_text):
+
+            # Quick-check: if all write-action flags are True, skip classifier
+            uncalled_actions = set()
+            if not was_confirm_called():
+                uncalled_actions.add("confirm")
+            if not was_cancel_called():
+                uncalled_actions.add("cancel")
+            if not was_note_added():
+                uncalled_actions.add("note")
+            if not was_address_updated():
+                uncalled_actions.add("address")
+
+            # Also check fabricated time slots (pattern-based, not intent)
+            if not was_time_slots_called() and _looks_like_time_slot_list(voice_text):
                 logger.warning(
                     "Fabricated time slots in Vapi call (call_id=%s) — retrying",
                     call_id,
                 )
-                # Check if the user's question was a date selection — if so,
-                # the retry should call get_time_slots for that date, not re-list dates.
                 if _looks_like_date_selection(question):
                     retry_prompt = (
                         f"You fabricated time slots. The customer selected '{question}'. "
@@ -2111,39 +2072,67 @@ async def _process_tool(
                         "Once the customer picks a date, THEN call get_time_slots to get "
                         "real time slots."
                     )
-            elif (
-                not was_address_updated()
-                and _looks_like_address_update(voice_text)
-                and not session_action_completed(session_id, "address_update", pinned)
-                and not session_has_any_completed(session_id, "address_update")
-            ):
-                logger.warning(
-                    "Hallucinated address update in Vapi call (call_id=%s) — retrying",
-                    call_id,
-                )
-                retry_prompt = (
-                    "You told the customer the address was saved/noted but you did NOT call "
-                    "update_installation_address. The address is NOT saved. "
-                    "You MUST call update_installation_address NOW with the address details "
-                    "the customer provided. After that, call add_note starting with "
-                    "'CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE'. "
-                    "Do NOT tell the customer the address is saved until BOTH tools succeed."
-                )
-            elif (
-                not was_note_added()
-                and _looks_like_note_added(voice_text)
-            ):
-                logger.warning(
-                    "Hallucinated note addition in Vapi call (call_id=%s) — retrying",
-                    call_id,
-                )
-                retry_prompt = (
-                    "You told the customer the note was added/saved but you did NOT call "
-                    "add_note. The note is NOT saved. "
-                    "You MUST call add_note NOW with the note text "
-                    "the customer provided. Do NOT tell the customer the note is saved "
-                    "until add_note succeeds."
-                )
+
+            # Intent classifier: only run if there are uncalled actions AND
+            # no time-slot retry already triggered
+            if uncalled_actions and not retry_prompt:
+                claimed = await _classify_claimed_actions_async(voice_text)
+                # Intersect: which actions were claimed but NOT actually called?
+                hallucinated = claimed & uncalled_actions
+                # Filter out actions that already succeeded in this session
+                if "confirm" in hallucinated and (
+                    session_action_completed(session_id, "confirm", pinned)
+                    or session_has_any_completed(session_id, "confirm")
+                ):
+                    hallucinated.discard("confirm")
+                if "cancel" in hallucinated and (
+                    session_action_completed(session_id, "cancel", pinned)
+                    or session_has_any_completed(session_id, "cancel")
+                ):
+                    hallucinated.discard("cancel")
+                if "address" in hallucinated and (
+                    session_action_completed(session_id, "address_update", pinned)
+                    or session_has_any_completed(session_id, "address_update")
+                ):
+                    hallucinated.discard("address")
+
+                if hallucinated:
+                    logger.warning(
+                        "Guardrail classifier detected hallucinated actions %s "
+                        "in Vapi call (call_id=%s) — retrying",
+                        hallucinated, call_id,
+                    )
+                    # Build retry prompt based on what was hallucinated
+                    if "confirm" in hallucinated:
+                        retry_prompt = (
+                            "The customer confirmed. You MUST call the confirm_appointment "
+                            "tool NOW to actually book the appointment. Do NOT respond "
+                            "without calling the tool."
+                        )
+                    elif "cancel" in hallucinated:
+                        retry_prompt = (
+                            "You said the appointment was cancelled but you did NOT call "
+                            "cancel_appointment. The appointment is NOT actually cancelled. "
+                            "You MUST call cancel_appointment(project_id, reason) NOW. "
+                            "Use the reason the customer already provided."
+                        )
+                    elif "address" in hallucinated:
+                        retry_prompt = (
+                            "You told the customer the address was saved/noted but you did NOT call "
+                            "update_installation_address. The address is NOT saved. "
+                            "You MUST call update_installation_address NOW with the address details "
+                            "the customer provided. After that, call add_note starting with "
+                            "'CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE'. "
+                            "Do NOT tell the customer the address is saved until BOTH tools succeed."
+                        )
+                    elif "note" in hallucinated:
+                        retry_prompt = (
+                            "You told the customer the note was added/saved but you did NOT call "
+                            "add_note. The note is NOT saved. "
+                            "You MUST call add_note NOW with the note text "
+                            "the customer provided. Do NOT tell the customer the note is saved "
+                            "until add_note succeeds."
+                        )
 
             if retry_prompt:
                 # Pin the project so GPT cannot drift to a different project

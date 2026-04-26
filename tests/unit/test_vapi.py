@@ -1948,42 +1948,77 @@ class TestSessionCompletedActions:
         assert not session_action_completed(sid, "confirm", "P1")
 
 
-class TestNoteAddedGuardrail:
-    """Tests for the add_note hallucination guardrail."""
+class TestGuardrailClassifier:
+    """Tests for the intent-based guardrail classifier."""
 
-    def test_looks_like_note_added_positive(self):
-        from channels.vapi import _looks_like_note_added
+    def test_classify_returns_empty_for_short_text(self):
+        from channels.vapi import _classify_claimed_actions
 
-        assert _looks_like_note_added("I've added that note to your project.")
-        assert _looks_like_note_added("The note has been added successfully.")
-        assert _looks_like_note_added("I've noted that for you.")
-        assert _looks_like_note_added("Your notes have been saved.")
-        assert _looks_like_note_added("I've made a note about the big dog.")
-        assert _looks_like_note_added("That's been noted on your project.")
-        assert _looks_like_note_added("I'll add that note for you.")
-        assert _looks_like_note_added("The note has been recorded on the project.")
+        assert _classify_claimed_actions("") == set()
+        assert _classify_claimed_actions("Hi") == set()
 
-    def test_looks_like_note_added_negative(self):
-        from channels.vapi import _looks_like_note_added
+    def test_classify_falls_back_on_error(self):
+        """Classifier returns empty set (fail-open) on Bedrock errors."""
+        from channels.vapi import _classify_claimed_actions
 
-        assert not _looks_like_note_added("Your appointment is confirmed.")
-        assert not _looks_like_note_added("Here are your available time slots.")
-        assert not _looks_like_note_added("What would you like to schedule?")
-        assert not _looks_like_note_added("Can you tell me more about the note?")
-        assert not _looks_like_note_added("Do you want me to add a note?")
+        with patch("channels.vapi._get_guardrail_bedrock_client") as mock_client:
+            mock_client.return_value.converse.side_effect = Exception("Bedrock down")
+            result = _classify_claimed_actions("I've added that note for you.")
+            assert result == set()
+
+    def test_classify_parses_valid_json(self):
+        """Classifier correctly parses LLM JSON response."""
+        from channels.vapi import _classify_claimed_actions
+
+        with patch("channels.vapi._get_guardrail_bedrock_client") as mock_client:
+            mock_client.return_value.converse.return_value = {
+                "output": {"message": {"content": [{"text": '["confirm", "note"]'}]}},
+            }
+            result = _classify_claimed_actions("Your appointment is confirmed and note added.")
+            assert result == {"confirm", "note"}
+
+    def test_classify_filters_invalid_actions(self):
+        """Classifier ignores actions not in the valid set."""
+        from channels.vapi import _classify_claimed_actions
+
+        with patch("channels.vapi._get_guardrail_bedrock_client") as mock_client:
+            mock_client.return_value.converse.return_value = {
+                "output": {"message": {"content": [{"text": '["confirm", "delete", "hack"]'}]}},
+            }
+            result = _classify_claimed_actions("Your appointment is confirmed.")
+            assert result == {"confirm"}
+
+    def test_classify_handles_empty_array(self):
+        """Classifier returns empty set for no claimed actions."""
+        from channels.vapi import _classify_claimed_actions
+
+        with patch("channels.vapi._get_guardrail_bedrock_client") as mock_client:
+            mock_client.return_value.converse.return_value = {
+                "output": {"message": {"content": [{"text": "[]"}]}},
+            }
+            result = _classify_claimed_actions("Here are your available dates.")
+            assert result == set()
+
+    def test_classify_handles_malformed_json(self):
+        """Classifier returns empty set on malformed JSON (fail-open)."""
+        from channels.vapi import _classify_claimed_actions
+
+        with patch("channels.vapi._get_guardrail_bedrock_client") as mock_client:
+            mock_client.return_value.converse.return_value = {
+                "output": {"message": {"content": [{"text": "not json"}]}},
+            }
+            result = _classify_claimed_actions("Something something.")
+            assert result == set()
 
     def test_was_note_added_flag(self):
         from tools.scheduling import _note_added_in_request, was_note_added
 
-        # Initially false
         _note_added_in_request.set(False)
         assert not was_note_added()
 
-        # Set flag
         _note_added_in_request.set(True)
         assert was_note_added()
 
-        # Reset
         _note_added_in_request.set(False)
         assert not was_note_added()
 
