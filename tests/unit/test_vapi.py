@@ -1869,3 +1869,80 @@ class TestOutboundDirectTools:
         assert "confirm_appointment" in fn_names
         assert "add_note" in fn_names
         assert "get_available_dates" in fn_names
+
+
+class TestSessionCompletedActions:
+    """Tests for session-level action tracking that prevents duplicate guardrail retries."""
+
+    def test_mark_and_check_confirm(self):
+        from tools.scheduling import (
+            clear_session_completed_actions,
+            mark_session_action,
+            session_action_completed,
+            session_has_any_completed,
+        )
+
+        sid = "vapi-test-session-actions"
+        pid = "12345"
+
+        # Before marking — nothing completed
+        assert not session_action_completed(sid, "confirm", pid)
+        assert not session_has_any_completed(sid, "confirm")
+
+        # Mark confirm for project
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = sid
+            mark_session_action("confirm", pid)
+
+        # Now it should be detected
+        assert session_action_completed(sid, "confirm", pid)
+        assert session_has_any_completed(sid, "confirm")
+
+        # Different action or project should not match
+        assert not session_action_completed(sid, "cancel", pid)
+        assert not session_action_completed(sid, "confirm", "99999")
+
+        # Cleanup
+        clear_session_completed_actions(sid)
+        assert not session_action_completed(sid, "confirm", pid)
+
+    def test_mark_cancel_and_reschedule(self):
+        from tools.scheduling import (
+            clear_session_completed_actions,
+            mark_session_action,
+            session_action_completed,
+            session_has_any_completed,
+        )
+
+        sid = "vapi-test-multi-actions"
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = sid
+            mark_session_action("cancel", "AAA")
+            mark_session_action("reschedule", "BBB")
+            mark_session_action("address_update", "CCC")
+
+        assert session_action_completed(sid, "cancel", "AAA")
+        assert session_action_completed(sid, "reschedule", "BBB")
+        assert session_action_completed(sid, "address_update", "CCC")
+        assert session_has_any_completed(sid, "cancel")
+        assert not session_has_any_completed(sid, "confirm")
+
+        clear_session_completed_actions(sid)
+
+    def test_cleanup_call_caches_clears_completed_actions(self):
+        from tools.scheduling import (
+            cleanup_call_caches,
+            mark_session_action,
+            session_action_completed,
+        )
+
+        sid = "vapi-test-cleanup-actions"
+        with patch("tools.scheduling.RequestContext") as mock_ctx:
+            mock_ctx.get_session_id.return_value = sid
+            mark_session_action("confirm", "P1")
+
+        assert session_action_completed(sid, "confirm", "P1")
+
+        cleanup_call_caches(sid)
+
+        assert not session_action_completed(sid, "confirm", "P1")

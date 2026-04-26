@@ -59,6 +59,8 @@ from tools.scheduling import (
     reset_action_flags,
     reset_confirm_flag,
     reset_request_caches,
+    session_action_completed,
+    session_has_any_completed,
     was_address_updated,
     was_cancel_called,
     was_confirm_called,
@@ -2019,8 +2021,20 @@ async def _process_tool(
             # Guardrail: detect hallucinated booking confirmations.
             # If the scheduling agent says "confirmed" without calling
             # confirm_appointment, retry with an explicit instruction.
+            #
+            # IMPORTANT: Skip the guardrail if the action already succeeded
+            # for this project earlier in the same call session.  The per-
+            # request ContextVar flags reset every turn, so on the NEXT turn
+            # Claude correctly saying "already confirmed" would trigger a
+            # false-positive retry that creates duplicate bookings.
             retry_prompt = ""
-            if not was_confirm_called() and _looks_like_booking_confirmation(voice_text):
+            pinned = get_last_project_id() or _call_project_pin.get(call_id, "")
+            if (
+                not was_confirm_called()
+                and _looks_like_booking_confirmation(voice_text)
+                and not session_action_completed(session_id, "confirm", pinned)
+                and not session_has_any_completed(session_id, "confirm")
+            ):
                 logger.warning(
                     "Hallucinated booking in Vapi call (call_id=%s) — retrying",
                     call_id,
@@ -2030,7 +2044,12 @@ async def _process_tool(
                     "tool NOW to actually book the appointment. Do NOT respond "
                     "without calling the tool."
                 )
-            elif not was_cancel_called() and _looks_like_cancel_confirmation(voice_text):
+            elif (
+                not was_cancel_called()
+                and _looks_like_cancel_confirmation(voice_text)
+                and not session_action_completed(session_id, "cancel", pinned)
+                and not session_has_any_completed(session_id, "cancel")
+            ):
                 logger.warning(
                     "Hallucinated cancellation in Vapi call (call_id=%s) — retrying",
                     call_id,
@@ -2063,7 +2082,12 @@ async def _process_tool(
                         "Once the customer picks a date, THEN call get_time_slots to get "
                         "real time slots."
                     )
-            elif not was_address_updated() and _looks_like_address_update(voice_text):
+            elif (
+                not was_address_updated()
+                and _looks_like_address_update(voice_text)
+                and not session_action_completed(session_id, "address_update", pinned)
+                and not session_has_any_completed(session_id, "address_update")
+            ):
                 logger.warning(
                     "Hallucinated address update in Vapi call (call_id=%s) — retrying",
                     call_id,

@@ -99,6 +99,9 @@ def cleanup_call_caches(session_id: str) -> None:
     # Clear deferred notes cache
     _session_notes.pop(session_id, None)
 
+    # Clear completed-action tracking
+    _session_completed_actions.pop(session_id, None)
+
     # Clear reschedule state for any projects discussed in this call
     for pid in projects:
         _reschedule_pending.discard(pid)
@@ -190,6 +193,59 @@ def get_session_notes(session_id: str) -> dict[str, list[str]]:
 def clear_session_notes(session_id: str) -> None:
     """Remove cached notes for a completed session."""
     _session_notes.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+#  Per-session completed-action tracking (cross-request guardrail)
+#
+#  Tracks which write actions (confirm, cancel, reschedule) have SUCCEEDED
+#  for each project within a call session.  Unlike the per-request ContextVar
+#  flags (which reset every `ask_scheduling_bot` invocation), these persist
+#  for the entire call.  The guardrail uses them to avoid re-triggering
+#  "you MUST call confirm_appointment" when Claude correctly says "your
+#  appointment is already confirmed" on a subsequent turn.
+# ---------------------------------------------------------------------------
+
+# session_id → {"confirm:PROJECT_ID", "cancel:PROJECT_ID", ...}
+_session_completed_actions: dict[str, set[str]] = {}
+
+
+def mark_session_action(action: str, project_id: str) -> None:
+    """Record that a write action succeeded for a project in this session."""
+    session_id = RequestContext.get_session_id()
+    if not session_id or not project_id:
+        return
+    if session_id not in _session_completed_actions:
+        _session_completed_actions[session_id] = set()
+    _session_completed_actions[session_id].add(f"{action}:{project_id}")
+    logger.debug(
+        "Marked session action: session=%s action=%s project=%s",
+        session_id, action, project_id,
+    )
+
+
+def session_action_completed(session_id: str, action: str, project_id: str) -> bool:
+    """Check if a write action already succeeded for this project in this session."""
+    if not session_id or not project_id:
+        return False
+    return f"{action}:{project_id}" in _session_completed_actions.get(session_id, set())
+
+
+def session_has_any_completed(session_id: str, action: str) -> bool:
+    """Check if ANY project had this action completed in this session.
+
+    Used when we don't know the specific project_id (e.g. guardrail fires
+    before project pinning).
+    """
+    if not session_id:
+        return False
+    prefix = f"{action}:"
+    return any(k.startswith(prefix) for k in _session_completed_actions.get(session_id, set()))
+
+
+def clear_session_completed_actions(session_id: str) -> None:
+    """Remove completed-action tracking for a finished session."""
+    _session_completed_actions.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1235,6 +1291,7 @@ async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwa
         msg += f" Confirmation number: {confirmation_number}."
     msg += " You will receive a confirmation to your registered email and phone number."
     _confirm_success_result.set(msg)
+    mark_session_action("confirm", project_id)
     return msg
 
 
@@ -1303,6 +1360,7 @@ async def _reschedule_appointment_impl(project_id: str) -> str:
         _invalidate_projects()
         _reschedule_pending.add(project_id)
         _reschedule_success_result.set(reschedule_dates)
+        mark_session_action("reschedule", project_id)
         return reschedule_dates
 
     # _get_reschedule_slots may have successfully cancelled but returned no
@@ -1314,6 +1372,7 @@ async def _reschedule_appointment_impl(project_id: str) -> str:
             "Now call get_available_dates to fetch available dates for rescheduling."
         )
         _reschedule_success_result.set(msg)
+        mark_session_action("reschedule", project_id)
         return msg
 
     return (
@@ -1465,6 +1524,7 @@ async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
     # Invalidate project cache — status changed
     _invalidate_projects()
     _reschedule_pending.discard(project_id)
+    mark_session_action("cancel", project_id)
 
     # Auto-save cancellation reason note if provided
     if reason.strip():
@@ -2095,6 +2155,7 @@ async def update_installation_address(
             except Exception:
                 logger.exception("Failed to save address update note for project %s", project_id)
 
+            mark_session_action("address_update", project_id)
             return json.dumps({
                 "project_number": pnum,
                 "updated_address": {k: v for k, v in updated_address.items() if v},
