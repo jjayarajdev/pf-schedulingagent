@@ -2091,108 +2091,32 @@ async def update_installation_address(
     zipcode: str = "",
     **kwargs,
 ) -> str:
-    """Update the installation address for a project.
+    """Capture an address change request as a project note.
 
-    Calls PUT /authentication/update-installation-address to update the address.
-    Also saves a note on the project for audit trail.
+    Direct address updates are not supported — all address change requests
+    are saved as notes for the office to review and process manually.
     """
-    _confirm_called_in_request.set(True)
     _address_updated_in_request.set(True)
     project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "update_installation_address")
-
-    # Get address_id from cache
-    cached = _get_cached_project(project_id)
-    address_id = ""
-    if cached and cached.get("address"):
-        address_id = str(cached["address"].get("address_id", ""))
-
-    # If no address_id cached, fetch it via the get API
-    if not address_id:
-        logger.info("No cached address_id for project %s — fetching", project_id)
-        get_result = await get_installation_address(project_id)
-        try:
-            get_data = json.loads(get_result)
-            address_id = str(get_data.get("address", {}).get("address_id", ""))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    if not address_id:
-        return (
-            f"Cannot update address for project {project_id}: "
-            "no address_id found. The project may not have an address on file."
-        )
-
-    client_id = AuthContext.get_client_id()
-    base_url = get_pf_api_base()
-    url = f"{base_url}/authentication/update-installation-address"
-    headers = build_headers()
-    body: dict[str, Any] = {
-        "address_id": int(address_id),
-        "client_id": client_id,
-        "address1": address1,
-        "city": city,
-    }
-    if state:
-        body["state"] = state
-    if zipcode:
-        body["zipcode"] = zipcode
-
     pnum = _get_project_number(project_id)
 
+    address_parts = [v for v in [address1, city, state, zipcode] if v]
+    note_text = (
+        f"CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE. "
+        f"New address: {', '.join(address_parts)}."
+    )
+
     try:
-        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
-            log_curl("PUT", url, headers, body)
-            resp = await client.put(url, headers=headers, json=body)
-            log_response(resp, "update_installation_address")
-            resp.raise_for_status()
-
-            _invalidate_projects()
-            updated_address = {
-                "address1": address1,
-                "city": city,
-                "state": state,
-                "zipcode": zipcode,
-            }
-
-            # Save a note for audit trail
-            address_parts = [v for v in [address1, city, state, zipcode] if v]
-            note_text = f"Customer requested installation address update. New address is {', '.join(address_parts)}"
-            try:
-                await add_note(project_id, note_text)
-            except Exception:
-                logger.exception("Failed to save address update note for project %s", project_id)
-
-            mark_session_action("address_update", project_id)
-            return json.dumps({
-                "project_number": pnum,
-                "updated_address": {k: v for k, v in updated_address.items() if v},
-                "message": f"Installation address updated for project {pnum}.",
-            })
-    except (httpx.HTTPStatusError, Exception) as exc:
-        status = getattr(getattr(exc, "response", None), "status_code", "N/A")
-        resp_text = getattr(getattr(exc, "response", None), "text", "")[:500]
-        logger.error(
-            "update_installation_address failed: %s %s — saving as note instead",
-            status, resp_text,
+        await add_note(project_id, note_text)
+        mark_session_action("address_update", project_id)
+        return (
+            f"I've noted your address change request for project {pnum}. "
+            "The office will review and update it."
         )
-        # Fallback: save the address change request as a note so the office can act on it
-        address_parts = [v for v in [address1, city, state, zipcode] if v]
-        note_text = (
-            f"CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE. "
-            f"New address: {', '.join(address_parts)}. "
-            f"(Automatic update failed — needs manual review.)"
+    except Exception:
+        logger.exception("Failed to save address update note for project %s", project_id)
+        return (
+            f"I wasn't able to save the address change request for project {pnum} right now. "
+            "Please contact the office directly to request the change."
         )
-        try:
-            await add_note(project_id, note_text)
-            mark_session_action("address_update", project_id)
-            return (
-                f"I wasn't able to update the address directly for project {pnum}, "
-                "but I've noted your request and the office will review and update it."
-            )
-        except Exception:
-            logger.exception("Fallback note also failed for project %s", project_id)
-            return (
-                f"I wasn't able to update the address for project {pnum} right now. "
-                "Please contact the office directly to request the change."
-            )

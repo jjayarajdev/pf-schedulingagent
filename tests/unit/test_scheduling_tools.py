@@ -881,23 +881,21 @@ class TestGetInstallationAddress:
 
 
 class TestUpdateInstallationAddress:
-    async def test_returns_error_when_no_address_id(self, mock_httpx_client, mock_httpx_response):
-        """Update returns error when no address_id can be found."""
-        # get_installation_address returns no address_id
+    async def test_saves_note_instead_of_api_call(self, mock_httpx_client, mock_httpx_response):
+        """Address update saves a note — no direct API update."""
         response = mock_httpx_response(200, {"data": {}})
         with mock_httpx_client(response=response):
             result = await update_installation_address(
                 "123", address1="123 New St", city="New City",
             )
-        assert "cannot update address" in result.lower()
-        assert "no address_id" in result.lower()
+        assert "noted" in result.lower() or "office will review" in result.lower()
 
-    async def test_sets_confirm_flag(self, mock_httpx_client, mock_httpx_response):
-        """update_installation_address sets the confirm flag for guardrail."""
-        from tools.scheduling import was_confirm_called, reset_confirm_flag
+    async def test_sets_address_updated_flag(self, mock_httpx_client, mock_httpx_response):
+        """update_installation_address sets the address_updated flag."""
+        from tools.scheduling import was_address_updated, reset_action_flags
 
-        reset_confirm_flag()
+        reset_action_flags()
         response = mock_httpx_response(200, {"data": {}})
         with mock_httpx_client(response=response):
             await update_installation_address("123", address1="Test", city="City")
-        assert was_confirm_called() is True
+        assert was_address_updated() is True
