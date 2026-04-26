@@ -52,6 +52,7 @@ from tools.scheduling import (
     clear_session_projects,
     get_last_project_id,
     get_reschedule_old_appointment,
+    get_session_notes,
     get_session_projects,
     post_call_summary_notes,
     post_store_call_notes,
@@ -1867,10 +1868,16 @@ async def _handle_server_event(body: dict) -> dict:
                 clear_reschedule_old_appointment(pid)
 
         # ── Inbound call end-of-call handling (existing) ────────────
-        # Post call summary notes to discussed projects (fire-and-forget)
+        # Post call summary notes to discussed projects (fire-and-forget).
+        # IMPORTANT: extract project/notes data BEFORE cleanup_call_caches()
+        # clears it — the async tasks run later when the data would be gone.
         session_id = f"vapi-{call_id}"
         session_key = f"vapi-{call_id}"
         store_session = _store_sessions.get(session_key)
+
+        # Snapshot session data before cleanup
+        session_projects = get_session_projects(session_id)
+        session_notes = get_session_notes(session_id)
 
         if store_session and store_session.get("authenticated") and summary:
             # Store call — use /project-notes/add-note endpoint
@@ -1882,6 +1889,7 @@ async def _handle_server_event(body: dict) -> dict:
                     client_id=store_creds.get("client_id", ""),
                     summary=summary,
                     duration_seconds=duration,
+                    projects_discussed=session_projects,
                 )
             )
             _background_tasks.add(task)
@@ -1900,6 +1908,8 @@ async def _handle_server_event(body: dict) -> dict:
                             customer_id=creds["customer_id"],
                             summary=summary,
                             duration_seconds=duration,
+                            projects_discussed=session_projects,
+                            cached_notes=session_notes,
                         )
                     )
                     _background_tasks.add(task)
@@ -1910,7 +1920,7 @@ async def _handle_server_event(body: dict) -> dict:
                         call_id, phone_number[-4:] if phone_number else "none",
                     )
 
-        # Clean up all caches for this call
+        # Clean up all caches for this call (safe — data already snapshotted above)
         cleanup_call_caches(session_id)
         _store_sessions.pop(session_key, None)
         _call_auth_cache.pop(call_id, None)

@@ -1662,16 +1662,23 @@ async def post_call_summary_notes(
     customer_id: str,
     summary: str,
     duration_seconds: float = 0,
+    projects_discussed: dict[str, list[str]] | None = None,
+    cached_notes: dict[str, list[str]] | None = None,
 ) -> None:
     """Post call summary as a note to each project discussed during the session.
 
     Called from the Vapi end-of-call handler. Uses explicit auth params since
     AuthContext is not available outside the request lifecycle.
+
+    Args:
+        projects_discussed: Pre-extracted {project_id: [actions]} from the session.
+            Must be passed by the caller before cleanup_call_caches() clears the data.
+        cached_notes: Pre-extracted deferred notes from the session.
     """
-    projects_discussed = get_session_projects(session_id)
+    if projects_discussed is None:
+        projects_discussed = get_session_projects(session_id)
     if not projects_discussed:
         logger.info("No projects discussed in session %s — skipping call notes", session_id)
-        clear_session_projects(session_id)
         return
 
     # Format duration
@@ -1688,8 +1695,9 @@ async def post_call_summary_notes(
         "client_id": client_id,
     }
 
-    # Collect cached notes for deferred posting
-    cached_notes = get_session_notes(session_id)
+    # Collect cached notes for deferred posting (use pre-extracted if available)
+    if cached_notes is None:
+        cached_notes = get_session_notes(session_id)
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for project_id, actions in projects_discussed.items():
@@ -1744,8 +1752,8 @@ async def post_call_summary_notes(
                         project_id, session_id,
                     )
 
-    clear_session_projects(session_id)
-    clear_session_notes(session_id)
+    # Note: cleanup is handled by the caller (cleanup_call_caches) —
+    # do NOT call clear_session_projects/clear_session_notes here.
 
 
 async def post_store_call_notes(
@@ -1755,17 +1763,22 @@ async def post_store_call_notes(
     client_id: str,
     summary: str,
     duration_seconds: float = 0,
+    projects_discussed: dict[str, list[str]] | None = None,
 ) -> None:
     """Post call summary as a note for store calls via /project-notes/add-note.
 
     Store callers don't have customer-level auth, so we use the separate
     add-note endpoint that only requires client_id + project_id.
     Called from the Vapi end-of-call handler for store sessions.
+
+    Args:
+        projects_discussed: Pre-extracted {project_id: [actions]} from the session.
+            Must be passed by the caller before cleanup_call_caches() clears the data.
     """
-    projects_discussed = get_session_projects(session_id)
+    if projects_discussed is None:
+        projects_discussed = get_session_projects(session_id)
     if not projects_discussed:
         logger.info("No projects discussed in store session %s — skipping call notes", session_id)
-        clear_session_projects(session_id)
         return
 
     minutes = int(duration_seconds // 60)
@@ -1809,7 +1822,7 @@ async def post_store_call_notes(
                     project_id, session_id,
                 )
 
-    clear_session_projects(session_id)
+    # Note: cleanup is handled by the caller (cleanup_call_caches).
 
 
 async def get_business_hours() -> str:

@@ -29,6 +29,7 @@ _VAPI_PHONE_NUMBERS = {
 _OUTBOUND_VAPI_PHONE_IDS = {
     "dev": "f089f8dc-5886-464b-a615-236064f43956",   # SchedulingBot-Dev +19566699322
     "qa": "d57a879f-b6af-4549-8179-222bd86ee6c5",    # Twilio +17155004798 (new account)
+    "prod": "28b2f785-7995-4859-8fc6-066f3bf4c73e",  # SchedulingBot-Prod-Outbound +12296299798
 }
 
 

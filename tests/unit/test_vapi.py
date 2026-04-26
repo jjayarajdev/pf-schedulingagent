@@ -1012,6 +1012,9 @@ class TestPostCallSummaryNotes:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
+            # Snapshot projects before calling (simulates what vapi.py now does)
+            projects = get_session_projects("vapi-test-notes")
+
             await post_call_summary_notes(
                 session_id="vapi-test-notes",
                 bearer_token="tok-abc",
@@ -1019,6 +1022,7 @@ class TestPostCallSummaryNotes:
                 customer_id="CUST1",
                 summary="Customer scheduled fence installation.",
                 duration_seconds=165,
+                projects_discussed=projects,
             )
 
             # Should have posted to 2 projects
@@ -1034,8 +1038,8 @@ class TestPostCallSummaryNotes:
             assert "Customer scheduled fence installation." in note
             assert "/communication/client/CL1/project/" in url
 
-        # Session should be cleaned up
-        assert get_session_projects("vapi-test-notes") == {}
+        # Cleanup is now handled by the caller (cleanup_call_caches), not the function
+        clear_session_projects("vapi-test-notes")
 
 
 class TestPostStoreCallNotes:
@@ -1044,6 +1048,7 @@ class TestPostStoreCallNotes:
     @pytest.mark.asyncio
     async def test_posts_note_per_project(self):
         from tools.scheduling import (
+            clear_session_projects,
             get_session_projects,
             post_store_call_notes,
         )
@@ -1065,17 +1070,21 @@ class TestPostStoreCallNotes:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
+            # Snapshot projects before calling (simulates what vapi.py now does)
+            projects = get_session_projects("vapi-store-test")
+
             await post_store_call_notes(
                 session_id="vapi-store-test",
                 bearer_token="tok-store",
                 client_id="09PF05VD",
                 summary="Store confirmed delivery schedule.",
                 duration_seconds=90,
+                projects_discussed=projects,
             )
 
             assert mock_client.post.call_count == 2
 
-            # Verify it uses /authentication/add-note endpoint
+            # Verify it uses /project-notes/add-note endpoint
             first_call = mock_client.post.call_args_list[0]
             url = first_call[0][0] if first_call[0] else first_call[1].get("url", "")
             assert "/project-notes/add-note" in url
@@ -1087,6 +1096,9 @@ class TestPostStoreCallNotes:
             assert "Store called" in payload["note_text"]
             assert "1m 30s" in payload["note_text"]
             assert "Store confirmed delivery schedule." in payload["note_text"]
+
+        # Cleanup handled by caller
+        clear_session_projects("vapi-store-test")
 
         assert get_session_projects("vapi-store-test") == {}
 
