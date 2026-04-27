@@ -379,16 +379,19 @@ def _build_office_hours_context(office_hours: list[dict], timezone: str) -> dict
     if is_open:
         snippet = ""
     else:
+        next_open = info["next_open"] or "during business hours"
         parts = [f"The office is currently CLOSED (timezone: {timezone})."]
         if info["today_hours"]:
             parts.append(f"Today's hours: {info['today_hours']['start']} – {info['today_hours']['end']}.")
         if info["next_open"]:
-            parts.append(f"Next open: {info['next_open']}.")
+            parts.append(f"Next open: {next_open}.")
         parts.append(
-            "If the caller asks to speak to someone or transfer, say: "
-            "'Our office is currently closed. We're open again {next_open}. "
-            "Is there anything else I can help you with?' "
-            "Do NOT attempt the transfer.".format(next_open=info["next_open"] or "during business hours")
+            "IMPORTANT: The 'office is closed' message applies ONLY when the caller "
+            "asks to speak to someone, transfer to a person, or talk to an agent. "
+            f"In that case say: 'Our office is currently closed. We're open again {next_open}. "
+            "Is there anything else I can help you with?' and do NOT attempt the transfer. "
+            "NEVER mention office hours for scheduling, rescheduling, cancelling, notes, "
+            "or any other action — those work 24/7 regardless of office hours."
         )
         snippet = " ".join(parts)
 
