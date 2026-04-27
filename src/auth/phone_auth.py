@@ -38,11 +38,15 @@ class AuthenticationError(Exception):
         status_code: int = 0,
         client_name: str = "",
         support_number: str = "",
+        office_hours: list | None = None,
+        timezone: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
         self.client_name = client_name
         self.support_number = support_number
+        self.office_hours = office_hours or []
+        self.timezone = timezone
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -88,14 +92,19 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
     )
     try:
         credentials = await _call_auth_api(phone, to_clean)
-    except AuthenticationError:
+    except AuthenticationError as exc:
         if to_clean:
             logger.warning(
                 "Auth failed with to_phone=***%s — retrying without it",
                 to_clean[-4:],
             )
-            credentials = await _call_auth_api(phone)
+            try:
+                credentials = await _call_auth_api(phone)
+            except AuthenticationError as retry_exc:
+                _enrich_error_from_cache(retry_exc, phone)
+                raise
         else:
+            _enrich_error_from_cache(exc, phone)
             raise
 
     # Step 3: Store in DynamoDB for subsequent requests
@@ -107,6 +116,46 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
     )
 
     return credentials
+
+
+def _enrich_error_from_cache(exc: "AuthenticationError", phone: str) -> None:
+    """Populate an AuthenticationError with support info from expired cache."""
+    info = _get_cached_support_info(phone)
+    if not info:
+        return
+    if not exc.client_name:
+        exc.client_name = info.get("client_name", "")
+    if not exc.support_number:
+        exc.support_number = info.get("support_number", "")
+    if not exc.office_hours:
+        exc.office_hours = info.get("office_hours", [])
+    if not exc.timezone:
+        exc.timezone = info.get("timezone", "")
+
+
+def _get_cached_support_info(phone: str) -> dict:
+    """Read support info from DynamoDB ignoring token expiry.
+
+    Used to enrich AuthenticationError when a known caller's token has expired
+    and re-auth fails — we still want the support_number, office_hours, etc.
+    """
+    settings = get_settings()
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.Table(settings.phone_creds_table)
+        response = table.get_item(Key={"phone_number": phone})
+        if "Item" not in response:
+            return {}
+        item = response["Item"]
+        return {
+            "support_number": item.get("support_number", ""),
+            "client_name": item.get("client_name", ""),
+            "office_hours": item.get("office_hours", []),
+            "timezone": item.get("timezone", ""),
+        }
+    except Exception:
+        logger.exception("Error reading support info from DynamoDB for ***%s", phone[-4:])
+        return {}
 
 
 def get_support_info(phone: str) -> dict:

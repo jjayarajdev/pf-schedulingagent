@@ -459,11 +459,15 @@ async def _handle_assistant_request(body: dict) -> dict:
             # Auth failure = unknown caller (could be store/retailer or unrecognized customer)
             logger.info("Unknown caller detected (call_id=%s)", call_id)
             is_store_caller = True
-            # PF API may return client_name and support_number even on auth failure
+            # Use support info from PF API response or expired DynamoDB cache
             if exc.client_name:
                 client_name = exc.client_name
             if exc.support_number:
                 support_number = exc.support_number
+            if exc.office_hours:
+                office_hours = exc.office_hours
+            if exc.timezone:
+                tenant_timezone = exc.timezone
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
 
