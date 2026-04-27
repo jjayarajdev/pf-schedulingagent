@@ -36,6 +36,7 @@ class AuthenticationError(Exception):
         self,
         message: str,
         status_code: int = 0,
+        client_id: str = "",
         client_name: str = "",
         support_number: str = "",
         office_hours: list | None = None,
@@ -43,6 +44,7 @@ class AuthenticationError(Exception):
     ):
         super().__init__(message)
         self.status_code = status_code
+        self.client_id = client_id
         self.client_name = client_name
         self.support_number = support_number
         self.office_hours = office_hours or []
@@ -93,7 +95,9 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
     try:
         credentials = await _call_auth_api(phone, to_clean)
     except AuthenticationError as exc:
-        if to_clean:
+        # status_code == 0 means 200 with no token (valid "not a customer")
+        # — no point retrying. Only retry on actual API failures (non-200).
+        if to_clean and exc.status_code != 0:
             logger.warning(
                 "Auth failed with to_phone=***%s — retrying without it",
                 to_clean[-4:],
@@ -109,6 +113,7 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
 
     # Step 3: Store in DynamoDB for subsequent requests
     _store_credentials(phone, credentials)
+    save_tenant_config(credentials)
     logger.info(
         "Stored new credentials for user %s (phone: ***%s)",
         credentials.get("user_id", "?"),
@@ -119,8 +124,12 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
 
 
 def _enrich_error_from_cache(exc: "AuthenticationError", phone: str) -> None:
-    """Populate an AuthenticationError with support info from expired cache."""
+    """Populate an AuthenticationError with support info from expired cache or tenant config."""
+    # Try expired phone cache first (has all fields)
     info = _get_cached_support_info(phone)
+    if not info and exc.client_id:
+        # Fall back to tenant config (keyed by client_id, has office_hours + timezone)
+        info = get_tenant_config(exc.client_id)
     if not info:
         return
     if not exc.client_name:
@@ -156,6 +165,59 @@ def _get_cached_support_info(phone: str) -> dict:
     except Exception:
         logger.exception("Error reading support info from DynamoDB for ***%s", phone[-4:])
         return {}
+
+
+def get_tenant_config(client_id: str) -> dict:
+    """Read tenant-level config (office_hours, timezone) from DynamoDB.
+
+    Keyed by ``client:{client_id}`` in the phone-creds table.
+    """
+    if not client_id:
+        return {}
+    settings = get_settings()
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.Table(settings.phone_creds_table)
+        response = table.get_item(Key={"phone_number": f"client:{client_id}"})
+        if "Item" not in response:
+            return {}
+        item = response["Item"]
+        return {
+            "office_hours": item.get("office_hours", []),
+            "timezone": item.get("timezone", ""),
+            "support_number": item.get("support_number", ""),
+            "client_name": item.get("client_name", ""),
+        }
+    except Exception:
+        logger.exception("Error reading tenant config for client %s", client_id)
+        return {}
+
+
+def save_tenant_config(credentials: dict) -> None:
+    """Persist tenant-level config (office_hours, timezone) keyed by client_id.
+
+    Called on any successful auth that returns office_hours.
+    """
+    client_id = credentials.get("client_id", "")
+    office_hours = credentials.get("office_hours", [])
+    if not client_id or not office_hours:
+        return
+    settings = get_settings()
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.Table(settings.phone_creds_table)
+        table.put_item(Item={
+            "phone_number": f"client:{client_id}",
+            "client_id": client_id,
+            "client_name": credentials.get("client_name", ""),
+            "support_number": credentials.get("support_number", ""),
+            "timezone": credentials.get("timezone", "US/Eastern"),
+            "office_hours": office_hours,
+            "updated_at": datetime.now(UTC).isoformat(),
+        })
+        logger.info("Saved tenant config for client %s", client_id)
+    except Exception:
+        logger.exception("Failed to save tenant config for client %s", client_id)
 
 
 def get_support_info(phone: str) -> dict:
@@ -384,11 +446,14 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
 
         if "accesstoken" not in data:
             error_msg = data.get("message", "No access token in response")
-            logger.error("Invalid phone auth response: %s", error_msg)
+            logger.info("Phone auth: no token (non-customer) for ***%s", phone[-4:])
             raise AuthenticationError(
                 f"Authentication failed: {error_msg}",
+                client_id=data.get("client_id", ""),
                 client_name=data.get("client_name", ""),
                 support_number=data.get("support_number", ""),
+                office_hours=data.get("office_hours", []),
+                timezone=data.get("timezone", ""),
             )
 
         user = data.get("user", {})
@@ -493,6 +558,7 @@ async def authenticate_store(
         }
 
         _store_credentials(cache_key, credentials)
+        save_tenant_config(credentials)
         logger.info(
             "Store login success: tenant=***%s lookup=%s:%s user=%s",
             tenant_phone[-4:] if tenant_phone else "none",

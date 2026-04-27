@@ -29,6 +29,7 @@ from auth.phone_auth import (
     authenticate_store,
     get_cached_auth,
     get_or_authenticate,
+    get_tenant_config,
     normalize_phone,
 )
 from channels.conversation_log import log_conversation
