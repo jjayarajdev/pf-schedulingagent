@@ -111,9 +111,11 @@ def _get_base_url() -> str:
 # Shared voice config — used by main assistant, store assistant, AND transfer assistant
 # so the caller hears a consistent voice throughout the entire call.
 _VOICE_CONFIG = {
-    "provider": "cartesia",
-    "model": "sonic-3",
-    "voiceId": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
+    "provider": "11labs",
+    "model": "eleven_turbo_v2_5",
+    "voiceId": "3liN8q8YoeB9Hk6AboKe",
+    "similarityBoost": 0.75,
+    "stability": 0.5,
 }
 
 # Background tasks need a strong reference to avoid GC before completion
