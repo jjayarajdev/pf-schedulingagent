@@ -399,6 +399,11 @@ def _normalize_time(time_str: str) -> str:
     """
     t = time_str.strip()
 
+    # Range format (e.g. "1:00 PM - 3:00 PM") — extract start time only.
+    # GPT sometimes fabricates ranges from single start-time slots.
+    if " - " in t:
+        t = t.split(" - ")[0].strip()
+
     # Already in HH:MM:SS 24-hour format
     if re.match(r"^\d{2}:\d{2}:\d{2}$", t):
         return t
@@ -1191,16 +1196,21 @@ async def get_time_slots(project_id: str, date: str) -> str:
     api_rid = data.get("request_id", request_id)
     if api_rid:
         _request_id_by_project[project_id] = api_rid
-    # Cache the real time slots for server-side injection — prevents the LLM
+    # Format slots as human-readable start times so GPT/Claude relay exact values
+    # and don't fabricate ranges. Raw 24h values ("13:00:00") cause GPT to guess
+    # windows like "1 to 3 PM" which then fail confirm_appointment.
+    display_slots = [_format_time_display(s) for s in slots]
+
+    # Cache display-format slots for server-side injection — prevents the LLM
     # from fabricating additional slots beyond what the API returned.
-    _last_time_slots.set(list(slots))
+    _last_time_slots.set(display_slots)
 
     pnum = _get_project_number(project_id)
     date_display = _format_date_display(date)
     result = {
         "project_number": pnum,
         "date": date_display,
-        "time_slots": slots,
+        "time_slots": display_slots,
         "message": f"Found {len(slots)} available time slot(s) for {date_display}.",
     }
     return json.dumps(result, indent=2)
