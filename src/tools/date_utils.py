@@ -102,10 +102,24 @@ def convert_natural_date(date_str: str) -> dict | None:
                 "strategy": "week",
             }
 
-    # Ordinal week: "1st week of January", "3rd week feb"
+    # Ordinal week: "1st week of January", "3rd week feb", "may of 2nd week"
     ordinal_week_match = re.search(
-        r"(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)\s+week\s+(?:of|for)?\s*(\w+)", date_lower
+        r"(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)\s+week\s+(?:of|for|in)?\s*(\w+)", date_lower
     )
+    if not ordinal_week_match:
+        # Reversed pattern: "may of 2nd week", "january 3rd week"
+        reversed_match = re.search(
+            r"(\w+)\s+(?:of|for|in)?\s*(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)\s+week",
+            date_lower,
+        )
+        if reversed_match:
+            # Swap groups so month_name and week_ord are in the expected positions
+            class _FakeMatch:
+                def __init__(self, g1, g2):
+                    self._groups = (g1, g2)
+                def group(self, n):
+                    return self._groups[n - 1]
+            ordinal_week_match = _FakeMatch(reversed_match.group(2), reversed_match.group(1))
     if ordinal_week_match:
         week_ord = ordinal_week_match.group(1).lower()
         month_name = ordinal_week_match.group(2)[:3].lower()
@@ -228,3 +242,48 @@ def extract_date_range(text: str) -> dict | None:
                 return {"start_date": start_date, "end_date": end_date}
 
     return None
+
+
+def normalize_date_str(date_str: str) -> str:
+    """Normalize a date string to YYYY-MM-DD format.
+
+    Handles: "April 1, 2026", "May 5", "2026-04-28", "04/28/2026",
+    "Jan 10th", "10th Jan", "1 May 2026", etc.
+    Returns the original string unchanged if it can't be parsed.
+    """
+    if not date_str:
+        return date_str
+
+    s = date_str.strip()
+
+    # Already YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+
+    # MM/DD/YYYY
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+
+    today = datetime.now()
+    s_lower = s.lower()
+
+    # "April 1, 2026" or "April 1 2026" or "April 1" or "1 April 2026"
+    for name, num in MONTHS_MAP.items():
+        if name not in s_lower:
+            continue
+        day_match = re.search(r"(\d{1,2})(?:st|nd|rd|th)?", s_lower)
+        year_match = re.search(r"(\d{4})", s)
+        if day_match:
+            day = max(1, min(int(day_match.group(1)), 31))
+            year = int(year_match.group(1)) if year_match else (
+                today.year if num >= today.month else today.year + 1
+            )
+            return f"{year}-{num:02d}-{day:02d}"
+        # Month only — return first of month
+        year = int(year_match.group(1)) if year_match else (
+            today.year if num >= today.month else today.year + 1
+        )
+        return f"{year}-{num:02d}-01"
+
+    return date_str

@@ -73,6 +73,7 @@ from tools.scheduling import (
 )
 from tools.scheduling import confirm_appointment as sched_confirm_appointment
 from tools.scheduling import get_available_dates as sched_get_available_dates
+from tools.scheduling import get_installation_address as sched_get_installation_address
 from tools.scheduling import get_time_slots as sched_get_time_slots
 
 logger = logging.getLogger(__name__)
@@ -636,6 +637,11 @@ def _build_assistant_config(
                     "content": (
                         f"You are J, a friendly phone assistant for {name} "
                         "— a home improvement scheduling service.\n\n"
+                        f"Today's date is {datetime.now().strftime('%A, %B %d, %Y')}. "
+                        f"The current year is {datetime.now().year}. "
+                        f"All dates are in {datetime.now().year}. NEVER say 2020, 2024, or 2025 "
+                        "— those years are in the past. When repeating dates from the scheduling bot, "
+                        "use the EXACT year the bot provided. Do NOT change the year.\n\n"
                         "CRITICAL RULES:\n"
                         '1. You MUST call ask_scheduling_bot for EVERY user request — no exceptions. '
                         "You cannot answer any question about projects, scheduling, dates, times, "
@@ -694,7 +700,20 @@ def _build_assistant_config(
                         "customer's projects, dates, time slots, or appointment details. "
                         "ONLY the scheduling bot knows this. Do NOT include dates, times, "
                         "slot lists, or project details in the question — just pass "
-                        "the user's exact words. The scheduling bot has all the context."
+                        "the user's exact words. The scheduling bot has all the context.\n"
+                        "14. EMOTIONAL CALLERS: If the caller sounds frustrated, angry, or mentions "
+                        "previous problems, acknowledge it briefly — 'I'm sorry about that' or "
+                        "'I understand' — then pass their words to ask_scheduling_bot as usual. "
+                        "Do NOT add lengthy apologies or try to fix emotional issues yourself. "
+                        "One brief acknowledgment, then keep moving.\n"
+                        "15. If the caller is clearly upset and asks to speak to someone, transfer "
+                        "immediately with transferCall. Do NOT say 'let me check' or "
+                        "'is there anything else I can help with' — just transfer.\n"
+                        "16. For questions about pricing, fees, or costs: say 'I handle scheduling — "
+                        "I can connect you with our team for pricing questions. Would you like me "
+                        "to transfer you?' If yes, use transferCall.\n"
+                        "17. If the caller asks you to repeat something, repeat it clearly. "
+                        "Do NOT rephrase or add extra information — just repeat what you said."
                         + (
                             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
                             if hours_context and hours_context.get("prompt_snippet")
@@ -1067,7 +1086,7 @@ def _format_address_for_speech(address: dict) -> str:
 
 
 def _outbound_scheduling_tools(
-    support_number: str, client_name: str, has_dates: bool
+    support_number: str, client_name: str, has_dates: bool, has_address: bool = True,
 ) -> list[dict]:
     """Build the Vapi tool definitions for outbound scheduling calls.
 
@@ -1161,6 +1180,24 @@ def _outbound_scheduling_tools(
             },
         })
 
+    # Fallback: include get_installation_address when address isn't pre-fetched
+    if not has_address:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_installation_address",
+                "description": (
+                    "Get the installation address for the project. "
+                    "Call this BEFORE the booking confirmation step "
+                    "so you can read the address to the customer."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        })
+
     tools.extend(_transfer_call_tool(support_number, client_name))
     return tools
 
@@ -1208,16 +1245,22 @@ def _build_outbound_scheduling_config(
     # Check for pre-fetched data
     dates_data = prefetched.get("dates", {})
     has_dates = bool(dates_data.get("available_dates"))
+    address_data = prefetched.get("address", {})
+    has_address = bool(address_data)
 
     # Build the pre-loaded data section for the prompt
     preloaded_section = ""
-    if has_dates:
+    if has_dates or has_address:
         preloaded_section = "\n## PRE-LOADED PROJECT DATA (already fetched — DO NOT call any tool for this)\n"
         preloaded_section += (
             "IMPORTANT: This data is ALREADY loaded. DO NOT call get_available_dates "
-            "or any other tool to look up dates. Present this data DIRECTLY.\n\n"
+            "or any other tool to look up dates or address. Present this data DIRECTLY.\n\n"
         )
-        preloaded_section += _format_prefetched_dates(dates_data) + "\n"
+        if has_dates:
+            preloaded_section += _format_prefetched_dates(dates_data) + "\n"
+        if has_address:
+            addr_str = _format_address_for_speech(address_data)
+            preloaded_section += f"**Installation Address:** {addr_str}\n"
 
     # Build Step 3 — different depending on whether we have pre-fetched dates
     if has_dates:
@@ -1241,9 +1284,26 @@ def _build_outbound_scheduling_config(
             "- If they pick a date NOT in the list: "
             "'That date isn't available. The closest options are [X] and [Y].'\n"
             "- Read time slots briefly: 'I have [X] and [Y]. Which works better?'\n"
-            "- Customer picks a time → confirm before booking:\n"
-            "  'I'll schedule that for [day] the [date] at [time]. Sound good?'\n"
-            "- Wait for YES before calling confirm_appointment.\n"
+            "- Customer picks a time → CONFIRM ADDRESS before booking:\n"
+            + (
+                f"  'So that's [day] the [date] at [time], at {_format_address_for_speech(address_data)}. "
+                "Does everything look right, including the address?'\n"
+                if has_address else
+                "  BEFORE confirming, call get_installation_address to fetch the address. "
+                "Then read it to the customer:\n"
+                "  'So that's [day] the [date] at [time], at [address from tool]. "
+                "Does everything look right, including the address?'\n"
+                "  If get_installation_address returns no address, say: "
+                "'So that's [day] the [date] at [time]. I don't have the installation "
+                "address on file — our team will confirm it with you before the appointment. "
+                "Should I go ahead and book this?'\n"
+            )
+            + "- If YES → call confirm_appointment.\n"
+            "- If ADDRESS IS WRONG → ask for the correct address → call add_note with "
+            "'Customer requested installation address update. New address is [new]. "
+            "Previous address was [old].' → then call confirm_appointment → tell customer "
+            "the appointment is booked and the address change has been noted.\n"
+            "- If they want a DIFFERENT DATE/TIME → go back to date/time selection.\n"
         )
     else:
         step3 = (
@@ -1252,14 +1312,31 @@ def _build_outbound_scheduling_config(
             "- Call get_available_dates to fetch dates with weather information.\n"
             "- Present the dates as a summary with a recommendation (not one by one).\n"
             "- Customer picks a date → call get_time_slots with that date.\n"
-            "- Read time slots, customer picks → SUMMARIZE before booking:\n"
-            "  'Just to confirm — I'll schedule your appointment for [date] "
-            "between [time slot]. Shall I go ahead and book that?'\n"
-            "- Wait for the customer to say YES before calling confirm_appointment.\n"
+            "- Customer picks a time → CONFIRM ADDRESS before booking:\n"
+            + (
+                f"  'Just to confirm — that's [date] between [time slot], at "
+                f"{_format_address_for_speech(address_data)}. "
+                "Does everything look right, including the address?'\n"
+                if has_address else
+                "  BEFORE confirming, call get_installation_address to fetch the address. "
+                "Then read it to the customer:\n"
+                "  'Just to confirm — that's [date] between [time slot], at [address from tool]. "
+                "Does everything look right, including the address?'\n"
+                "  If get_installation_address returns no address, say: "
+                "'Just to confirm — that's [date] between [time slot]. I don't have the installation "
+                "address on file — our team will confirm it with you before the appointment. "
+                "Should I go ahead and book this?'\n"
+            )
+            + "- If YES → call confirm_appointment.\n"
+            "- If ADDRESS IS WRONG → ask for the correct address → call add_note with "
+            "'Customer requested installation address update. New address is [new]. "
+            "Previous address was [old].' → then call confirm_appointment → tell customer "
+            "the appointment is booked and the address change has been noted.\n"
+            "- If they want a DIFFERENT DATE/TIME → go back to date/time selection.\n"
             "- The appointment is NOT booked until confirm_appointment returns 'confirmed'.\n"
         )
 
-    # Build Step 4+5 — Notes + Wrap-up (no address confirmation needed)
+    # Build Step 4+5 — Notes + Wrap-up
     step45 = (
         "### Step 4 — Additional Notes\n"
         "- Ask: 'Is there anything our team should know before arriving? "
@@ -1273,8 +1350,14 @@ def _build_outbound_scheduling_config(
         "End the call.\n"
     )
 
+    from datetime import datetime as _dt
+    _today = _dt.now()
+    _today_str = _today.strftime("%A, %B %d, %Y")
+
     system_prompt = (
         f"You are J, a friendly and concise phone assistant for {name}.\n\n"
+        f"Today is {_today_str}. The current year is {_today.year}. "
+        f"All dates MUST use {_today.year}. NEVER use 2024 or 2025 — those are in the past.\n\n"
         "## YOUR MISSION\n"
         f"Schedule {first_name}'s {project_type or 'upcoming'} project. "
         "Be natural, brief, and conversational — like a human scheduler.\n"
@@ -1297,8 +1380,14 @@ def _build_outbound_scheduling_config(
         "- Only discuss THIS project ("
         + (project_type or "the one you called about")
         + "). Do NOT mention other projects the customer may have.\n"
-        "- Do NOT proactively ask for the installation address. But if the customer "
-        "volunteers an address correction, capture it with add_note.\n"
+        "- ALWAYS read the installation address aloud during the booking confirmation step. "
+        + (
+            "The address is in PRE-LOADED DATA above. "
+            if has_address else
+            "Call get_installation_address to fetch it first, then read it aloud. "
+            "NEVER ask 'Does the address look correct?' without first telling the customer what the address is. "
+        )
+        + "If the customer says the address is wrong, capture the correction with add_note.\n"
         "- FILLER RULES: When a tool call is running, say 'One moment.' and NOTHING else. "
         "NEVER say 'Just a sec', 'Give me a moment', 'Hold on', 'Wait', "
         "'Hang on', 'Let me check', or any other filler. One filler per tool call MAX.\n"
@@ -1308,7 +1397,7 @@ def _build_outbound_scheduling_config(
         "## TOOL RULES\n"
         "1. get_time_slots: Call with a date (YYYY-MM-DD) to get available time slots.\n"
         "2. confirm_appointment: Call with date and time ONLY after you have "
-        "summarized the appointment and the customer has said YES. "
+        "summarized the appointment AND read the address AND the customer has said YES. "
         "NEVER call this without verbal confirmation first.\n"
         "3. add_note: For address changes, start note_text with 'Customer requested installation address update. New address is'. "
         "For customer notes (gate codes, pets, parking, etc.), start with 'CUSTOMER NOTE:'.\n"
@@ -1318,7 +1407,24 @@ def _build_outbound_scheduling_config(
         "in PRE-LOADED DATA above. Answer directly, no tool call needed.\n"
         "7. Past dates are NOT allowed. Scheduling is only available from tomorrow onwards. "
         "If the customer suggests a past date, say: 'That date has already passed. "
-        "Let me check the next available dates for you.'"
+        "Let me check the next available dates for you.'\n"
+        + (
+            ""
+            if has_address else
+            "8. get_installation_address: Call this BEFORE the booking confirmation to get the "
+            "address. You MUST read the address aloud to the customer before asking them to confirm.\n"
+        )
+        + "\n"
+        "## EMOTIONAL AWARENESS\n"
+        "- If the customer sounds annoyed about receiving the call: "
+        "'I understand — I'll keep this quick.' Then proceed efficiently.\n"
+        "- If they express frustration about past scheduling issues: "
+        "'I'm sorry about that. Let's make this one easy.'\n"
+        "- If they get angry or want a person: transfer immediately with transferCall. "
+        "Do NOT try to keep them on the line.\n"
+        "- For pricing or fee questions: 'I handle scheduling — I can transfer you "
+        "to our team for pricing questions.' Then transfer if they agree.\n"
+        "- If asked to repeat something: repeat clearly, no extra commentary."
         + (
             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
             if hours_context and hours_context.get("prompt_snippet")
@@ -1345,7 +1451,7 @@ def _build_outbound_scheduling_config(
             "messages": [
                 {"role": "system", "content": system_prompt}
             ],
-            "tools": _outbound_scheduling_tools(support_number, name, has_dates),
+            "tools": _outbound_scheduling_tools(support_number, name, has_dates, has_address),
         },
         "transcriber": {
             "model": "nova-3",
@@ -2214,7 +2320,7 @@ async def _process_tool(
         )
 
     # Direct outbound tools — bypass orchestrator, call scheduling functions directly
-    if tool_name in ("get_time_slots", "confirm_appointment", "add_note", "get_available_dates"):
+    if tool_name in ("get_time_slots", "confirm_appointment", "add_note", "get_available_dates", "get_installation_address"):
         return await _handle_outbound_direct_tool(
             tool_name, tool_params, call_id, tool_call_id, session_id, user_id,
         )
@@ -2413,6 +2519,8 @@ async def _handle_outbound_direct_tool(
             result = await sched_add_note(project_id, note_text)
         elif tool_name == "get_available_dates":
             result = await sched_get_available_dates(project_id)
+        elif tool_name == "get_installation_address":
+            result = await sched_get_installation_address(project_id)
         else:
             result = f"Unknown tool: {tool_name}"
     except Exception:

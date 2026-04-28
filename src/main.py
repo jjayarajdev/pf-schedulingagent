@@ -93,12 +93,15 @@ app.include_router(admin_router)
 
 @app.get("/health", tags=["system"], summary="Health check")
 async def health():
+    from channels.outbound_consumer import is_consumer_running
+
     settings = get_settings()
     return {
         "status": "healthy",
         "service": "scheduling-bot",
         "environment": settings.environment,
         "region": settings.aws_region,
+        "outbound_consumer": "running" if is_consumer_running() else "stopped",
     }
 
 

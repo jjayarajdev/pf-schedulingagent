@@ -1445,8 +1445,9 @@ class TestOutboundPrefetchPrompt:
         assert "April 14" in prompt
         assert "April 15" in prompt
 
-        # Address should NOT be in the prompt (removed)
-        assert "123 Main St" not in prompt
+        # Address should be in the prompt (for confirmation step)
+        assert "123 Main St" in prompt
+        assert "Installation Address" in prompt
 
         # Time slots should be in the prompt
         assert "9:00 AM" in prompt
@@ -1502,16 +1503,16 @@ class TestOutboundPrefetchPrompt:
         # Without prefetched data, should use tool-based flow
         assert "PRE-LOADED PROJECT DATA" not in prompt
         assert "get_available_dates" in prompt
-        # Should NOT proactively ask for address (but rule about it is fine)
-        assert "Do NOT proactively ask for the installation address" in prompt
+        # Address confirmation step should still be present
+        assert "ALWAYS read the installation address" in prompt
         # Project type still mentioned in the mission statement
         assert "Carpet" in prompt
 
-    def test_no_address_confirmation_in_prompt(self):
-        """Address confirmation should NOT be in the outbound prompt."""
+    def test_address_confirmation_in_prompt(self):
+        """Address confirmation should be in the outbound prompt before booking."""
         from channels.vapi import _build_outbound_scheduling_config
 
-        # With prefetched data
+        # With prefetched address — address included in confirmation step
         outbound_with = {
             "customer_name": "Jane",
             "project_type": "Tile",
@@ -1521,18 +1522,23 @@ class TestOutboundPrefetchPrompt:
         }
         config = _build_outbound_scheduling_config("Hi!", "secret", outbound_with, "")
         prompt = config["model"]["messages"][0]["content"]
-        assert "Confirm Address" not in prompt
-        assert "we have your installation address" not in prompt
+        assert "456 Oak Ave" in prompt
+        assert "ADDRESS IS WRONG" in prompt
 
-        # Without prefetched data
+        # Without prefetched address — prompt instructs GPT to call get_installation_address
         outbound_without = {"customer_name": "Jane", "project_type": "Tile"}
         config2 = _build_outbound_scheduling_config("Hi!", "secret", outbound_without, "")
         prompt2 = config2["model"]["messages"][0]["content"]
-        assert "Confirm Address" not in prompt2
-        assert "Do NOT proactively ask for the installation address" in prompt2
+        assert "ADDRESS IS WRONG" in prompt2
+        assert "ALWAYS read the installation address" in prompt2
+        assert "call get_installation_address" in prompt2
+        assert "NEVER ask" in prompt2  # NEVER ask about address without reading it first
+        # get_installation_address tool should be included
+        tool_names = [t["function"]["name"] for t in config2["model"]["tools"]]
+        assert "get_installation_address" in tool_names
 
     def test_verbal_confirmation_before_booking(self):
-        """AI must summarize and get verbal YES before calling confirm_appointment."""
+        """AI must confirm address and get verbal YES before calling confirm_appointment."""
         from channels.vapi import _build_outbound_scheduling_config
 
         outbound = {
@@ -1544,8 +1550,9 @@ class TestOutboundPrefetchPrompt:
         }
         config = _build_outbound_scheduling_config("Hi!", "secret", outbound, "")
         prompt = config["model"]["messages"][0]["content"]
-        assert "Sound good?" in prompt
-        assert "Wait for YES before calling confirm_appointment" in prompt
+        assert "CONFIRM ADDRESS" in prompt
+        assert "If YES" in prompt
+        assert "confirm_appointment" in prompt
 
     def test_style_rules_present(self):
         from channels.vapi import _build_outbound_scheduling_config
@@ -1560,7 +1567,7 @@ class TestOutboundPrefetchPrompt:
         assert "ONCE per action" in prompt
         assert "only discuss THIS project" in prompt.lower() or "Only discuss THIS project" in prompt
         assert "Hold on" in prompt  # prohibition mentioned
-        assert "Do NOT proactively ask for the installation address" in prompt
+        assert "ALWAYS read the installation address" in prompt
 
     def test_project_scoping_in_prompt(self):
         from channels.vapi import _build_outbound_scheduling_config
@@ -1847,28 +1854,40 @@ class TestOutboundDirectTools:
         assert "trouble" in result["results"][0]["result"].lower()
 
     def test_outbound_tools_list_with_prefetch(self):
-        """When dates are pre-fetched, get_available_dates should NOT be a tool."""
+        """When dates+address are pre-fetched, fallback tools should NOT be included."""
         from channels.vapi import _outbound_scheduling_tools
 
-        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=True)
+        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=True, has_address=True)
         fn_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
 
         assert "get_time_slots" in fn_names
         assert "confirm_appointment" in fn_names
         assert "add_note" in fn_names
         assert "get_available_dates" not in fn_names
+        assert "get_installation_address" not in fn_names
 
     def test_outbound_tools_list_without_prefetch(self):
-        """When dates are NOT pre-fetched, get_available_dates should be included."""
+        """When dates+address are NOT pre-fetched, fallback tools should be included."""
         from channels.vapi import _outbound_scheduling_tools
 
-        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=False)
+        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=False, has_address=False)
         fn_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
 
         assert "get_time_slots" in fn_names
         assert "confirm_appointment" in fn_names
         assert "add_note" in fn_names
         assert "get_available_dates" in fn_names
+        assert "get_installation_address" in fn_names
+
+    def test_outbound_tools_address_only_missing(self):
+        """When dates pre-fetched but address missing, only address tool is added."""
+        from channels.vapi import _outbound_scheduling_tools
+
+        tools = _outbound_scheduling_tools("+15551234567", "TestCo", has_dates=True, has_address=False)
+        fn_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
+
+        assert "get_available_dates" not in fn_names
+        assert "get_installation_address" in fn_names
 
 
 class TestSessionCompletedActions:

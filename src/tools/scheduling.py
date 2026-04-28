@@ -22,7 +22,7 @@ import httpx
 from auth.context import AuthContext
 from observability.logging import RequestContext
 from tools.api_client import build_headers, get_pf_api_base, log_curl, log_response
-from tools.date_utils import convert_natural_date, extract_date_range
+from tools.date_utils import convert_natural_date, extract_date_range, normalize_date_str
 from tools.project_rules import ProjectStatusRules
 
 logger = logging.getLogger(__name__)
@@ -930,6 +930,11 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
 
+    # Normalize natural language dates to YYYY-MM-DD (e.g. "April 1, 2026" → "2026-04-01")
+    # Must happen before all other date logic so clamping/parsing works on ISO format.
+    start_date = normalize_date_str(start_date)
+    end_date = normalize_date_str(end_date)
+
     if start_date and not end_date:
         range_result = extract_date_range(start_date)
         if range_result:
@@ -1109,6 +1114,8 @@ async def get_time_slots(project_id: str, date: str) -> str:
     _time_slots_called_in_request.set(True)
     project_id = await _resolve_project_id(project_id)
     _track_project_action(project_id, "get_time_slots")
+    # Normalize natural language dates (e.g. "May 5" → "2026-05-05")
+    date = normalize_date_str(date)
     # Fix common LLM date errors: wrong year
     try:
         date_obj = datetime.strptime(date, "%Y-%m-%d")
@@ -1233,6 +1240,17 @@ async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwa
     request_id = _request_id_by_project.get(project_id, 0)
     normalized_time = _normalize_time(time)
 
+    # Normalize date — GPT often sends natural language or wrong year (e.g. 2024)
+    date = normalize_date_str(date)
+    try:
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        current_year = datetime.now().year
+        if date_obj.year < current_year:
+            date = date.replace(str(date_obj.year), str(current_year), 1)
+            logger.warning("confirm_appointment: corrected date year from %d to %d: %s", date_obj.year, current_year, date)
+    except ValueError:
+        pass
+
     client_id = AuthContext.get_client_id()
     base_url = _build_scheduler_url(client_id, project_id)
     url = f"{base_url}/schedule"
@@ -1293,10 +1311,24 @@ async def _confirm_appointment_impl(project_id: str, date: str, time: str, **kwa
 
     date_display = _format_date_display(date)
     time_display = _format_time_display(normalized_time)
-    msg = f"Appointment confirmed! Your appointment is scheduled for {date_display} at {time_display}."
+
+    # Check if the PF API says the appointment needs office review
+    api_message = data.get("message", "")
+    is_pending_review = "review" in api_message.lower() or "request" in api_message.lower()
+
+    if is_pending_review:
+        msg = (
+            f"Your scheduling request for {date_display} at {time_display} has been submitted. "
+            f"The office will review and confirm it shortly. "
+            f"The project status is NOT yet 'Scheduled' — it will update once the office approves. "
+            f"Do NOT tell the customer it is already scheduled."
+        )
+    else:
+        msg = f"Appointment confirmed! Your appointment is scheduled for {date_display} at {time_display}."
     if confirmation_number:
         msg += f" Confirmation number: {confirmation_number}."
-    msg += " You will receive a confirmation to your registered email and phone number."
+    if not is_pending_review:
+        msg += " You will receive a confirmation to your registered email and phone number."
     _confirm_success_result.set(msg)
     mark_session_action("confirm", project_id)
     return msg

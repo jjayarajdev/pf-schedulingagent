@@ -268,7 +268,7 @@ async def start_outbound_consumer() -> None:
         return
 
     _shutdown_event.clear()
-    _consumer_task = asyncio.create_task(_consumer_loop())
+    _consumer_task = asyncio.create_task(_consumer_supervisor())
     logger.info("Outbound SQS consumer started (queue=%s)", settings.outbound_queue_url)
 
 
@@ -281,14 +281,33 @@ async def stop_outbound_consumer() -> None:
     _shutdown_event.set()
     try:
         await asyncio.wait_for(_consumer_task, timeout=10.0)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         logger.warning("Outbound consumer shutdown timed out — cancelling")
         _consumer_task.cancel()
     _consumer_task = None
     logger.info("Outbound SQS consumer stopped")
 
 
+def is_consumer_running() -> bool:
+    """Check if the outbound consumer is alive (for health checks)."""
+    return _consumer_task is not None and not _consumer_task.done()
+
+
 # ── Consumer loop ────────────────────────────────────────────────────
+
+
+async def _consumer_supervisor() -> None:
+    """Supervise the consumer loop — auto-restart if it crashes unexpectedly."""
+    while not _shutdown_event.is_set():
+        try:
+            await _consumer_loop()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            if _shutdown_event.is_set():
+                break
+            logger.exception("Consumer loop crashed — restarting in 5s")
+            await asyncio.sleep(5)
 
 
 async def _consumer_loop() -> None:
@@ -299,12 +318,14 @@ async def _consumer_loop() -> None:
 
     while not _shutdown_event.is_set():
         try:
-            # Long-poll (blocking in thread pool to avoid blocking the event loop)
+            # Short poll (5s) so shutdown can complete within the 10s timeout.
+            # Previous 20s WaitTimeSeconds caused shutdown to timeout and
+            # force-cancel the consumer, leaving it dead after rolling deploys.
             response = await asyncio.to_thread(
                 sqs.receive_message,
                 QueueUrl=queue_url,
                 MaxNumberOfMessages=1,
-                WaitTimeSeconds=20,
+                WaitTimeSeconds=5,
                 VisibilityTimeout=120,
             )
 
