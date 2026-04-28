@@ -1521,9 +1521,11 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     then qualifies them during the conversation.
     """
     name = client_name or "ProjectsForce"
+    tts_name = name.replace("ProjectsForce", "Projects Force")
     return (
-        f'<break time="3000ms"/> Hello! I\'m J from {name}. '
+        f'<break time="3000ms"/> Hello! I\'m J from {tts_name}. '
         '<break time="300ms"/> '
+        "I can help you check on a project status or schedule a home improvement appointment. "
         "How can I help you today?"
     )
 
@@ -1589,13 +1591,17 @@ def _build_store_assistant_config(
         "retailer or a customer. You must qualify them first.\n\n"
         "## QUALIFICATION FLOW\n"
         "1. You already greeted them. Wait for them to state their need.\n"
-        "2. If their request is about a project, order, installation, "
-        "or scheduling, ask: 'Are you the customer, or are you calling "
-        "from a retailer?'\n"
-        "   - Recognize these as RETAILER: store, retailer, Lowe's, "
-        "Home Depot, vendor, supplier, dealer, shop.\n"
-        "   - Recognize these as CUSTOMER: customer, homeowner, "
+        "2. Determine if they are a RETAILER or CUSTOMER:\n"
+        "   - RETAILER keywords: store, retailer, Lowe's, Home Depot, WTU, "
+        "vendor, supplier, dealer, shop.\n"
+        "   - CUSTOMER keywords: customer, homeowner, "
         "I'm the customer, it's my project, I placed the order.\n"
+        "   IMPORTANT: If the caller ALREADY identified themselves in their first "
+        "statement (e.g., 'I'm calling from Home Depot about a project', "
+        "'This is Lowe's', 'I'm a retailer'), do NOT ask 'are you a customer "
+        "or retailer?' — they already told you. Skip straight to step 3.\n"
+        "   ONLY ask 'Are you the customer, or are you calling from a retailer?' "
+        "if their role is unclear from what they said.\n"
         "3. If RETAILER: ask for a project number or PO number. "
         "ONLY accept a project number or PO number — nothing else. "
         "Do NOT accept customer names, addresses, phone numbers, "
