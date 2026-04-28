@@ -141,6 +141,10 @@ _call_auth_cache: dict[str, dict] = {}
 # from drifting to a different project (especially during guardrail retries).
 _call_project_pin: dict[str, str] = {}
 
+# Outbound call tool sequence tracker: call_id → set of tools called.
+# Used to enforce that address is confirmed before booking on outbound calls.
+_outbound_tools_called: dict[str, set[str]] = {}
+
 
 def get_call_auth(call_id: str) -> dict | None:
     """Retrieve cached auth credentials for a call."""
@@ -628,7 +632,7 @@ def _build_assistant_config(
         "name": f"{name} Scheduling Bot",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o",
+            "model": "gpt-5.2-chat-latest",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -1458,7 +1462,7 @@ def _build_outbound_scheduling_config(
         "name": f"{name} Outbound Scheduling",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o",
+            "model": "gpt-5.2-chat-latest",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -1721,7 +1725,7 @@ def _build_store_assistant_config(
         "name": f"{name} Assistant",
         "voice": _VOICE_CONFIG,
         "model": {
-            "model": "gpt-4o",
+            "model": "gpt-5.2-chat-latest",
             "provider": "openai",
             "temperature": 0.3,
             "messages": [
@@ -1974,6 +1978,7 @@ async def _handle_server_event(body: dict) -> dict:
                 retry_task.add_done_callback(_background_tasks.discard)
 
             _call_project_pin.pop(call_id, None)
+            _outbound_tools_called.pop(call_id, None)
             logger.info(
                 "Outbound call ended: our_call_id=%s status=%s reason=%s",
                 our_call_id, outcome["status"], reason,
@@ -2080,6 +2085,7 @@ async def _handle_server_event(body: dict) -> dict:
         _store_sessions.pop(session_key, None)
         _call_auth_cache.pop(call_id, None)
         _call_project_pin.pop(call_id, None)
+        _outbound_tools_called.pop(call_id, None)
     elif event_type == "status-update":
         status = message.get("status", "unknown")
         logger.info("Vapi status-update: call_id=%s status=%s", call_id, status)
@@ -2524,6 +2530,28 @@ async def _handle_outbound_direct_tool(
         return _build_tool_result(
             "I'm having trouble with that. Let me try again.", tool_call_id,
         )
+
+    # Track tool calls per call for sequence enforcement
+    called = _outbound_tools_called.setdefault(call_id, set())
+
+    # Guardrail: block confirm_appointment if address was never confirmed.
+    # The prompt says "CONFIRM ADDRESS before booking" but GPT sometimes skips it.
+    # When address is pre-loaded in the prompt (has_address=True), GPT should still
+    # READ IT ALOUD before booking — we can't verify that, but we CAN check that
+    # get_time_slots was called (meaning the customer picked a date+time).
+    if tool_name == "confirm_appointment" and "get_time_slots" not in called:
+        logger.warning(
+            "Outbound guardrail: confirm_appointment called without get_time_slots (call_id=%s)",
+            call_id,
+        )
+        return _build_tool_result(
+            "You must ask the customer to pick a date and time first. "
+            "Present the available dates, let them choose, then call get_time_slots "
+            "for their chosen date before confirming.",
+            tool_call_id,
+        )
+
+    called.add(tool_name)
 
     start_time = time.monotonic()
     try:
