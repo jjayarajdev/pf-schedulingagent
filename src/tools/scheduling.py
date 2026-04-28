@@ -475,13 +475,16 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
         if category:
             project["category"] = category
 
+        store_status = project.get("status", "")
+        store_has_appt = store_status not in ("Ready To Schedule", "Ready to Schedule")
+
         scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
-        if scheduled_date:
+        if scheduled_date and store_has_appt:
             project["scheduledDate"] = scheduled_date
             project["scheduledEndDate"] = _safe_get(item, "convertedProjectEndScheduledDate", default="")
 
         installer_name = _safe_get(item, "user_idata_first_name")
-        if installer_name:
+        if installer_name and store_has_appt:
             installer_last = _safe_get(item, "user_idata_last_name", default="")
             project["installer"] = {"name": f"{installer_name} {installer_last}".strip()}
 
@@ -491,13 +494,19 @@ def _extract_project_minimal(item: dict) -> dict[str, Any]:
     project["category"] = category
     project["projectType"] = project_type
 
+    # Only include appointment details when the project is actually scheduled.
+    # "Ready To Schedule" projects may have stale dates from a previous booking
+    # that was cancelled or needs rescheduling — showing those confuses users.
+    status = project.get("status", "")
+    has_active_appointment = status not in ("Ready To Schedule", "Ready to Schedule")
+
     scheduled_date = _safe_get(item, "convertedProjectStartScheduledDate")
-    if scheduled_date:
+    if scheduled_date and has_active_appointment:
         project["scheduledDate"] = scheduled_date
         project["scheduledEndDate"] = _safe_get(item, "convertedProjectEndScheduledDate", default="")
 
     installer_name = _safe_get(item, "user_idata_first_name")
-    if installer_name:
+    if installer_name and has_active_appointment:
         installer_last = _safe_get(item, "user_idata_last_name", default="")
         project["installer"] = {
             "name": f"{installer_name} {installer_last}".strip(),
