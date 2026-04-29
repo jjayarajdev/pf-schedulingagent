@@ -154,6 +154,25 @@ def _track_project_action(project_id: str, action: str) -> None:
         projects[project_id].append(action)
 
 
+def track_session_project(session_id: str, project_id: str, action: str = "store_lookup") -> None:
+    """Explicitly track a project for a session (used by store auth flow).
+
+    Unlike ``_track_project_action`` which reads session_id from RequestContext,
+    this accepts session_id directly — useful when the caller knows the session
+    but RequestContext may not be set (e.g., during store authentication).
+    """
+    if not session_id or not project_id:
+        return
+    project_id = str(project_id)
+    if session_id not in _session_projects:
+        _session_projects[session_id] = {}
+    projects = _session_projects[session_id]
+    if project_id not in projects:
+        projects[project_id] = []
+    if action not in projects[project_id]:
+        projects[project_id].append(action)
+
+
 def get_session_projects(session_id: str) -> dict[str, list[str]]:
     """Return {project_id: [actions]} for a session. Used by end-of-call handler."""
     return _session_projects.get(session_id, {})
@@ -1897,7 +1916,7 @@ async def post_store_call_notes(
     if projects_discussed is None:
         projects_discussed = get_session_projects(session_id)
     if not projects_discussed:
-        logger.info("No projects discussed in store session %s — skipping call notes", session_id)
+        logger.warning("No projects discussed in store session %s — skipping call notes", session_id)
         return
 
     minutes = int(duration_seconds // 60)

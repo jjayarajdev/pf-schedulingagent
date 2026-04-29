@@ -58,6 +58,7 @@ from tools.scheduling import (
     get_reschedule_old_appointment,
     get_session_notes,
     get_session_projects,
+    track_session_project,
     post_call_summary_notes,
     post_store_call_notes,
     reset_action_flags,
@@ -2065,9 +2066,42 @@ async def _handle_server_event(body: dict) -> dict:
         session_projects = get_session_projects(session_id)
         session_notes = get_session_notes(session_id)
 
+        # Debug: log store call conditions
+        if store_session:
+            logger.info(
+                "Store end-of-call check: call_id=%s authenticated=%s "
+                "has_summary=%s projects_tracked=%d",
+                call_id,
+                store_session.get("authenticated"),
+                bool(summary),
+                len(session_projects),
+            )
+
         if store_session and store_session.get("authenticated") and summary:
             # Store call — use /project-notes/add-note endpoint
             store_creds = store_session["creds"]
+            # Fallback: if no projects were tracked by tools, try the lookup
+            # value from store auth (project_number → project_id).
+            if not session_projects:
+                lookup_type = store_session.get("lookup_type", "")
+                lookup_value = store_session.get("lookup_value", "")
+                if lookup_type == "project_number" and lookup_value:
+                    session_projects = {lookup_value: ["store_lookup"]}
+                    logger.warning(
+                        "Store end-of-call: no tools tracked projects — "
+                        "falling back to auth lookup project=%s session=%s",
+                        lookup_value, session_id,
+                    )
+                else:
+                    logger.warning(
+                        "Store end-of-call: no projects tracked and lookup_type=%s "
+                        "— cannot post notes. session=%s",
+                        lookup_type, session_id,
+                    )
+            logger.info(
+                "Store end-of-call: posting notes for %d project(s) session=%s",
+                len(session_projects), session_id,
+            )
             task = asyncio.create_task(
                 post_store_call_notes(
                     session_id=session_id,
@@ -2437,6 +2471,12 @@ async def _handle_store_bot(
         store_session["support_number"] = creds.get("support_number", "")
         store_session["client_name"] = creds.get("client_name", "")
         _store_sessions[session_key] = store_session
+        # Pre-track the project from lookup so end-of-call notes always have
+        # at least one project — even if the orchestrator's tools don't fire
+        # _track_project_action (e.g., RequestContext not propagated).
+        if lookup_type == "project_number" and lookup_value:
+            track_session_project(session_key, lookup_value, "store_lookup")
+            logger.info("Store auth: tracked project %s for session %s", lookup_value, session_key)
 
     if not question:
         msg = (
