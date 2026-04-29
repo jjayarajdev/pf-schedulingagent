@@ -1599,24 +1599,20 @@ def _build_store_assistant_config(
     if server_secret:
         server_config["secret"] = server_secret
 
-    # Build customer/non-project handling based on whether transfer is available
+    # Customer instruction: redirect to retailer flow (never immediate transfer)
+    customer_instruction = (
+        "say 'I\\'m sorry, I don\\'t have your information on file on this line. "
+        "This line is for retailers to check project status. "
+        "If you\\'re calling from a store or retailer, I can look up a project "
+        "by project number or PO number. Do you have either of those?'"
+    )
+    # Non-project handling (job inquiry, sales call, wrong number)
     if has_transfer:
-        customer_instruction = (
-            "say 'I don't recognize your phone number. "
-            "Let me transfer you to our team so they can help you.' "
-            "Then use the transferCall tool to transfer the call."
-        )
         non_project_instruction = (
             "say 'Let me connect you with someone who can help.' "
             "Then use the transferCall tool to transfer the call."
         )
     else:
-        customer_instruction = (
-            f"say 'I don't have your account on file right now. "
-            f"Our team at {speech_name} will reach out to you shortly. "
-            "Is there anything else I can help you with?' "
-            "Then end the call gracefully."
-        )
         non_project_instruction = (
             f"say 'Our team at {speech_name} will reach out to you shortly. "
             "Is there anything else I can help you with?' "
@@ -1647,10 +1643,14 @@ def _build_store_assistant_config(
         "Do NOT accept customer names, addresses, phone numbers, "
         "project descriptions, or any other identifier. "
         "If they give something else, say: 'I can only look up projects "
-        "by project number or PO number. Do you have either of those?' "
-        "IMPORTANT: Project numbers can be ANY length (even 4 digits like '6789') "
-        "and may contain letters. NEVER reject a number for being too short or "
-        "too long — always pass it to ask_store_bot and let the system validate it. "
+        "by project number or PO number. Do you have either of those?'\n"
+        "## CRITICAL: ALWAYS Pass Numbers to the Tool\n"
+        "When the caller gives you ANY value as a project number or PO number "
+        "— whether it is 4 digits, 5 digits, 10 digits, or alphanumeric — "
+        "ALWAYS pass it to ask_store_bot IMMEDIATELY. "
+        "Do NOT say 'I need the full number', 'that seems too short', "
+        "'could you provide the complete number', or anything similar. "
+        "The system validates the number, NOT you. Your ONLY job is to pass it through. "
         "Once they give a number, call ask_store_bot "
         "with ALL THREE fields: question (what they said), "
         "lookup_type ('project_number' or 'po_number'), and "
