@@ -1741,9 +1741,10 @@ def _build_store_assistant_config(
         "Let the scheduling bot handle clarification.\n"
         "- TECHNICIAN REQUESTS: If the caller asks to speak to the technician, "
         "installer, or field worker specifically, say: "
-        "'I\\'m sorry, I don\\'t have the ability to connect you with the technician directly. "
-        "I can transfer you to our support team if you\\'d like.' "
-        "Do NOT attempt to transfer to a technician — only transfer to the support team."
+        "'I\\'m sorry, I\\'m not able to connect you with the technician directly.' "
+        "Then offer to help: 'I can check the project status or leave a note "
+        "for the team. Would either of those help?' "
+        "Do NOT offer to transfer the call. Do NOT use transferCall for technician requests."
         + (
             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
             if hours_context and hours_context.get("prompt_snippet")
