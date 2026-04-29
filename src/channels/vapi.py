@@ -1683,9 +1683,12 @@ def _build_store_assistant_config(
         "email addresses, or street addresses. "
         "Only share project status, scheduled dates, and technician names.\n"
         "- NEVER offer to schedule, reschedule, or cancel appointments. "
-        "Retailer callers can ONLY check project status. If they ask to schedule, "
+        "Retailer callers can check project status and leave notes. If they ask to schedule, "
         "say: 'Scheduling is not available for retailer calls. "
         "Please have the customer call us directly.'\n"
+        "- If the caller wants to leave a note or message about a project "
+        "(e.g., 'tell the tech the customer wants blue tiles', 'add a note that delivery is delayed'), "
+        "pass their words to ask_store_bot — it can save notes on projects.\n"
         "- If the caller asks to be TRANSFERRED, to speak with someone, "
         "or to talk to support — use the transferCall tool IMMEDIATELY. "
         "Do NOT confuse transfer requests with scheduling requests. "
@@ -2521,12 +2524,12 @@ async def _handle_store_bot(
                 f"If multiple projects exist, focus on the one matching this identifier."
             )
         store_question = (
-            "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
+            "[STORE CALLER — status, technician names, and notes only. No scheduling, no customer PII] "
             "List this customer's projects and show their current status." + lookup_hint
         )
     else:
         store_question = (
-            "[STORE CALLER — status and technician names only, no scheduling, no customer PII] "
+            "[STORE CALLER — status, technician names, and notes only. No scheduling, no customer PII] "
             + question
         )
     agent_name = ""
