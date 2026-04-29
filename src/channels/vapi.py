@@ -521,7 +521,7 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
     - 500ms after intro
     """
     name_part = f"Hello {first_name}!" if first_name else "Hello!"
-    intro = f"I'm J, your AI assistant from {client_name}."
+    intro = f"I'm J, your AI assistant from {_speech_name(client_name)}."
     guidance = (
         "I can help you view your projects, check available dates, "
         "or schedule appointments. What would you like to do today?"
@@ -531,6 +531,17 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
         f'{intro} <break time="500ms"/> '
         f'{guidance}'
     )
+
+
+def _speech_name(name: str) -> str:
+    """Normalize a company name for TTS — avoids mispronunciation.
+
+    - "ProjectsForce" → "Projects Force" (TTS reads it as one garbled word)
+    - "360" → "three sixty" (TTS reads it as "three hundred and sixty")
+    """
+    result = name.replace("ProjectsForce", "Projects Force")
+    result = result.replace("360", "three sixty")
+    return result
 
 
 def _normalize_e164(phone: str) -> str:
@@ -641,7 +652,7 @@ def _build_assistant_config(
                 {
                     "role": "system",
                     "content": (
-                        f"You are J, a friendly phone assistant for {name} "
+                        f"You are J, a friendly phone assistant for {_speech_name(name)} "
                         "— a home improvement scheduling service.\n\n"
                         f"Today's date is {datetime.now().strftime('%A, %B %d, %Y')}. "
                         f"The current year is {datetime.now().year}. "
@@ -732,7 +743,12 @@ def _build_assistant_config(
                         "an appointment, relay the confirmation question AS-IS. "
                         "Do NOT add 'or should I confirm this?', 'or should I go ahead and book?', "
                         "or any other alternative. Just ask 'Does everything look correct?' "
-                        "exactly as the bot phrased it."
+                        "exactly as the bot phrased it.\n"
+                        "21. TECHNICIAN REQUESTS: If the caller asks to speak to the technician, "
+                        "installer, or field worker specifically, say: "
+                        "'I\\'m sorry, I don\\'t have the ability to connect you with the technician directly. "
+                        "I can transfer you to our support team if you\\'d like.' "
+                        "Do NOT attempt to transfer to a technician — only transfer to the support team."
                         + (
                             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
                             if hours_context and hours_context.get("prompt_snippet")
@@ -783,7 +799,7 @@ def _build_assistant_config(
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            f"Thank you for calling {name}. "
+            f"Thank you for calling {_speech_name(name)}. "
             "Your scheduling is all set. Have a wonderful day!"
         ),
         "endCallPhrases": [
@@ -793,11 +809,11 @@ def _build_assistant_config(
         ],
         "endCallFunctionEnabled": True,
         "voicemailMessage": (
-            f"Hello, this is J from {name}. I'm calling about your "
+            f"Hello, this is J from {_speech_name(name)}. I'm calling about your "
             "home improvement project. Please call us back at your earliest convenience."
         ),
         "silenceTimeoutSeconds": 30,
-        "maxDurationSeconds": 600,
+        "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
             "waitSeconds": 0.4,
@@ -836,7 +852,7 @@ def _build_custom_llm_assistant_config(
     # Minimal system prompt — voice style + office hours only.
     # All reasoning is done by our Claude via the Custom LLM endpoint.
     system_content = (
-        f"You are J, a friendly phone assistant for {name} "
+        f"You are J, a friendly phone assistant for {_speech_name(name)} "
         "— a home improvement scheduling service.\n"
         "Keep your responses concise and conversational — this is a phone call.\n"
         "No bullet points, no markdown.\n"
@@ -869,7 +885,7 @@ def _build_custom_llm_assistant_config(
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            f"Thank you for calling {name}. "
+            f"Thank you for calling {_speech_name(name)}. "
             "Your scheduling is all set. Have a wonderful day!"
         ),
         "endCallPhrases": [
@@ -879,11 +895,11 @@ def _build_custom_llm_assistant_config(
         ],
         "endCallFunctionEnabled": True,
         "voicemailMessage": (
-            f"Hello, this is J from {name}. I'm calling about your "
+            f"Hello, this is J from {_speech_name(name)}. I'm calling about your "
             "home improvement project. Please call us back at your earliest convenience."
         ),
         "silenceTimeoutSeconds": 30,
-        "maxDurationSeconds": 600,
+        "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
             "waitSeconds": 0.4,
@@ -1365,7 +1381,7 @@ def _build_outbound_scheduling_config(
         "- If they say no / nothing: move on.\n\n"
         "### Step 5 — Wrap-up\n"
         f"Say: 'You\\'ll receive a confirmation text and email shortly. "
-        f"Thank you for choosing {name}! Have a great day.'\n"
+        f"Thank you for choosing {_speech_name(name)}! Have a great day.'\n"
         "End the call.\n"
     )
 
@@ -1374,7 +1390,7 @@ def _build_outbound_scheduling_config(
     _today_str = _today.strftime("%A, %B %d, %Y")
 
     system_prompt = (
-        f"You are J, a friendly and concise phone assistant for {name}.\n\n"
+        f"You are J, a friendly and concise phone assistant for {_speech_name(name)}.\n\n"
         f"Today is {_today_str}. The current year is {_today.year}. "
         f"All dates MUST use {_today.year}. NEVER use 2024 or 2025 — those are in the past.\n\n"
         "## YOUR MISSION\n"
@@ -1443,7 +1459,12 @@ def _build_outbound_scheduling_config(
         "Do NOT try to keep them on the line.\n"
         "- For pricing or fee questions: 'I handle scheduling — I can transfer you "
         "to our team for pricing questions.' Then transfer if they agree.\n"
-        "- If asked to repeat something: repeat clearly, no extra commentary."
+        "- If asked to repeat something: repeat clearly, no extra commentary.\n"
+        "- TECHNICIAN REQUESTS: If the caller asks to speak to the technician, "
+        "installer, or field worker specifically, say: "
+        "'I\\'m sorry, I don\\'t have the ability to connect you with the technician directly. "
+        "I can transfer you to our support team if you\\'d like.' "
+        "Do NOT attempt to transfer to a technician — only transfer to the support team."
         + (
             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
             if hours_context and hours_context.get("prompt_snippet")
@@ -1452,7 +1473,7 @@ def _build_outbound_scheduling_config(
     )
 
     voicemail_msg = (
-        f"Hello {first_name}, this is J from {name}. "
+        f"Hello {first_name}, this is J from {_speech_name(name)}. "
         f"I'm calling about scheduling your {project_type.lower() if project_type else 'upcoming project'}. "
         "We'd like to find a convenient time for you. "
     )
@@ -1492,7 +1513,7 @@ def _build_outbound_scheduling_config(
         },
         "voicemailMessage": voicemail_msg,
         "silenceTimeoutSeconds": 30,
-        "maxDurationSeconds": 600,
+        "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
             "waitSeconds": 0.4,
@@ -1540,9 +1561,8 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     then qualifies them during the conversation.
     """
     name = client_name or "ProjectsForce"
-    tts_name = name.replace("ProjectsForce", "Projects Force")
     return (
-        f'<break time="3000ms"/> Hello! I\'m J from {tts_name}. '
+        f'<break time="3000ms"/> Hello! I\'m J from {_speech_name(name)}. '
         '<break time="300ms"/> '
         "I can help you check on a project status or schedule a home improvement appointment. "
         "How can I help you today?"
@@ -1569,8 +1589,7 @@ def _build_store_assistant_config(
     for office transfers when a support number is available.
     """
     name = client_name or "ProjectsForce"
-    # TTS reads "ProjectsForce" as "Project Source" — use spaced version for speech
-    tts_name = name.replace("ProjectsForce", "Projects Force")
+    speech_name = _speech_name(name)
     has_transfer = bool(support_number)
     server_config: dict = {
         "url": _get_webhook_url(),
@@ -1593,18 +1612,18 @@ def _build_store_assistant_config(
     else:
         customer_instruction = (
             f"say 'I don't have your account on file right now. "
-            f"Our team at {tts_name} will reach out to you shortly. "
+            f"Our team at {speech_name} will reach out to you shortly. "
             "Is there anything else I can help you with?' "
             "Then end the call gracefully."
         )
         non_project_instruction = (
-            f"say 'Our team at {tts_name} will reach out to you shortly. "
+            f"say 'Our team at {speech_name} will reach out to you shortly. "
             "Is there anything else I can help you with?' "
             "Then end the call gracefully."
         )
 
     system_prompt = (
-        f"You are J, a friendly phone assistant for {tts_name} "
+        f"You are J, a friendly phone assistant for {speech_name} "
         "— a home improvement scheduling service.\n\n"
         "You do NOT know who this caller is. Do NOT assume they are a "
         "retailer or a customer. You must qualify them first.\n\n"
@@ -1706,7 +1725,7 @@ def _build_store_assistant_config(
                 "'Let me connect you', or anything about transferring. "
                 "You will ONLY hang up on the caller if you say these words. "
                 "Instead, when you cannot help, say: "
-                f"'Our team at {tts_name} will reach out to you shortly. "
+                f"'Our team at {speech_name} will reach out to you shortly. "
                 "Is there anything else I can help you with?' "
                 "If they say no, end the call politely.\n"
             )
@@ -1715,7 +1734,12 @@ def _build_store_assistant_config(
         "or similar — say 'Take your time, I'll be right here' and wait "
         "patiently. Do NOT end the call or rush them.\n"
         "- NEVER ask clarifying questions before calling the tool. "
-        "Let the scheduling bot handle clarification."
+        "Let the scheduling bot handle clarification.\n"
+        "- TECHNICIAN REQUESTS: If the caller asks to speak to the technician, "
+        "installer, or field worker specifically, say: "
+        "'I\\'m sorry, I don\\'t have the ability to connect you with the technician directly. "
+        "I can transfer you to our support team if you\\'d like.' "
+        "Do NOT attempt to transfer to a technician — only transfer to the support team."
         + (
             f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
             if hours_context and hours_context.get("prompt_snippet")
@@ -1787,7 +1811,7 @@ def _build_store_assistant_config(
         },
         "firstMessage": first_message,
         "endCallMessage": (
-            f"Thank you for calling {tts_name}. Have a great day!"
+            f"Thank you for calling {speech_name}. Have a great day!"
         ),
         "endCallPhrases": [
             "goodbye", "bye bye", "bye now",
@@ -1796,7 +1820,7 @@ def _build_store_assistant_config(
         ],
         "endCallFunctionEnabled": True,
         "silenceTimeoutSeconds": 60,
-        "maxDurationSeconds": 600,
+        "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
             "waitSeconds": 0.4,
