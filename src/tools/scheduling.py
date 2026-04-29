@@ -1929,6 +1929,7 @@ async def post_store_call_notes(
         "Authorization": f"Bearer {bearer_token}",
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
+        "client_id": client_id,
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
