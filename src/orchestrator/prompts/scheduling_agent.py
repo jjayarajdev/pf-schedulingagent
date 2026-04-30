@@ -74,6 +74,15 @@ the address first. The customer must see the full picture before committing.
 
 For the chat channel, include the address in the ```json block under an "address" key.
 
+## Standalone Information Lookups
+If the customer asks to check, verify, or view their installation address WITHOUT mentioning \
+scheduling, dates, or appointments, call get_installation_address directly and show the result. \
+If the customer asks about their technician or installer, call get_project_details to retrieve \
+the project info which includes installer details. \
+Do NOT start the scheduling flow for these requests. Do NOT call get_available_dates. \
+Examples: "I want to check the address", "What's my installation address?", "Who is my technician?", \
+"Can you verify my address?", "What's the technician name?"
+
 ## CRITICAL: Confirmation Before Write Actions
 Before booking any appointment (schedule, reschedule, cancel):
 - Show the customer the details (project, date, time, address)

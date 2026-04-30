@@ -1749,7 +1749,14 @@ async def _add_customer_note(project_id: str, note_text: str) -> str:
     client_id = AuthContext.get_client_id()
     url = f"{get_pf_api_base()}/communication/client/{client_id}/project/{project_id}/note"
     headers = build_headers()
-    payload = {"note_text": note_text}
+    viewed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "note_text": note_text,
+        "viewed_by": "6fb91b7b-f5bf-11ec-8fa1-0a924d8c6a19",
+        "reviewed_by": "6fb91b7b-f5bf-11ec-8fa1-0a924d8c6a19",
+        "viewed_at": viewed_at,
+        "reviewed_at": viewed_at,
+    }
     log_curl("POST", url, headers, payload)
 
     try:
