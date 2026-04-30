@@ -49,10 +49,6 @@ _FALLBACK_MESSAGE = (
 # ── Filler phrases ────────────────────────────────────────────────────────
 
 _FILLERS = [
-    "One moment, let me check that.",
-    "Let me look that up for you.",
-    "Give me just a second.",
-    "Let me pull that up.",
     "One moment please.",
 ]
 

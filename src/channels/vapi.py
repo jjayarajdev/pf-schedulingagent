@@ -688,13 +688,13 @@ def _build_assistant_config(
                         "No bullet points, no markdown. "
                         "NEVER read out project numbers or IDs — they are long and unintelligible. "
                         "Instead, identify projects by their category/type and status.\n"
-                        "9. FILLER RULES: Say 'One moment.' ONLY when the user asks a NEW question "
+                        "9. FILLER RULES: Say 'One moment please.' ONLY when the user asks a NEW question "
                         "that requires a tool call (e.g. 'what are my projects?', 'what dates are available?'). "
                         "Do NOT say any filler when the user is just replying to your question "
                         "(e.g. picking a date, saying 'yes', choosing a time slot). "
                         "NEVER say 'Hold on', 'Wait', 'Hang on', 'Just a sec', 'Give me a moment', "
                         "'Let me check', 'Let me pull that up', or 'One second'. "
-                        "The ONLY allowed filler is 'One moment.' — nothing else, and only once per tool call.\n"
+                        "The ONLY allowed filler is 'One moment please.' — nothing else, and only once per tool call.\n"
                         "10. If the tool call fails or times out, say: "
                         '"Let me try that again." and retry once. '
                         "NEVER say 'I'm having trouble looking that up' or fabricate an error "
@@ -817,7 +817,7 @@ def _build_assistant_config(
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
-            "waitSeconds": 0.4,
+            "waitSeconds": 0.8,
             "smartEndpointingEnabled": True,
         },
         "hipaaEnabled": False,
@@ -903,7 +903,7 @@ def _build_custom_llm_assistant_config(
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
-            "waitSeconds": 0.4,
+            "waitSeconds": 0.8,
             "smartEndpointingEnabled": True,
         },
         "hipaaEnabled": False,
@@ -993,7 +993,7 @@ def _generate_outbound_greeting(
         project_part = " I'm calling about scheduling your upcoming project."
 
     return (
-        f'<break time="2000ms"/> {name_part} <break time="300ms"/> '
+        f'<break time="3000ms"/> {name_part} <break time="300ms"/> '
         f"This is J from {name}."
         f' <break time="300ms"/> '
         f"{project_part}"
@@ -1424,7 +1424,7 @@ def _build_outbound_scheduling_config(
             "NEVER ask 'Does the address look correct?' without first telling the customer what the address is. "
         )
         + "If the customer says the address is wrong, capture the correction with add_note.\n"
-        "- FILLER RULES: When a tool call is running, say 'One moment.' and NOTHING else. "
+        "- FILLER RULES: When a tool call is running, say 'One moment please.' and NOTHING else. "
         "NEVER say 'Just a sec', 'Give me a moment', 'Hold on', 'Wait', "
         "'Hang on', 'Let me check', or any other filler. One filler per tool call MAX.\n"
         "- Speak dates as ordinal words: 'the twenty-first', NOT '21st'.\n"
@@ -1517,7 +1517,7 @@ def _build_outbound_scheduling_config(
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
-            "waitSeconds": 0.4,
+            "waitSeconds": 0.8,
             "smartEndpointingEnabled": True,
         },
         "hipaaEnabled": False,
@@ -1565,7 +1565,7 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     return (
         f'<break time="3000ms"/> Hello! I\'m J from {_speech_name(name)}. '
         '<break time="300ms"/> '
-        "I can help you check on a project status or schedule a home improvement appointment. "
+        "I can help you check on a project status or look up project details. "
         "How can I help you today?"
     )
 
@@ -1712,13 +1712,13 @@ def _build_store_assistant_config(
         "'I don't have that information right now.'\n\n"
         "## GENERAL RULES\n"
         "- Keep responses concise — no bullet points, no markdown.\n"
-        "- Say 'One moment.' ONLY when the caller asks a NEW question "
+        "- Say 'One moment please.' ONLY when the caller asks a NEW question "
         "that requires a tool call. Do NOT say any filler when the caller "
         "is just replying to your question. "
         "NEVER say 'Hold on', 'Wait', 'Hang on', 'Just a sec', "
         "'Give me a moment', 'Let me check', 'Let me pull that up', "
         "'One second', or 'Let me take a look'. "
-        "The ONLY allowed filler is 'One moment.' — nothing else.\n"
+        "The ONLY allowed filler is 'One moment please.' — nothing else.\n"
         "- NEVER say 'I'm transferring you now' unless you are actually "
         "invoking the transferCall tool in the same turn. If you cannot "
         "transfer, do NOT mention transferring at all.\n"
@@ -1833,7 +1833,7 @@ def _build_store_assistant_config(
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
-            "waitSeconds": 0.4,
+            "waitSeconds": 0.8,
             "smartEndpointingEnabled": True,
         },
         "hipaaEnabled": False,

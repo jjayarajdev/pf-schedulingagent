@@ -717,12 +717,12 @@ class TestHelpers:
         assert not _wants_transfer("Your appointment is confirmed.")
         assert not _wants_transfer("You have 3 projects ready to schedule.")
 
-    def test_rotating_filler_varies(self):
+    def test_rotating_filler_returns_approved_phrase(self):
         from channels.vapi_llm import _rotating_filler
 
         fillers = [_rotating_filler() for _ in range(5)]
-        # Should not all be the same
-        assert len(set(fillers)) > 1
+        # All fillers must be the approved phrase
+        assert all(f == "One moment please." for f in fillers)
 
     def test_openai_chunk_format(self):
         from channels.vapi_llm import _openai_chunk
