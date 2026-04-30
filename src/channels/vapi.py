@@ -514,12 +514,12 @@ async def _handle_assistant_request(body: dict) -> dict:
 
 
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
-    """Build a personalized SSML greeting with the caller's first name.
+    """Build a personalized greeting with the caller's first name.
 
-    Returns an SSML string with ``<break>`` pauses for natural pacing:
+    Uses SSML <break> pauses for natural pacing (ElevenLabs turbo_v2_5):
     - 3s initial pause (call connection settling)
-    - 300ms after name
-    - 500ms after intro
+    - 0.3s after name
+    - 0.5s after intro
     """
     name_part = f"Hello {first_name}!" if first_name else "Hello!"
     intro = f"I'm J, your AI assistant from {_speech_name(client_name)}."
@@ -528,8 +528,8 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
         "or schedule appointments. What would you like to do today?"
     )
     return (
-        f'<break time="3000ms"/> {name_part} <break time="300ms"/> '
-        f'{intro} <break time="500ms"/> '
+        f'<break time="3s" /> {name_part} <break time="0.3s" /> '
+        f'{intro} <break time="0.5s" /> '
         f'{guidance}'
     )
 
@@ -993,11 +993,11 @@ def _generate_outbound_greeting(
         project_part = " I'm calling about scheduling your upcoming project."
 
     return (
-        f'<break time="3000ms"/> {name_part} <break time="300ms"/> '
+        f'<break time="3s" /> {name_part} <break time="0.3s" /> '
         f"This is J from {name}."
-        f' <break time="300ms"/> '
+        f' <break time="0.3s" /> '
         f"{project_part}"
-        ' <break time="500ms"/> '
+        ' <break time="0.5s" /> '
         "Is now a good time to talk?"
     )
 
@@ -1556,15 +1556,15 @@ def _classify_outbound_outcome(ended_reason: str, summary: str) -> dict:
 
 
 def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
-    """Build a generic SSML greeting for unknown callers.
+    """Build a generic greeting for unknown callers.
 
     Does NOT assume the caller is a retailer — asks how we can help first,
     then qualifies them during the conversation.
     """
     name = client_name or "ProjectsForce"
     return (
-        f'<break time="3000ms"/> Hello! I\'m J from {_speech_name(name)}. '
-        '<break time="300ms"/> '
+        f'<break time="3s" /> Hello! I\'m J from {_speech_name(name)}. '
+        '<break time="0.3s" /> '
         "I can help you check on a project status or look up project details. "
         "How can I help you today?"
     )
