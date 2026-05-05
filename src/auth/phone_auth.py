@@ -80,10 +80,14 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
 
     to_clean = normalize_phone(to_phone) if to_phone else ""
 
+    # Cache key includes to_phone so the same caller dialing different tenants
+    # gets separate cached credentials (e.g. WTU vs ProjectsForce).
+    cache_key = f"{phone}:{to_clean}" if to_clean else phone
+
     # Step 1: Check DynamoDB cache
-    cached = _get_cached_creds(phone)
+    cached = _get_cached_creds(cache_key)
     if cached:
-        logger.info("Using cached credentials for ***%s", phone[-4:])
+        logger.info("Using cached credentials for ***%s (to=***%s)", phone[-4:], to_clean[-4:] if to_clean else "none")
         return cached
 
     # Step 2: Call PF phone-call-login API
@@ -112,7 +116,7 @@ async def get_or_authenticate(from_phone: str, to_phone: str = "") -> dict:
             raise
 
     # Step 3: Store in DynamoDB for subsequent requests
-    _store_credentials(phone, credentials)
+    _store_credentials(cache_key, credentials)
     save_tenant_config(credentials)
     logger.info(
         "Stored new credentials for user %s (phone: ***%s)",

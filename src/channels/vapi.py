@@ -437,12 +437,14 @@ async def _handle_assistant_request(body: dict) -> dict:
 
     # Debug: log keys Vapi sends so we can see phoneNumber / assistantId presence
     logger.info(
-        "Vapi assistant-request: call_id=%s from=***%s to=***%s assistantId=%s phoneNumber=%s",
+        "Vapi assistant-request: call_id=%s from=***%s to=***%s assistantId=%s phoneNumber=%s phoneNumberId=%s call_keys=%s",
         call_id,
         from_phone[-4:] if from_phone else "none",
         to_phone[-4:] if to_phone else "none",
         call_data.get("assistantId", "none"),
         call_data.get("phoneNumber", "none"),
+        call_data.get("phoneNumberId", "none"),
+        list(call_data.keys()),
     )
 
     webhook_secret = get_secrets().vapi_api_key
@@ -643,7 +645,7 @@ def _build_assistant_config(
     if server_secret:
         server_config["secret"] = server_secret
     return {
-        "name": f"{name} Scheduling Bot",
+        "name": f"{name} Scheduling Bot"[:40],
         "voice": _VOICE_CONFIG,
         "model": {
             "model": "gpt-5.2-chat-latest",
@@ -864,7 +866,7 @@ def _build_custom_llm_assistant_config(
         system_content += f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
 
     return {
-        "name": f"{name} Scheduling Bot",
+        "name": f"{name} Scheduling Bot"[:40],
         "voice": _VOICE_CONFIG,
         "model": {
             "provider": "custom-llm",
@@ -2886,6 +2888,15 @@ def _resolve_to_phone_and_support(call_data: dict) -> tuple[str, str]:
     assistant_id = call_data.get("assistantId", "")
     if assistant_id:
         info = get_assistant_info(assistant_id)
+        phone = info.get("phone_number", "")
+        support_number = info.get("support_number", "")
+        if phone:
+            return phone, support_number
+
+    # 2b. Look up by phone number ID (Twilio-backed numbers send phoneNumberId, not phoneNumber)
+    phone_number_id = call_data.get("phoneNumberId", "")
+    if phone_number_id:
+        info = get_assistant_info(phone_number_id)
         phone = info.get("phone_number", "")
         support_number = info.get("support_number", "")
         if phone:
