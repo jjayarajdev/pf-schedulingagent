@@ -1026,7 +1026,6 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             if any(phrase in error_body for phrase in (
                 "already requested", "already scheduled",
                 "already contains a technician", "technician already assigned",
-                "not allowed",
             )):
                 logger.info("Project %s is already scheduled (API 400)", project_id)
                 result = {

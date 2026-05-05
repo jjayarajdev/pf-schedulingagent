@@ -1485,7 +1485,7 @@ def _build_outbound_scheduling_config(
     voicemail_msg += "Thank you!"
 
     return {
-        "name": f"{name} Outbound Scheduling",
+        "name": f"{name} Outbound Scheduling"[:40],
         "voice": _VOICE_CONFIG,
         "model": {
             "model": "gpt-5.2-chat-latest",
@@ -1760,7 +1760,7 @@ def _build_store_assistant_config(
     )
 
     return {
-        "name": f"{name} Assistant",
+        "name": f"{name} Assistant"[:40],
         "voice": _VOICE_CONFIG,
         "model": {
             "model": "gpt-5.2-chat-latest",

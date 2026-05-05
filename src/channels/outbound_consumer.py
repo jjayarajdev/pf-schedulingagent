@@ -31,6 +31,7 @@ from channels.outbound_store import (
     update_outbound_call,
 )
 from channels.outbound_vapi import create_vapi_call
+from channels.vapi_config import get_vapi_id_by_phone
 from config import get_settings
 from tools.project_rules import ProjectStatusRules
 from tools.scheduling import (
@@ -91,8 +92,20 @@ def _extract_pf_payload(body: dict) -> dict:
     else:
         project_type = category or ptype or ""
 
-    # Vapi phone number ID: from payload, or fall back to config default
+    # Vapi phone number ID resolution (4-priority):
+    # 1. Explicit UUID in SQS payload (best case)
+    # 2. Reverse lookup: tenant_vapi_phone_number → DynamoDB → Vapi UUID
+    # 3. Config default (PF prod outbound number)
     vapi_phone_id = body.get("vapi_phone_number_id", "")
+    if not vapi_phone_id:
+        # Try resolving tenant phone number to Vapi UUID via DynamoDB
+        _tenant_phone_raw = tenant_info.get("tenant_vapi_phone_number", "")
+        if isinstance(_tenant_phone_raw, list):
+            _tenant_phone_raw = _tenant_phone_raw[0] if _tenant_phone_raw else ""
+        if _tenant_phone_raw and str(_tenant_phone_raw).lower().strip() not in {
+            "undefined", "null", "none", ""
+        }:
+            vapi_phone_id = get_vapi_id_by_phone(_tenant_phone_raw)
     if not vapi_phone_id:
         vapi_phone_id = get_settings().outbound_vapi_phone_id
 
@@ -451,16 +464,17 @@ async def _process_outbound_message(
     )
 
     # ── Gate: only proceed if project status is schedulable ──
-    # PF API may return "Ready to Schedule" even when UI shows "Ready for Auto Call"
-    # (race condition from slotsChatbot call). Accept all SCHEDULABLE statuses.
+    # The CX Portal API may return a stale/inconsistent status (e.g. "Scheduled"
+    # when the PF UI shows "Ready for Auto Call").  Since PF's rule engine already
+    # validated the project before sending the SQS message, log a warning but
+    # proceed — the AI can handle edge cases during the conversation.
     project_status = (prefetched.get("project", {}).get("status") or "").lower()
     if project_status and project_status not in ProjectStatusRules.SCHEDULABLE:
-        logger.info(
-            "Skipping outbound call — project %s status '%s' is not schedulable",
+        logger.warning(
+            "Outbound call: project %s API status '%s' is not schedulable "
+            "but PF triggered auto_call_ready — proceeding with call",
             project_id, project_status,
         )
-        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        return
 
     # Dates are prefetched as a nice-to-have (injected into system prompt).
     # If the PF API rejected the request or returned no dates, log it but

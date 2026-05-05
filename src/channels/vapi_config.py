@@ -134,6 +134,59 @@ def register_assistant(
     )
 
 
+def get_vapi_id_by_phone(phone: str) -> str:
+    """Reverse lookup: phone number → Vapi phone number UUID.
+
+    Scans the vapi-assistants table for an entry matching the given phone
+    number.  The table is small (< 20 entries) so a scan is acceptable.
+    Results are cached for ``_CACHE_TTL_SECONDS``.
+    """
+    if not phone:
+        return ""
+
+    # Normalize: ensure E.164 with +1 prefix
+    normalized = phone.strip()
+    if not normalized.startswith("+"):
+        normalized = "+1" + normalized.lstrip("1")
+
+    # Check cache (reverse direction)
+    cache_key = f"phone:{normalized}"
+    cached = _cache.get(cache_key)
+    if cached:
+        if time.monotonic() - cached["ts"] < _CACHE_TTL_SECONDS:
+            return cached.get("assistant_id", "")
+        del _cache[cache_key]
+
+    settings = get_settings()
+    table_name = settings.vapi_assistants_table
+    if not table_name:
+        return ""
+
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
+        table = dynamodb.Table(table_name)
+        response = table.scan()
+
+        for item in response.get("Items", []):
+            if item.get("phone_number") == normalized:
+                vapi_id = item.get("assistant_id", "")
+                _cache[cache_key] = {"assistant_id": vapi_id, "ts": time.monotonic()}
+                logger.info(
+                    "Resolved phone %s → Vapi ID %s (tenant: %s)",
+                    normalized[-4:],
+                    vapi_id[:8],
+                    item.get("tenant_name", ""),
+                )
+                return vapi_id
+
+        logger.warning("No Vapi phone number ID found for phone %s", normalized[-4:])
+        return ""
+
+    except Exception:
+        logger.exception("Failed reverse phone lookup for %s", normalized[-4:])
+        return ""
+
+
 def list_assistants() -> list[dict]:
     """Return all registered Vapi assistant configs."""
     settings = get_settings()

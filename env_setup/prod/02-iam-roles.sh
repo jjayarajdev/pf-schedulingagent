@@ -65,6 +65,7 @@ TASK_POLICY='{
         "dynamodb:UpdateItem",
         "dynamodb:DeleteItem",
         "dynamodb:Query",
+        "dynamodb:Scan",
         "dynamodb:BatchWriteItem",
         "dynamodb:DescribeTable"
       ],
