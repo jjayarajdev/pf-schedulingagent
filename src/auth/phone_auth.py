@@ -179,7 +179,7 @@ def _get_cached_support_info(phone: str) -> dict:
 
 
 def get_tenant_config(client_id: str) -> dict:
-    """Read tenant-level config (office_hours, timezone) from DynamoDB.
+    """Read tenant-level config (office_hours, timezone, lead capture flags) from DynamoDB.
 
     Keyed by ``client:{client_id}`` in the phone-creds table.
     """
@@ -198,6 +198,8 @@ def get_tenant_config(client_id: str) -> dict:
             "timezone": item.get("timezone", ""),
             "support_number": item.get("support_number", ""),
             "client_name": item.get("client_name", ""),
+            "lead_capture_enabled": bool(item.get("lead_capture_enabled", False)),
+            "lead_capture_email": item.get("lead_capture_email", ""),
         }
     except Exception:
         logger.exception("Error reading tenant config for client %s", client_id)
@@ -206,6 +208,9 @@ def get_tenant_config(client_id: str) -> dict:
 
 def save_tenant_config(credentials: dict) -> None:
     """Persist tenant-level config (office_hours, timezone) keyed by client_id.
+
+    Uses ``update_item`` so admin-set flags (lead_capture_enabled,
+    lead_capture_email) are preserved across auth-driven writes.
 
     Called on any successful auth that returns office_hours.
     """
@@ -217,15 +222,26 @@ def save_tenant_config(credentials: dict) -> None:
     try:
         dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
         table = dynamodb.Table(settings.phone_creds_table)
-        table.put_item(Item={
-            "phone_number": f"client:{client_id}",
-            "client_id": client_id,
-            "client_name": credentials.get("client_name", ""),
-            "support_number": credentials.get("support_number", ""),
-            "timezone": credentials.get("timezone", "US/Eastern"),
-            "office_hours": office_hours,
-            "updated_at": datetime.now(UTC).isoformat(),
-        })
+        table.update_item(
+            Key={"phone_number": f"client:{client_id}"},
+            UpdateExpression=(
+                "SET client_id = :cid, "
+                "client_name = :cname, "
+                "support_number = :sn, "
+                "#tz = :tz, "
+                "office_hours = :oh, "
+                "updated_at = :ts"
+            ),
+            ExpressionAttributeNames={"#tz": "timezone"},
+            ExpressionAttributeValues={
+                ":cid": client_id,
+                ":cname": credentials.get("client_name", ""),
+                ":sn": credentials.get("support_number", ""),
+                ":tz": credentials.get("timezone", "US/Eastern"),
+                ":oh": office_hours,
+                ":ts": datetime.now(UTC).isoformat(),
+            },
+        )
         logger.info("Saved tenant config for client %s", client_id)
     except Exception:
         logger.exception("Failed to save tenant config for client %s", client_id)

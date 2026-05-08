@@ -1,7 +1,7 @@
 """Tests for Vapi phone channel — webhook, tool calls, server events."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -485,8 +485,8 @@ class TestAssistantRequest:
     @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
     def test_store_session_created(self, mock_auth, client):
         """Store detection creates a session entry in _store_sessions."""
-        from channels.vapi import _store_sessions
         from auth.phone_auth import AuthenticationError
+        from channels.vapi import _store_sessions
 
         mock_auth.side_effect = AuthenticationError("Not found", status_code=404)
 
@@ -509,6 +509,204 @@ class TestAssistantRequest:
         assert session["authenticated"] is False
         # Cleanup
         _store_sessions.pop("vapi-call-store-sess", None)
+
+
+class TestLeadCaptureRouting:
+    """Routing of caller_type=unknown to the lead capture assistant."""
+
+    @patch("channels.vapi.get_tenant_config")
+    @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
+    def test_unknown_caller_with_flag_enabled_routes_to_lead_capture(
+        self, mock_auth, mock_tenant_cfg, client,
+    ):
+        from auth.phone_auth import AuthenticationError
+        from channels.vapi import _lead_sessions, _store_sessions
+
+        mock_auth.side_effect = AuthenticationError(
+            "not found",
+            status_code=200,
+            client_id="09PF05VD",
+            client_name="ProjectsForce Validation",
+            support_number="(987) 987-9874",
+            caller_type="unknown",
+        )
+        mock_tenant_cfg.return_value = {
+            "lead_capture_enabled": True,
+            "lead_capture_email": "leads@example.com",
+            "office_hours": [],
+            "timezone": "US/Eastern",
+            "client_name": "ProjectsForce Validation",
+            "support_number": "(987) 987-9874",
+        }
+
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "assistant-request",
+                    "call": {
+                        "id": "call-lead-1",
+                        "customer": {"number": "+10000000000"},
+                        "phoneNumber": {"number": "+18447845789"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assistant = resp.json()["assistant"]
+        # Lead capture assistant identifies via name + tool set
+        assert "Lead Capture" in assistant["name"]
+        tool_names = [
+            t.get("function", {}).get("name", "") or t.get("type", "")
+            for t in assistant["model"]["tools"]
+        ]
+        assert "capture_lead" in tool_names
+        assert "ask_store_bot" not in tool_names
+        # Lead session populated; store session NOT populated
+        assert "vapi-call-lead-1" in _lead_sessions
+        assert "vapi-call-lead-1" not in _store_sessions
+        sess = _lead_sessions["vapi-call-lead-1"]
+        assert sess["client_id"] == "09PF05VD"
+        assert sess["lead_capture_email"] == "leads@example.com"
+        # Cleanup
+        _lead_sessions.pop("vapi-call-lead-1", None)
+
+    @patch("channels.vapi.get_tenant_config")
+    @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
+    def test_unknown_caller_without_flag_falls_through_to_store(
+        self, mock_auth, mock_tenant_cfg, client,
+    ):
+        from auth.phone_auth import AuthenticationError
+        from channels.vapi import _lead_sessions, _store_sessions
+
+        mock_auth.side_effect = AuthenticationError(
+            "not found",
+            status_code=200,
+            client_id="09PF05VD",
+            client_name="ProjectsForce Validation",
+            support_number="(987) 987-9874",
+            caller_type="unknown",
+        )
+        # Flag absent / explicitly disabled
+        mock_tenant_cfg.return_value = {"lead_capture_enabled": False}
+
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "assistant-request",
+                    "call": {
+                        "id": "call-lead-fallback",
+                        "customer": {"number": "+10000000000"},
+                        "phoneNumber": {"number": "+18447845789"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assistant = resp.json()["assistant"]
+        # Falls through to existing store assistant
+        assert "Assistant" in assistant["name"]
+        assert "Lead Capture" not in assistant["name"]
+        tool_names = [
+            t.get("function", {}).get("name", "") or t.get("type", "")
+            for t in assistant["model"]["tools"]
+        ]
+        assert "ask_store_bot" in tool_names
+        assert "capture_lead" not in tool_names
+        # Store session created, lead session NOT created
+        assert "vapi-call-lead-fallback" in _store_sessions
+        assert "vapi-call-lead-fallback" not in _lead_sessions
+        # Cleanup
+        _store_sessions.pop("vapi-call-lead-fallback", None)
+
+    @patch("channels.vapi.get_tenant_config")
+    @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
+    def test_store_caller_type_never_routes_to_lead_capture(
+        self, mock_auth, mock_tenant_cfg, client,
+    ):
+        """Even with the flag on, caller_type=store stays on the store flow."""
+        from auth.phone_auth import AuthenticationError
+        from channels.vapi import _lead_sessions, _store_sessions
+
+        mock_auth.side_effect = AuthenticationError(
+            "failed",
+            status_code=200,
+            client_id="09PF05VD",
+            client_name="ProjectsForce Validation",
+            caller_type="store",
+            store={"store_id": 60008210, "store_name": "Test Store", "store_number": 1234},
+        )
+        mock_tenant_cfg.return_value = {"lead_capture_enabled": True}
+
+        resp = client.post(
+            "/vapi/webhook",
+            json={
+                "message": {
+                    "type": "assistant-request",
+                    "call": {
+                        "id": "call-store-not-lead",
+                        "customer": {"number": "+13453232535"},
+                        "phoneNumber": {"number": "+18447845789"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assistant = resp.json()["assistant"]
+        assert "Lead Capture" not in assistant["name"]
+        tool_names = [
+            t.get("function", {}).get("name", "") or t.get("type", "")
+            for t in assistant["model"]["tools"]
+        ]
+        assert "ask_store_bot" in tool_names
+        assert "capture_lead" not in tool_names
+        assert "vapi-call-store-not-lead" in _store_sessions
+        assert "vapi-call-store-not-lead" not in _lead_sessions
+        # Cleanup
+        _store_sessions.pop("vapi-call-store-not-lead", None)
+
+
+class TestCaptureLeadTool:
+    """capture_lead tool stub handler."""
+
+    def test_missing_field_prompts_for_more(self, client):
+        import asyncio
+
+        from channels.vapi import _handle_capture_lead
+
+        result = asyncio.run(_handle_capture_lead(
+            {
+                "caller_name": "Jane Doe",
+                "caller_email": "",  # missing
+                "caller_address": "123 Main St, Anytown, CA 12345",
+                "service_interest": "kitchen remodel",
+            },
+            "call-cap-1",
+            "tool-call-1",
+        ))
+        msg = result["results"][0]["result"]
+        assert "missing" in msg.lower()
+        assert "email" in msg.lower()
+
+    def test_all_fields_returns_success_message(self, client):
+        import asyncio
+
+        from channels.vapi import _handle_capture_lead
+
+        result = asyncio.run(_handle_capture_lead(
+            {
+                "caller_name": "Jane Doe",
+                "caller_email": "jane@example.com",
+                "caller_address": "123 Main St, Anytown, CA 12345",
+                "service_interest": "kitchen remodel",
+                "notes": "Wants quote within 2 weeks",
+            },
+            "call-cap-2",
+            "tool-call-2",
+        ))
+        msg = result["results"][0]["result"]
+        assert "recorded" in msg.lower() or "got it" in msg.lower()
 
 
 class TestStoreToolCalls:
@@ -948,7 +1146,6 @@ class TestProjectTracking:
 
     def test_track_and_retrieve(self):
         from tools.scheduling import (
-            _session_projects,
             _track_project_action,
             clear_session_projects,
             get_session_projects,
@@ -1715,8 +1912,8 @@ class TestOutboundAuthContext:
     @patch("channels.vapi.get_active_call")
     async def test_outbound_creds_populate_auth_context(self, mock_cache):
         """Active outbound call creds should populate AuthContext."""
-        from channels.vapi import _set_auth_context_from_phone
         from auth.context import AuthContext
+        from channels.vapi import _set_auth_context_from_phone
 
         mock_cache.return_value = {
             "auth_creds": {
@@ -1742,8 +1939,8 @@ class TestOutboundAuthContext:
     @patch("channels.vapi.get_active_call", return_value=None)
     async def test_outbound_ddb_fallback_on_cache_miss(self, mock_cache, mock_ddb, mock_recache):
         """When in-memory cache misses, fall back to DynamoDB via metadata.call_id."""
-        from channels.vapi import _set_auth_context_from_phone
         from auth.context import AuthContext
+        from channels.vapi import _set_auth_context_from_phone
 
         mock_ddb.return_value = {
             "call_id": "our-internal-id",

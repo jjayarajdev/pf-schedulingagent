@@ -132,6 +132,11 @@ _FALLBACK_MESSAGE = (
 # Tracks auth state across tool calls within one Vapi call.
 _store_sessions: dict[str, dict] = {}
 
+# Lead capture sessions: call_id → {to_phone, client_id, lead_capture_email}
+# Holds tenant context for unknown callers in the lead-capture flow so the
+# capture_lead tool handler can email the right tenant team.
+_lead_sessions: dict[str, dict] = {}
+
 # Call auth cache: call_id → creds dict.
 # Populated during assistant-request (after phone auth), consumed by the
 # Custom LLM endpoint (POST /vapi/chat/completions) so it can set AuthContext
@@ -452,6 +457,9 @@ async def _handle_assistant_request(body: dict) -> dict:
 
     # Authenticate caller to get their name
     is_store_caller = False
+    is_lead_capture = False
+    caller_type = "user"
+    auth_client_id = ""
     first_name = ""
     client_name = "ProjectsForce"
     support_number = tenant_support_number  # Pre-populated from vapi-assistants table
@@ -466,9 +474,16 @@ async def _handle_assistant_request(body: dict) -> dict:
             support_number = creds.get("support_number", "") or support_number
             office_hours = creds.get("office_hours", [])
             tenant_timezone = creds.get("timezone", "US/Eastern")
+            caller_type = creds.get("caller_type", "user")
         except AuthenticationError as exc:
-            # Auth failure = unknown caller (could be store/retailer or unrecognized customer)
-            logger.info("Unknown caller detected (call_id=%s)", call_id)
+            # PF API distinguishes 'store' (failed auth, known store/retailer)
+            # from 'unknown' (not_found, neither customer nor store).
+            caller_type = exc.caller_type or "store"
+            auth_client_id = exc.client_id or ""
+            logger.info(
+                "Unknown caller detected (call_id=%s caller_type=%s)",
+                call_id, caller_type,
+            )
             is_store_caller = True
             # Use support info from PF API response or expired DynamoDB cache
             if exc.client_name:
@@ -479,11 +494,47 @@ async def _handle_assistant_request(body: dict) -> dict:
                 office_hours = exc.office_hours
             if exc.timezone:
                 tenant_timezone = exc.timezone
+
+            # Lead-capture branch: only when API returned caller_type=unknown
+            # AND the tenant has opted in via the lead_capture_enabled flag.
+            if caller_type == "unknown" and auth_client_id:
+                tenant_cfg = get_tenant_config(auth_client_id)
+                if tenant_cfg.get("lead_capture_enabled"):
+                    is_lead_capture = True
+                    is_store_caller = False
+                    # Tenant's office_hours/timezone aren't returned for
+                    # unknown callers — backfill from cached tenant config.
+                    if tenant_cfg.get("office_hours"):
+                        office_hours = tenant_cfg["office_hours"]
+                    if tenant_cfg.get("timezone"):
+                        tenant_timezone = tenant_cfg["timezone"]
+                    logger.info(
+                        "Lead capture enabled for client=%s — routing to lead capture assistant",
+                        auth_client_id,
+                    )
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
 
     # Check office hours for transfer gating
     hours_context = _build_office_hours_context(office_hours, tenant_timezone)
+
+    if is_lead_capture:
+        tenant_cfg = get_tenant_config(auth_client_id) if auth_client_id else {}
+        _lead_sessions[session_key] = {
+            "to_phone": to_phone,
+            "from_phone": from_phone,
+            "client_id": auth_client_id,
+            "client_name": client_name,
+            "lead_capture_email": tenant_cfg.get("lead_capture_email", ""),
+        }
+        greeting = _generate_lead_capture_greeting(client_name)
+        logger.info(
+            "Vapi lead capture greeting: call_id=%s client=%s office_open=%s has_transfer=%s",
+            call_id, client_name, hours_context.get("is_open"), bool(support_number),
+        )
+        return {"assistant": _build_lead_capture_assistant_config(
+            greeting, webhook_secret, client_name, support_number, hours_context,
+        )}
 
     if is_store_caller:
         if not support_number:
@@ -1572,6 +1623,22 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     )
 
 
+def _generate_lead_capture_greeting(client_name: str = "ProjectsForce") -> str:
+    """Build a greeting for unrecognised callers (lead capture flow).
+
+    The PF API has flagged this caller as ``caller_type=unknown`` — neither
+    a customer nor a known store. Greet warmly and invite them to share
+    what they're looking for.
+    """
+    name = client_name or "ProjectsForce"
+    return (
+        f'<break time="3s" /> Hi, thanks for calling {_speech_name(name)}. '
+        '<break time="0.3s" /> '
+        "I'm J — I can help with home improvement projects. "
+        "What can I help you with today?"
+    )
+
+
 def _build_store_assistant_config(
     first_message: str,
     server_secret: str = "",
@@ -1832,6 +1899,182 @@ def _build_store_assistant_config(
         ],
         "endCallFunctionEnabled": True,
         "silenceTimeoutSeconds": 60,
+        "maxDurationSeconds": 300,
+        "backgroundDenoisingEnabled": True,
+        "startSpeakingPlan": {
+            "waitSeconds": 0.8,
+            "smartEndpointingEnabled": True,
+        },
+        "hipaaEnabled": False,
+        "server": server_config,
+        "serverUrl": _get_webhook_url(),
+    }
+
+
+def _build_lead_capture_assistant_config(
+    first_message: str,
+    server_secret: str = "",
+    client_name: str = "ProjectsForce",
+    support_number: str = "",
+    hours_context: dict | None = None,
+) -> dict:
+    """Build the Vapi assistant config for unknown callers (lead capture).
+
+    Triggered when the PF phone-call-login API returns
+    ``caller_type=unknown`` AND the tenant has ``lead_capture_enabled=true``.
+    The assistant qualifies the caller's interest and captures contact info
+    via the ``capture_lead`` tool. Falls back to ``transferCall`` for callers
+    who prefer a human or for non-project requests.
+    """
+    name = client_name or "ProjectsForce"
+    speech_name = _speech_name(name)
+    has_transfer = bool(support_number)
+    server_config: dict = {
+        "url": _get_webhook_url(),
+        "timeoutSeconds": 60,
+    }
+    if server_secret:
+        server_config["secret"] = server_secret
+
+    transfer_instruction = (
+        "use the transferCall tool to connect them to our team"
+        if has_transfer
+        else "say 'Our team will reach out shortly. Have a great day!' and end the call"
+    )
+
+    system_prompt = (
+        f"You are J, a friendly phone assistant for {speech_name} "
+        "— a home improvement scheduling service.\n\n"
+        "This caller's number is NOT in our customer database. They may be a "
+        "potential new customer interested in our services. Your job is to "
+        "qualify their interest and capture contact info so our team can "
+        "follow up.\n\n"
+        "## CONVERSATION FLOW\n"
+        "1. You already greeted them. Wait for them to state what they need.\n"
+        "2. Acknowledge their interest briefly. Ask what kind of service "
+        "they're looking for (open-ended — flooring, windows, kitchen, "
+        "any home improvement project).\n"
+        "3. Collect these details, ONE QUESTION AT A TIME, in this order:\n"
+        "   a. First and last name — 'Could I get your first and last name?'\n"
+        "   b. Best email — 'And the best email to reach you?'\n"
+        "   c. Service address (street, city, state, zip) — "
+        "'What's the address where the work would be done?'\n"
+        "   d. Brief notes — 'Anything else our team should know?'\n"
+        "4. Read back the captured info for confirmation: "
+        "'Just to confirm, I have <name>, <email>, <address>, "
+        "looking for <service>. Is that all correct?'\n"
+        "5. Once confirmed, call the capture_lead tool with ALL fields. "
+        "While the tool runs, say 'One moment please.'\n"
+        "6. After the tool returns success, say: 'Perfect, our team at "
+        f"{speech_name} will reach out within one business day. "
+        "Is there anything else I can help you with?'\n\n"
+        "## CRITICAL RULES\n"
+        "- ONE question at a time. Do NOT ask for multiple fields in one turn.\n"
+        "- If the caller does NOT want to share info or asks for a person, "
+        f"{transfer_instruction}.\n"
+        "- If the caller is asking about an EXISTING project (mentions PO, "
+        "order number, project number, prior appointment), do NOT capture as "
+        f"lead. Instead {transfer_instruction}.\n"
+        "- NEVER make up or guess any field. If unclear, ask again.\n"
+        "- Keep responses concise — this is a phone call, not a text chat.\n"
+        "- NO bullet points, NO markdown.\n"
+        "- If the caller is rude, frustrated, or angry, acknowledge briefly "
+        "('I understand') then gently redirect to capturing their info.\n"
+        "- The capture_lead tool needs ALL of: caller_name, caller_email, "
+        "caller_address, service_interest. notes is OPTIONAL.\n"
+        + (
+            f"\n\nOFFICE HOURS: {hours_context['prompt_snippet']}"
+            if hours_context and hours_context.get("prompt_snippet")
+            else ""
+        )
+    )
+
+    return {
+        "name": f"{name} Lead Capture"[:40],
+        "voice": _VOICE_CONFIG,
+        "model": {
+            "model": "gpt-5.2-chat-latest",
+            "provider": "openai",
+            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "capture_lead",
+                        "description": (
+                            "Submit the captured lead. Call this ONCE after the "
+                            "caller has confirmed all details. Returns success "
+                            "or an error message you should relay to the caller."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": [
+                                "caller_name",
+                                "caller_email",
+                                "caller_address",
+                                "service_interest",
+                            ],
+                            "properties": {
+                                "caller_name": {
+                                    "type": "string",
+                                    "description": "Full name of the caller (first + last).",
+                                },
+                                "caller_email": {
+                                    "type": "string",
+                                    "description": "Best email for follow-up.",
+                                },
+                                "caller_address": {
+                                    "type": "string",
+                                    "description": (
+                                        "Service address — street, city, state, zip."
+                                    ),
+                                },
+                                "service_interest": {
+                                    "type": "string",
+                                    "description": (
+                                        "What kind of service the caller is "
+                                        "interested in — free text (e.g., "
+                                        "'kitchen remodel', 'window installation')."
+                                    ),
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional extra context the caller "
+                                        "shared (timeline, budget, prior work)."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+                *(_transfer_call_tool(support_number, name)),
+            ],
+        },
+        "transcriber": {
+            "model": "nova-3",
+            "language": "en",
+            "provider": "deepgram",
+            "endpointing": 150,
+        },
+        "firstMessage": first_message,
+        "endCallMessage": (
+            f"Thanks for calling {speech_name}. Have a great day!"
+        ),
+        "endCallPhrases": [
+            "goodbye", "bye", "bye bye", "bye now",
+            "talk to you later", "have a great day",
+            "have a good day", "no thanks", "not interested",
+        ],
+        "endCallFunctionEnabled": True,
+        "voicemailMessage": (
+            f"Hi, this is J from {speech_name}. Sorry I missed you. "
+            "Please give us a call back when you have a moment. Thanks!"
+        ),
+        "silenceTimeoutSeconds": 30,
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -2416,6 +2659,11 @@ async def _process_tool(
             tool_params, user_id, session_id, call_id, tool_call_id,
         )
 
+    if tool_name == "capture_lead":
+        return await _handle_capture_lead(
+            tool_params, call_id, tool_call_id,
+        )
+
     # Direct outbound tools — bypass orchestrator, call scheduling functions directly
     if tool_name in ("get_time_slots", "confirm_appointment", "add_note", "get_available_dates", "get_installation_address"):
         return await _handle_outbound_direct_tool(
@@ -2424,6 +2672,67 @@ async def _process_tool(
 
     logger.warning("Unknown tool: %s (call_id=%s)", tool_name, call_id)
     return _build_tool_result(f"Unknown tool: {tool_name}", tool_call_id)
+
+
+async def _handle_capture_lead(
+    tool_params: dict,
+    call_id: str,
+    tool_call_id: str,
+) -> dict:
+    """Handle the ``capture_lead`` tool invocation.
+
+    Stub implementation for Phase 3A v0.1 — logs the captured fields and
+    confirms back to the caller. Slice 3 will replace this with a
+    DynamoDB write and SES email to the tenant team.
+    """
+    caller_name = (tool_params.get("caller_name") or "").strip()
+    caller_email = (tool_params.get("caller_email") or "").strip()
+    caller_address = (tool_params.get("caller_address") or "").strip()
+    service_interest = (tool_params.get("service_interest") or "").strip()
+    notes = (tool_params.get("notes") or "").strip()
+
+    missing = [
+        n for n, v in (
+            ("name", caller_name),
+            ("email", caller_email),
+            ("address", caller_address),
+            ("service_interest", service_interest),
+        )
+        if not v
+    ]
+    if missing:
+        msg = (
+            f"I'm missing your {', '.join(missing)}. "
+            "Could you share that so I can capture your information?"
+        )
+        logger.warning(
+            "capture_lead missing fields: call_id=%s missing=%s",
+            call_id, missing,
+        )
+        return _build_tool_result(msg, tool_call_id)
+
+    # Stub: log only. Slice 3 will persist to DynamoDB + SES.
+    tenant_phone = ""
+    session_session = _lead_sessions.get(f"vapi-{call_id}", {})
+    if session_session:
+        tenant_phone = session_session.get("to_phone", "")
+    logger.info(
+        "capture_lead (stub): call_id=%s tenant=***%s name=%s email=%s "
+        "address_len=%d service=%s notes_len=%d",
+        call_id,
+        tenant_phone[-4:] if tenant_phone else "none",
+        caller_name,
+        caller_email,
+        len(caller_address),
+        service_interest,
+        len(notes),
+    )
+
+    return _build_tool_result(
+        "Got it — I've recorded your information. Our team will reach out "
+        "within one business day. Is there anything else I can help with?",
+        tool_call_id,
+    )
 
 
 async def _handle_store_bot(
