@@ -41,6 +41,8 @@ class AuthenticationError(Exception):
         support_number: str = "",
         office_hours: list | None = None,
         timezone: str = "",
+        caller_type: str = "store",
+        store: dict | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -49,6 +51,11 @@ class AuthenticationError(Exception):
         self.support_number = support_number
         self.office_hours = office_hours or []
         self.timezone = timezone
+        # PF API caller_type ∈ {user, store, unknown}. Default 'store' preserves
+        # legacy behaviour for callers that hit non-200 responses (no caller_type).
+        self.caller_type = caller_type
+        # Populated when caller_type == 'store' (store_id, store_name, store_number).
+        self.store = store or {}
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -353,6 +360,7 @@ def _get_cached_creds(phone: str) -> dict | None:
             "support_number": item.get("support_number", ""),
             "support_email": item.get("support_email", ""),
             "office_hours": item.get("office_hours", []),
+            "caller_type": item.get("caller_type", "user"),
         }
 
     except Exception:
@@ -408,6 +416,7 @@ def _store_credentials(phone: str, credentials: dict) -> None:
                 "support_number": credentials.get("support_number", ""),
                 "support_email": credentials.get("support_email", ""),
                 "office_hours": credentials.get("office_hours", []),
+                "caller_type": credentials.get("caller_type", "user"),
             }
         )
         logger.info("Stored credentials for ***%s (TTL: %d)", phone[-4:], ttl)
@@ -450,7 +459,13 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
 
         if "accesstoken" not in data:
             error_msg = data.get("message", "No access token in response")
-            logger.info("Phone auth: no token (non-customer) for ***%s", phone[-4:])
+            # PF API distinguishes 'store' (failed) from 'unknown' (not_found).
+            # Default to 'store' if the field is absent (legacy responses).
+            caller_type = data.get("caller_type") or "store"
+            logger.info(
+                "Phone auth: no token (caller_type=%s) for ***%s",
+                caller_type, phone[-4:],
+            )
             raise AuthenticationError(
                 f"Authentication failed: {error_msg}",
                 client_id=data.get("client_id", ""),
@@ -458,6 +473,8 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
                 support_number=data.get("support_number", ""),
                 office_hours=data.get("office_hours", []),
                 timezone=data.get("timezone", ""),
+                caller_type=caller_type,
+                store=data.get("store") or {},
             )
 
         user = data.get("user", {})
@@ -478,6 +495,8 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
             "support_number": data.get("support_number", ""),
             "support_email": data.get("support_email_1", ""),
             "office_hours": data.get("office_hours", []),
+            # PF API caller_type — defaults to 'user' on success path.
+            "caller_type": data.get("caller_type") or "user",
         }
 
     except httpx.HTTPError as exc:
