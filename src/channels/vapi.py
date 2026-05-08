@@ -518,10 +518,10 @@ async def _handle_assistant_request(body: dict) -> dict:
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
     """Build a personalized greeting with the caller's first name.
 
-    Uses SSML <break> pauses for natural pacing (ElevenLabs turbo_v2_5):
-    - 3s initial pause (call connection settling)
-    - 0.3s after name
-    - 0.5s after intro
+    The TTS payload must start with a real word, not an SSML <break> tag —
+    leading breaks trigger an ElevenLabs warm-up artifact where the trained
+    voice leaks vocal mannerisms ("Torii", "Japura") into stream start.
+    Inter-word breaks are fine; only the *leading* one is the problem.
     """
     name_part = f"Hello {first_name}!" if first_name else "Hello!"
     intro = f"I'm J, your AI assistant from {_speech_name(client_name)}."
@@ -530,7 +530,7 @@ def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
         "or schedule appointments. What would you like to do today?"
     )
     return (
-        f'<break time="3s" /> {name_part} <break time="0.3s" /> '
+        f'{name_part} <break time="0.3s" /> '
         f'{intro} <break time="0.5s" /> '
         f'{guidance}'
     )
@@ -994,8 +994,10 @@ def _generate_outbound_greeting(
     else:
         project_part = " I'm calling about scheduling your upcoming project."
 
+    # TTS payload must start with a real word, not <break> — see
+    # _generate_dynamic_greeting for context on the ElevenLabs warm-up artifact.
     return (
-        f'<break time="3s" /> {name_part} <break time="0.3s" /> '
+        f'{name_part} <break time="0.3s" /> '
         f"This is J from {name}."
         f' <break time="0.3s" /> '
         f"{project_part}"
@@ -1564,8 +1566,10 @@ def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
     then qualifies them during the conversation.
     """
     name = client_name or "ProjectsForce"
+    # TTS payload must start with a real word, not <break> — see
+    # _generate_dynamic_greeting for context on the ElevenLabs warm-up artifact.
     return (
-        f'<break time="3s" /> Hello! I\'m J from {_speech_name(name)}. '
+        f"Hello! I'm J from {_speech_name(name)}. "
         '<break time="0.3s" /> '
         "I can help you check on a project status or look up project details. "
         "How can I help you today?"

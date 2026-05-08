@@ -1307,6 +1307,46 @@ class TestTransferCallTool:
 # ── Outbound call tests ──────────────────────────────────────────────
 
 
+class TestGreetingsDoNotStartWithSSMLBreak:
+    """Regression: leading <break> tags trigger ElevenLabs Lauren B. warm-up
+    artifacts (phantom words like 'Torii' / 'Japura' leak before greeting).
+    All TTS payloads must start with a real word.
+    Refs:
+      - https://help.elevenlabs.io/hc/en-us/articles/24352686926609
+      - https://help.elevenlabs.io/hc/en-us/articles/13416374683665
+    """
+
+    def _assert_no_leading_break(self, greeting: str):
+        stripped = greeting.lstrip()
+        assert not stripped.startswith("<break"), (
+            f"Greeting must not start with <break>. Got: {greeting[:80]!r}"
+        )
+
+    def test_dynamic_greeting_with_name(self):
+        from channels.vapi import _generate_dynamic_greeting
+        self._assert_no_leading_break(_generate_dynamic_greeting("Jane", "FloorCo"))
+
+    def test_dynamic_greeting_without_name(self):
+        from channels.vapi import _generate_dynamic_greeting
+        self._assert_no_leading_break(_generate_dynamic_greeting("", "FloorCo"))
+
+    def test_store_greeting(self):
+        from channels.vapi import _generate_store_greeting
+        self._assert_no_leading_break(_generate_store_greeting("FloorCo"))
+
+    def test_outbound_greeting_with_name_and_project(self):
+        from channels.vapi import _generate_outbound_greeting
+        self._assert_no_leading_break(
+            _generate_outbound_greeting("Jane Doe", "FloorCo", "Carpet")
+        )
+
+    def test_outbound_greeting_without_name(self):
+        from channels.vapi import _generate_outbound_greeting
+        self._assert_no_leading_break(
+            _generate_outbound_greeting("", "FloorCo", "")
+        )
+
+
 class TestOutboundGreeting:
     def test_greeting_with_name_and_project(self):
         from channels.vapi import _generate_outbound_greeting
