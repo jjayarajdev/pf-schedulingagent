@@ -2038,7 +2038,10 @@ async def _handle_server_event(body: dict) -> dict:
                     # Try to get creds for auto-recovery
                     recovery_creds = None
                     if phone_number:
-                        recovery_creds = get_cached_auth(normalize_phone(phone_number))
+                        recovery_creds = get_cached_auth(
+                            normalize_phone(phone_number),
+                            to_phone=_resolve_to_phone(call_data),
+                        )
                     if not recovery_creds:
                         recovery_creds = _call_auth_cache.get(call_id)
 
@@ -2133,7 +2136,10 @@ async def _handle_server_event(body: dict) -> dict:
             # Customer call — use /communication/.../note endpoint
             phone_number = _extract_phone_number(call_data)
             if phone_number and summary:
-                creds = get_cached_auth(normalize_phone(phone_number))
+                creds = get_cached_auth(
+                    normalize_phone(phone_number),
+                    to_phone=_resolve_to_phone(call_data),
+                )
                 if creds and creds.get("bearer_token"):
                     task = asyncio.create_task(
                         post_call_summary_notes(

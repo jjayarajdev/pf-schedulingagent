@@ -241,13 +241,25 @@ def get_support_info(phone: str) -> dict:
     return {"support_number": "", "support_email": "", "client_name": "ProjectsForce"}
 
 
-def get_cached_auth(phone: str) -> dict | None:
+def get_cached_auth(phone: str, to_phone: str = "") -> dict | None:
     """Return cached auth credentials for end-of-call note posting.
+
+    Must mirror the cache key built by ``get_or_authenticate`` — which is
+    tenant-aware (``f"{phone}:{to_phone}"``). Without ``to_phone`` the
+    lookup misses every customer call cached under the compound key.
+
+    Falls back to a phone-only lookup for legacy single-tenant rows.
 
     Returns dict with ``bearer_token``, ``client_id``, ``customer_id``
     or None if not cached / expired.
     """
-    cached = _get_cached_creds(phone)
+    to_clean = normalize_phone(to_phone) if to_phone else ""
+    cache_key = f"{phone}:{to_clean}" if to_clean else phone
+    cached = _get_cached_creds(cache_key)
+    if not cached and to_clean:
+        # Legacy fallback: row may still be keyed by phone alone (pre
+        # multi-tenant cache change in 319caca)
+        cached = _get_cached_creds(phone)
     if not cached:
         return None
     return {
