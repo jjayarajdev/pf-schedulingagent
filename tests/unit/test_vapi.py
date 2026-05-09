@@ -1,7 +1,7 @@
 """Tests for Vapi phone channel — webhook, tool calls, server events."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -485,8 +485,8 @@ class TestAssistantRequest:
     @patch("channels.vapi.get_or_authenticate", new_callable=AsyncMock)
     def test_store_session_created(self, mock_auth, client):
         """Store detection creates a session entry in _store_sessions."""
-        from channels.vapi import _store_sessions
         from auth.phone_auth import AuthenticationError
+        from channels.vapi import _store_sessions
 
         mock_auth.side_effect = AuthenticationError("Not found", status_code=404)
 
@@ -924,6 +924,95 @@ class TestCallSummaryNotes:
         assert resp.status_code == 200
         mock_cleanup.assert_called_with("vapi-call-notes-2")
 
+    @patch("channels.vapi.get_cached_auth", return_value=None)
+    @patch("channels.vapi.cleanup_call_caches")
+    def test_no_creds_unauthenticated_caller_logs_info_not_warning(
+        self, mock_cleanup, mock_get_auth, client, caplog,
+    ):
+        """A6: Unknown/anonymous caller hitting end-of-call should NOT trigger
+        a WARNING — it's expected behaviour (no customer to attach notes to).
+        """
+        import logging
+
+        from channels.vapi import _call_auth_cache
+
+        # Ensure no auth was attempted for this call
+        _call_auth_cache.pop("call-anon-1", None)
+
+        with caplog.at_level(logging.INFO, logger="channels.vapi"):
+            resp = client.post(
+                "/vapi/webhook",
+                json={
+                    "message": {
+                        "type": "end-of-call-report",
+                        "endedReason": "customer-ended-call",
+                        "summary": "Anonymous caller asked about something.",
+                        "durationSeconds": 20,
+                        "call": {
+                            "id": "call-anon-1",
+                            "customer": {"number": "+15559876543"},
+                        },
+                    },
+                },
+                headers=_vapi_headers(),
+            )
+        assert resp.status_code == 200
+        # Should have INFO message about skipping notes, NOT a WARNING
+        skip_logs = [r for r in caplog.records if "Skipping call notes" in r.message]
+        warn_logs = [r for r in caplog.records if "No cached creds for call notes" in r.message]
+        assert len(skip_logs) == 1, "Expected exactly one INFO 'Skipping call notes' log"
+        assert skip_logs[0].levelname == "INFO"
+        assert len(warn_logs) == 0, "Should NOT log WARNING for unauthenticated caller"
+
+    @patch("channels.vapi.get_cached_auth", return_value=None)
+    @patch("channels.vapi.cleanup_call_caches")
+    def test_no_creds_after_auth_attempt_keeps_warning(
+        self, mock_cleanup, mock_get_auth, client, caplog,
+    ):
+        """A6: When auth WAS attempted (caller appeared in _call_auth_cache during
+        the call) but lookup at end-of-call failed, that's a real inconsistency
+        and should still WARN.
+        """
+        import logging
+
+        from channels.vapi import _call_auth_cache
+
+        # Simulate that auth was attempted/cached during the call
+        _call_auth_cache["call-auth-lost"] = {
+            "bearer_token": "previously-cached",
+            "client_id": "CL1",
+            "customer_id": "CUST1",
+        }
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="channels.vapi"):
+                resp = client.post(
+                    "/vapi/webhook",
+                    json={
+                        "message": {
+                            "type": "end-of-call-report",
+                            "endedReason": "customer-ended-call",
+                            "summary": "Customer call where auth got lost somehow.",
+                            "durationSeconds": 60,
+                            "call": {
+                                "id": "call-auth-lost",
+                                "customer": {"number": "+15559876543"},
+                            },
+                        },
+                    },
+                    headers=_vapi_headers(),
+                )
+            assert resp.status_code == 200
+            warn_logs = [
+                r for r in caplog.records
+                if "No cached creds for call notes" in r.message
+                and "auth was attempted" in r.message
+            ]
+            assert len(warn_logs) == 1
+            assert warn_logs[0].levelname == "WARNING"
+        finally:
+            _call_auth_cache.pop("call-auth-lost", None)
+
     @patch("channels.vapi.cleanup_call_caches")
     def test_end_of_call_no_summary_clears_session(self, mock_cleanup, client):
         """No summary → no note posting, just cleanup."""
@@ -948,7 +1037,6 @@ class TestProjectTracking:
 
     def test_track_and_retrieve(self):
         from tools.scheduling import (
-            _session_projects,
             _track_project_action,
             clear_session_projects,
             get_session_projects,
@@ -1755,8 +1843,8 @@ class TestOutboundAuthContext:
     @patch("channels.vapi.get_active_call")
     async def test_outbound_creds_populate_auth_context(self, mock_cache):
         """Active outbound call creds should populate AuthContext."""
-        from channels.vapi import _set_auth_context_from_phone
         from auth.context import AuthContext
+        from channels.vapi import _set_auth_context_from_phone
 
         mock_cache.return_value = {
             "auth_creds": {
@@ -1782,8 +1870,8 @@ class TestOutboundAuthContext:
     @patch("channels.vapi.get_active_call", return_value=None)
     async def test_outbound_ddb_fallback_on_cache_miss(self, mock_cache, mock_ddb, mock_recache):
         """When in-memory cache misses, fall back to DynamoDB via metadata.call_id."""
-        from channels.vapi import _set_auth_context_from_phone
         from auth.context import AuthContext
+        from channels.vapi import _set_auth_context_from_phone
 
         mock_ddb.return_value = {
             "call_id": "our-internal-id",

@@ -2156,10 +2156,25 @@ async def _handle_server_event(body: dict) -> dict:
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
                 else:
-                    logger.warning(
-                        "No cached creds for call notes (call_id=%s phone=***%s)",
-                        call_id, phone_number[-4:] if phone_number else "none",
-                    )
+                    # Differentiate two cases:
+                    #   1. Caller never authenticated (anonymous/unknown flow) — expected,
+                    #      no creds = no customer to attach notes to. Log at INFO.
+                    #   2. Caller DID authenticate during the call (auth was cached in
+                    #      _call_auth_cache) but lookup at end-of-call failed — real
+                    #      inconsistency. Keep WARNING so we get paged.
+                    auth_attempted = call_id in _call_auth_cache
+                    if auth_attempted:
+                        logger.warning(
+                            "No cached creds for call notes (call_id=%s phone=***%s) "
+                            "— auth was attempted during call but lookup failed",
+                            call_id, phone_number[-4:] if phone_number else "none",
+                        )
+                    else:
+                        logger.info(
+                            "Skipping call notes — caller never authenticated "
+                            "(call_id=%s phone=***%s)",
+                            call_id, phone_number[-4:] if phone_number else "none",
+                        )
 
         # Clean up all caches for this call (safe — data already snapshotted above)
         cleanup_call_caches(session_id)
