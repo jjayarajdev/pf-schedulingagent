@@ -14,6 +14,16 @@ MONTHS_MAP = {
     "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
+WEEKDAYS_MAP = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
 
 def convert_natural_date(date_str: str) -> dict | None:
     """Convert natural language date to a date range dict.
@@ -179,6 +189,30 @@ def convert_natural_date(date_str: str) -> dict | None:
                 "strategy": "week",
             }
 
+    # Weekday phrases: "this Thursday", "next Tuesday", "on Friday", or just "Friday"
+    # - "this <day>" / "<day>" / "on <day>" → upcoming weekday (0-6 days from today)
+    # - "next <day>" → always next week's weekday (7-13 days from today)
+    weekday_match = re.match(
+        r"^(this|next|on|coming)?\s*(monday|mon|tuesday|tues?|wednesday|wed|"
+        r"thursday|thu(?:rs?)?|friday|fri|saturday|sat|sunday|sun)\.?$",
+        date_lower,
+    )
+    if weekday_match:
+        qualifier = weekday_match.group(1) or ""
+        day_name = weekday_match.group(2)
+        target_weekday = WEEKDAYS_MAP.get(day_name)
+        if target_weekday is not None:
+            days_ahead = (target_weekday - today.weekday()) % 7
+            if qualifier == "next":
+                # "next Thursday" — always next-week's, even if today is Thursday
+                days_ahead = days_ahead + 7 if days_ahead > 0 else 7
+            elif days_ahead == 0:
+                # "this Thursday" / "Thursday" with today being Thursday → today
+                days_ahead = 0
+            target = today + timedelta(days=days_ahead)
+            d = target.strftime("%Y-%m-%d")
+            return {"start_date": d, "end_date": d, "strategy": "specific_day"}
+
     # Month names with optional day: "Jan 10", "10th Jan", "January", "March 15th"
     for name, num in MONTHS_MAP.items():
         if name in date_lower:
@@ -285,5 +319,11 @@ def normalize_date_str(date_str: str) -> str:
             today.year if num >= today.month else today.year + 1
         )
         return f"{year}-{num:02d}-01"
+
+    # Fallback: try the broader natural-date parser for relative phrases
+    # like "this Thursday", "next Tuesday", "tomorrow", "today".
+    parsed = convert_natural_date(s)
+    if parsed and parsed.get("strategy") == "specific_day":
+        return parsed["start_date"]
 
     return date_str
