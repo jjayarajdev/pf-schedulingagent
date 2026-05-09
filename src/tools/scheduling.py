@@ -1798,6 +1798,38 @@ async def list_notes(project_id: str) -> str:
     return json.dumps({"notes": notes, "count": len(notes)}, indent=2, default=str)
 
 
+async def _post_with_retry_on_5xx(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    payload: dict,
+    *,
+    label: str,
+    max_attempts: int = 3,
+) -> httpx.Response:
+    """POST with retry on 5xx (PF transient server errors).
+
+    Retries up to ``max_attempts`` times with exponential backoff (0.5s, 1s, 2s)
+    when the response is HTTP 5xx. Does NOT retry 4xx (client error) or 2xx.
+    Returns the final response in any case so the caller can log the status.
+    """
+    import asyncio as _asyncio
+
+    last_resp = None
+    for attempt in range(1, max_attempts + 1):
+        last_resp = await client.post(url, headers=headers, json=payload)
+        if last_resp.status_code < 500:
+            return last_resp
+        if attempt < max_attempts:
+            backoff = 0.5 * (2 ** (attempt - 1))  # 0.5s, 1s, 2s
+            logger.warning(
+                "%s returned %d on attempt %d/%d — retrying in %.1fs",
+                label, last_resp.status_code, attempt, max_attempts, backoff,
+            )
+            await _asyncio.sleep(backoff)
+    return last_resp
+
+
 async def post_call_summary_notes(
     *,
     session_id: str,
@@ -1864,7 +1896,10 @@ async def post_call_summary_notes(
             }
             try:
                 log_curl("POST", url, headers, payload)
-                resp = await client.post(url, headers=headers, json=payload)
+                resp = await _post_with_retry_on_5xx(
+                    client, url, headers, payload,
+                    label=f"post_call_summary_notes(project={project_id})",
+                )
                 log_response(resp, "post_call_summary_notes (communication/note)")
                 logger.info(
                     "Call summary posted: project=%s status=%d session=%s",
@@ -1884,7 +1919,10 @@ async def post_call_summary_notes(
                 notes_payload = {"note_text": combined_notes}
                 try:
                     log_curl("POST", notes_url, headers, notes_payload)
-                    resp = await client.post(notes_url, headers=headers, json=notes_payload)
+                    resp = await _post_with_retry_on_5xx(
+                        client, notes_url, headers, notes_payload,
+                        label=f"post_call_project_notes(project={project_id})",
+                    )
                     log_response(resp, "post_call_project_notes (project-notes/add)")
                     logger.info(
                         "Project notes posted: project=%s notes=%d status=%d session=%s",
