@@ -1039,6 +1039,26 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
                 }
                 return json.dumps(result, indent=2)
 
+            # PF returns {"message":"Not allowed"} when the project is not
+            # in a schedulable state (e.g., status not yet ready, missing
+            # measurements, contract not signed). The caller can't fix this —
+            # offer transfer instead of letting the LLM fabricate a confirm.
+            if any(phrase in error_body for phrase in (
+                "not allowed", "not permitted", "not eligible",
+            )):
+                logger.info("Project %s not eligible for scheduling (API 400)", project_id)
+                return json.dumps({
+                    "project_number": _get_project_number(project_id),
+                    "not_schedulable": True,
+                    "available_dates": [],
+                    "message": (
+                        "This project isn't currently set up for self-service "
+                        "scheduling. Please offer to transfer the caller to "
+                        "the support team — do NOT attempt to confirm or "
+                        "schedule this project."
+                    ),
+                }, indent=2)
+
         response.raise_for_status()
         data = _unwrap(response.json())
     except httpx.HTTPError as exc:

@@ -334,6 +334,43 @@ class TestGetAvailableDates:
         data = json.loads(result)
         assert data["already_scheduled"] is True
 
+    async def test_not_allowed_returns_not_schedulable(self, mock_httpx_client, mock_httpx_response):
+        """A5: 400 with 'Not allowed' returns structured 'not_schedulable' so the
+        bot offers transfer instead of fabricating a confirm.
+
+        Bug observed in prod call 019e0cbc-dcfd: PF returned 400 with
+        message='Not allowed' for project not in a schedulable state. The bot
+        had no recognized handling, fell into a generic error, and the LLM
+        hallucinated a confirm action (caught by guardrail).
+        """
+        response = mock_httpx_response(
+            400,
+            {"message": "Not allowed"},
+            text='{"message":"Not allowed"}',
+        )
+        response.raise_for_status = MagicMock()
+        with mock_httpx_client(response=response):
+            result = await get_available_dates("10163901")
+        data = json.loads(result)
+        assert data["not_schedulable"] is True
+        assert data["available_dates"] == []
+        assert "transfer" in data["message"].lower()
+        # Don't let the bot try to confirm without a slot
+        assert "do not" in data["message"].lower() or "do NOT" in data["message"]
+
+    async def test_not_permitted_also_caught(self, mock_httpx_client, mock_httpx_response):
+        """A5: PF variant 'not permitted' also caught."""
+        response = mock_httpx_response(
+            400,
+            {"message": "Operation not permitted on this project"},
+            text='{"message":"Operation not permitted on this project"}',
+        )
+        response.raise_for_status = MagicMock()
+        with mock_httpx_client(response=response):
+            result = await get_available_dates("123")
+        data = json.loads(result)
+        assert data["not_schedulable"] is True
+
 
     async def test_dates_response_never_includes_time_slots(self, mock_httpx_client, mock_httpx_response):
         """Dates response must NEVER include time slots — forces get_time_slots call."""
