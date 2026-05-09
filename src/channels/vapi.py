@@ -2853,11 +2853,39 @@ async def _attempt_reschedule_recovery(
                 "RESCHEDULE RECOVERY FAILED: project=%s result=%s call_id=%s",
                 project_id, result, call_id,
             )
+
+            # If recovery failed because the slot has been released back to
+            # PF's pool, fetch fresh availability and attach to the note so
+            # the operator can call the customer back with concrete options.
+            slot_released = (
+                "no longer available" in result_lower
+                or "invalid appointment" in result_lower
+            )
+            next_options = ""
+            if slot_released:
+                try:
+                    fresh = await sched_get_available_dates(project_id)
+                    fresh_data = json.loads(fresh) if isinstance(fresh, str) else {}
+                    dates = fresh_data.get("dates") or fresh_data.get(
+                        "available_dates", []
+                    )
+                    if dates:
+                        next_options = (
+                            f" Next available dates: {', '.join(dates[:5])}."
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to fetch fresh dates during recovery: project=%s",
+                        project_id,
+                    )
+
             await sched_add_note(
                 project_id,
                 f"INCOMPLETE RESCHEDULE: Original appointment ({old_date} {old_time}) "
-                f"was cancelled but could not be restored. "
-                f"Recovery result: {result[:200]}. Manual recovery required.",
+                f"was cancelled but could not be restored — slot may have been "
+                f"released to another booking.{next_options} "
+                f"Please call the customer back to rebook. "
+                f"Recovery result: {result[:200]}.",
             )
     except Exception:
         logger.exception(
