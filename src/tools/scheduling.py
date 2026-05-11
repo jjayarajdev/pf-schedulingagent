@@ -1670,7 +1670,14 @@ async def _cancel_appointment_impl(project_id: str, reason: str = "") -> str:
 
 
 async def add_note(project_id: str, note_text: str) -> str:
-    """Add a note to a project. Routes to the correct API based on caller type and note content."""
+    """Add a note to a project. Routes to the correct API based on caller type and note content.
+
+    Routing matrix:
+      - Address update note (any caller)              → /project-notes/update-address-note
+      - Store caller, any note                        → /project-notes/add-store-note (cat 3)
+      - Customer caller, cancel/reschedule reason     → /project-notes/add-note (legacy)
+      - Customer caller, regular note                 → customer notes endpoint
+    """
     _note_added_in_request.set(True)
     project_id = await _resolve_project_id(project_id)
     caller_type = AuthContext.get_caller_type()
@@ -1683,7 +1690,11 @@ async def add_note(project_id: str, note_text: str) -> str:
 
     if is_address_note:
         return await _add_address_note(project_id, note_text)
-    elif caller_type == "store" or is_cancel_note:
+    elif caller_type == "store":
+        # Store callers always use the dedicated store-note endpoint (note_category_id=3).
+        return await _add_store_note(project_id, note_text)
+    elif is_cancel_note:
+        # Customer cancel/reschedule reason — legacy endpoint kept for compat.
         return await _add_project_note(project_id, note_text)
     else:
         return await _add_customer_note(project_id, note_text)
@@ -1759,6 +1770,45 @@ async def _add_project_note(project_id: str, note_text: str) -> str:
         response.raise_for_status()
     except httpx.HTTPError:
         logger.exception("Failed to add project note")
+        return "Sorry, I couldn't add the note. Please try again later."
+
+    pnum = _get_project_number(project_id)
+    return f"Note added successfully to project {pnum}."
+
+
+async def _add_store_note(project_id: str, note_text: str) -> str:
+    """Post a store-flow note via POST /project-notes/add-store-note (note_category_id=3).
+
+    Replaces the previous generic /project-notes/add-note for store callers
+    so PF can distinguish store-AI notes from other note types.
+    """
+    _track_project_action(project_id, "add_store_note")
+    client_id = AuthContext.get_client_id()
+    base = get_pf_api_base()
+    headers = build_headers()
+
+    try:
+        pid = int(project_id)
+    except (ValueError, TypeError):
+        pid = project_id
+
+    url = f"{base}/project-notes/add-store-note"
+    payload = {
+        "client_id": client_id,
+        "project_id": pid,
+        "note_text": note_text,
+    }
+
+    logger.info("add_store_note (project-notes/add-store-note) for project %s", project_id)
+    log_curl("POST", url, headers, payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=_SCHEDULER_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        log_response(response, "add_store_note")
+        response.raise_for_status()
+    except httpx.HTTPError:
+        logger.exception("Failed to add store note")
         return "Sorry, I couldn't add the note. Please try again later."
 
     pnum = _get_project_number(project_id)
@@ -1985,10 +2035,12 @@ async def post_store_call_notes(
     duration_seconds: float = 0,
     projects_discussed: dict[str, list[str]] | None = None,
 ) -> None:
-    """Post call summary as a note for store calls via /project-notes/add-note.
+    """Post AI call summary as a note for store calls via /project-notes/add-store-summary-note.
 
-    Store callers don't have customer-level auth, so we use the separate
-    add-note endpoint that only requires client_id + project_id.
+    Uses the dedicated store-summary endpoint (note_category_id=54) so PF can
+    distinguish AI-generated call summaries from other notes. Store callers
+    don't have customer-level auth, so we use the separate endpoint that only
+    requires client_id + project_id (and the tenant-scoped bearer token).
     Called from the Vapi end-of-call handler for store sessions.
 
     Args:
@@ -2023,7 +2075,7 @@ async def post_store_call_notes(
             if summary:
                 note_text += f" {summary}"
 
-            url = f"{base_url}/project-notes/add-note"
+            url = f"{base_url}/project-notes/add-store-summary-note"
             payload = {
                 "client_id": client_id,
                 "project_id": int(project_id),
@@ -2031,15 +2083,18 @@ async def post_store_call_notes(
             }
             try:
                 log_curl("POST", url, headers, payload)
-                resp = await client.post(url, headers=headers, json=payload)
-                log_response(resp, "post_store_call_notes (project-notes/add-note)")
+                resp = await _post_with_retry_on_5xx(
+                    client, url, headers, payload,
+                    label=f"post_store_call_notes(project={project_id})",
+                )
+                log_response(resp, "post_store_call_notes (project-notes/add-store-summary-note)")
                 logger.info(
-                    "Store call note posted: project=%s status=%d session=%s",
+                    "Store call summary note posted: project=%s status=%d session=%s",
                     project_id, resp.status_code, session_id,
                 )
             except Exception:
                 logger.exception(
-                    "Failed to post store call note for project %s (session=%s)",
+                    "Failed to post store call summary note for project %s (session=%s)",
                     project_id, session_id,
                 )
 

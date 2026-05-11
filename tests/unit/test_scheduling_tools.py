@@ -689,8 +689,10 @@ class TestAddNote:
         assert payload["client_id"] == "test-client-123"
         assert payload["project_id"] == 123
 
-    async def test_store_note_uses_add_note_endpoint(self):
-        """Store callers always route to /project-notes/add-note."""
+    async def test_store_note_uses_add_store_note_endpoint(self):
+        """Store callers route to the dedicated /project-notes/add-store-note
+        endpoint (note_category_id=3), not the generic /add-note.
+        """
         from auth.context import AuthContext
 
         AuthContext.set(
@@ -713,7 +715,13 @@ class TestAddNote:
             await add_note("456", "Store note")
 
         url = mock_client.post.call_args[0][0]
-        assert "/project-notes/add-note" in url
+        payload = mock_client.post.call_args[1].get("json", {})
+        assert url.endswith("/project-notes/add-store-note"), (
+            f"Expected store note endpoint, got {url}"
+        )
+        assert payload["client_id"] == "CL1"
+        assert payload["project_id"] == 456
+        assert payload["note_text"] == "Store note"
 
 
     async def test_address_correction_uses_update_address_endpoint(self):
@@ -740,8 +748,11 @@ class TestAddNote:
         assert payload["project_id"] == 123
         assert "CUSTOMER REQUESTED INSTALLATION ADDRESS UPDATE" in payload["note_text"]
 
-    async def test_store_address_correction_uses_add_note_endpoint(self):
-        """Store caller address corrections route to /project-notes/add-note, not update-address."""
+    async def test_store_address_correction_uses_add_store_note_endpoint(self):
+        """Store caller note that doesn't match the strict 'CUSTOMER REQUESTED…'
+        address phrase falls through to the regular store-note endpoint, not
+        /update-address-note.
+        """
         from auth.context import AuthContext
 
         AuthContext.set(
@@ -764,8 +775,97 @@ class TestAddNote:
             await add_note("456", "ADDRESS CORRECTION: 100 New Street, Dallas, TX 75201")
 
         url = mock_client.post.call_args[0][0]
-        assert "/project-notes/add-note" in url
+        assert url.endswith("/project-notes/add-store-note")
         assert "/update-address-note" not in url
+
+    async def test_store_cancel_reason_uses_add_store_note_endpoint(self):
+        """Store-flow cancellation reasons go to the store endpoint (not the
+        legacy /add-note that customer-cancel notes still use)."""
+        from auth.context import AuthContext
+
+        AuthContext.set(
+            auth_token="tok", client_id="CL1", customer_id="C1",
+            caller_type="store",
+        )
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await add_note("456", "CANCELLATION REASON: Customer changed plans")
+
+        url = mock_client.post.call_args[0][0]
+        # Store caller → store endpoint regardless of cancel-reason content
+        assert url.endswith("/project-notes/add-store-note")
+
+
+class TestPostStoreCallNotes:
+    """End-of-call summary note for store calls — uses /project-notes/add-store-summary-note
+    (note_category_id=54) so PF can distinguish AI summaries from other notes.
+    """
+
+    async def test_summary_posted_to_store_summary_endpoint(self):
+        from tools.scheduling import post_store_call_notes
+
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"message": "Store AI Summary Note added successfully"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.request = MagicMock(method="POST")
+        mock_resp.url = "https://test.com"
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await post_store_call_notes(
+                session_id="vapi-call-1",
+                bearer_token="tok",
+                client_id="CL1",
+                summary="Caller asked about project status; quoted ETA next week.",
+                duration_seconds=120,
+                projects_discussed={"10076161": ["status_lookup"]},
+            )
+
+        url = mock_client.post.call_args[0][0]
+        payload = mock_client.post.call_args[1].get("json", {})
+        assert url.endswith("/project-notes/add-store-summary-note"), (
+            f"Expected store-summary endpoint, got {url}"
+        )
+        assert payload["client_id"] == "CL1"
+        assert payload["project_id"] == 10076161
+        assert "Caller asked about project status" in payload["note_text"]
+        assert "AI Scheduling Assistant" in payload["note_text"]
+
+    async def test_no_projects_skips_post(self):
+        """If no projects discussed, no note posted."""
+        from tools.scheduling import post_store_call_notes
+
+        with patch("tools.scheduling.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
+
+            await post_store_call_notes(
+                session_id="vapi-call-1",
+                bearer_token="tok",
+                client_id="CL1",
+                summary="Short call, no project discussed.",
+                projects_discussed={},
+            )
+
+        mock_client.post.assert_not_called()
 
 
 class TestListNotes:

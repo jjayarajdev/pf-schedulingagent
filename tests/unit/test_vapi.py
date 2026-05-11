@@ -1131,7 +1131,7 @@ class TestPostCallSummaryNotes:
 
 
 class TestPostStoreCallNotes:
-    """Store call notes use /project-notes/add-note endpoint."""
+    """Store call summary notes use /project-notes/add-store-summary-note (cat 54)."""
 
     @pytest.mark.asyncio
     async def test_posts_note_per_project(self):
@@ -1172,10 +1172,12 @@ class TestPostStoreCallNotes:
 
             assert mock_client.post.call_count == 2
 
-            # Verify it uses /project-notes/add-note endpoint
+            # Verify it uses the dedicated store-summary endpoint
             first_call = mock_client.post.call_args_list[0]
             url = first_call[0][0] if first_call[0] else first_call[1].get("url", "")
-            assert "/project-notes/add-note" in url
+            assert url.endswith("/project-notes/add-store-summary-note"), (
+                f"Expected store-summary endpoint, got {url}"
+            )
 
             # Verify payload has client_id, project_id (int), note_text
             payload = first_call[1].get("json", {})
