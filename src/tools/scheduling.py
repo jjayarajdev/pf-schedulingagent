@@ -1096,7 +1096,25 @@ async def get_available_dates(project_id: str, start_date: str = "", end_date: s
             url,
             list(data.keys()) if isinstance(data, dict) else type(data).__name__,
         )
-        return f"No available dates found between {start_date} and {end_date}. Try a different date range."
+        return json.dumps({
+            "project_number": _get_project_number(project_id),
+            "no_dates_available": True,
+            "available_dates": [],
+            "searched_range": f"{start_date} to {end_date}",
+            "message": (
+                "No available dates returned by the scheduler for this range. "
+                "DO NOT offer to transfer the caller — this is a 'no dates in window' "
+                "situation, not a system failure. The PF scheduler genuinely has nothing "
+                "available right now. Tell the caller plainly: 'I'm not finding any "
+                "available dates in the next couple of weeks. I can take a note with your "
+                "preferred date and have someone reach out, or you can try a specific "
+                "date range — what would you prefer?' If they give a preferred date, "
+                "use add_note to record it. If the OFFICE HOURS section says the office "
+                "is closed, the callback option is the only sensible path — say so plainly. "
+                "If office is open, the caller may also ask for a transfer; only then "
+                "offer transferCall."
+            ),
+        }, indent=2)
 
     # Weather enrichment for outdoor projects
     weather_dates = None

@@ -371,6 +371,28 @@ class TestGetAvailableDates:
         data = json.loads(result)
         assert data["not_schedulable"] is True
 
+    async def test_no_dates_returns_structured_response_with_transfer_guidance(
+        self, mock_httpx_client, mock_httpx_response,
+    ):
+        """Empty dates after retry returns a structured 'no_dates_available' response
+        that explicitly tells the LLM not to offer transfer if office closed.
+
+        Bug observed in prod: with no dates returned, the LLM offered transfer,
+        caller said okay, then bot said 'office is currently closed' — broken flow.
+        Fix: tool response now includes explicit guidance and a note path.
+        """
+        empty = mock_httpx_response(200, {"dates": [], "request_id": 0})
+        empty2 = mock_httpx_response(200, {"dates": [], "request_id": 0})
+        with mock_httpx_client(responses=[empty, empty2]):
+            result = await get_available_dates("10199001")
+        data = json.loads(result)
+        assert data["no_dates_available"] is True
+        assert data["available_dates"] == []
+        msg = data["message"]
+        assert "DO NOT offer to transfer" in msg
+        assert "add_note" in msg
+        assert "callback" in msg.lower() or "reach out" in msg.lower()
+
 
     async def test_dates_response_never_includes_time_slots(self, mock_httpx_client, mock_httpx_response):
         """Dates response must NEVER include time slots — forces get_time_slots call."""

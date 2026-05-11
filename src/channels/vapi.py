@@ -395,12 +395,20 @@ def _build_office_hours_context(office_hours: list[dict], timezone: str) -> dict
         if info["next_open"]:
             parts.append(f"Next open: {next_open}.")
         parts.append(
-            "IMPORTANT: The 'office is closed' message applies ONLY when the caller "
-            "asks to speak to someone, transfer to a person, or talk to an agent. "
-            f"In that case say: 'Our office is currently closed. We're open again {next_open}. "
-            "Is there anything else I can help you with?' and do NOT attempt the transfer. "
-            "NEVER mention office hours for scheduling, rescheduling, cancelling, notes, "
-            "or any other action — those work 24/7 regardless of office hours."
+            "CRITICAL — TRANSFERS DURING CLOSED HOURS: NEVER offer or initiate a "
+            "transfer when the office is closed. This applies to EVERY transfer "
+            "scenario, including: caller asks for a person; project is blocked / "
+            "in-progress / on-hold; no available dates found; tool returned an "
+            "error; complaint about a missed appointment; address-update needed; "
+            "ANY other scenario where you would normally suggest transferring. "
+            f"INSTEAD say UPFRONT: 'Our office is currently closed. We're open "
+            f"again {next_open}. I can take a note for the team to call you back "
+            "then — would that help, or is there anything else I can do here?' "
+            "If they want a callback, use add_note to record what they need. "
+            "NEVER ask 'would you like me to transfer you?' followed by "
+            "'office is closed' — say office is closed FIRST. "
+            "NOTE: office hours do NOT apply to scheduling, rescheduling, "
+            "cancelling, listing projects, or notes — those work 24/7."
         )
         snippet = " ".join(parts)
 
