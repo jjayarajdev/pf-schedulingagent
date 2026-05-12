@@ -54,3 +54,6 @@ temp/
 docs/
 planning/
 reference/
+
+# === Local-only Vapi analysis tooling + outputs ===
+vapi/
