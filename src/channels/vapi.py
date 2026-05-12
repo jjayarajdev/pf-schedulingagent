@@ -565,6 +565,41 @@ def _normalize_e164(phone: str) -> str:
     return f"+{digits}"
 
 
+def _tool_wait_messages(start_msg: str = "One moment, let me check that for you.") -> list[dict]:
+    """Standard Vapi tool messages that keep the silence timer alive.
+
+    Vapi plays ``request-response-delayed`` at the specified timing if the tool
+    hasn't returned yet, which resets the call-level silence-timeout countdown.
+    PF scheduling endpoints regularly take 12-58s; without these the call dies
+    in silence the moment a slow tool kicks off.
+    """
+    return [
+        {"type": "request-start", "content": start_msg},
+        {
+            "type": "request-response-delayed",
+            "content": "Still working on that, just a few more seconds.",
+            "timingMilliseconds": 10000,
+        },
+        {
+            "type": "request-response-delayed",
+            "content": "Almost there, thanks for your patience.",
+            "timingMilliseconds": 22000,
+        },
+        {
+            "type": "request-response-delayed",
+            "content": "Just a bit longer, I'm pulling everything up.",
+            "timingMilliseconds": 35000,
+        },
+        {
+            "type": "request-failed",
+            "content": (
+                "I'm having trouble with that right now. "
+                "Let me get you to someone on our team who can help."
+            ),
+        },
+    ]
+
+
 def _transfer_call_tool(support_number: str, client_name: str = "ProjectsForce") -> list[dict]:
     """Build a Vapi ``transferCall`` tool using blind transfer (SIP REFER).
 
@@ -771,6 +806,7 @@ def _build_assistant_config(
             "tools": [
                 {
                     "type": "function",
+                    "messages": _tool_wait_messages(),
                     "function": {
                         "name": "ask_scheduling_bot",
                         "description": (
@@ -823,7 +859,7 @@ def _build_assistant_config(
             f"Hello, this is J from {_speech_name(name)}. I'm calling about your "
             "home improvement project. Please call us back at your earliest convenience."
         ),
-        "silenceTimeoutSeconds": 30,
+        "silenceTimeoutSeconds": 45,
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -909,7 +945,7 @@ def _build_custom_llm_assistant_config(
             f"Hello, this is J from {_speech_name(name)}. I'm calling about your "
             "home improvement project. Please call us back at your earliest convenience."
         ),
-        "silenceTimeoutSeconds": 30,
+        "silenceTimeoutSeconds": 45,
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -1145,6 +1181,7 @@ def _outbound_scheduling_tools(
     tools: list[dict] = [
         {
             "type": "function",
+            "messages": _tool_wait_messages("Let me check available times for that date."),
             "function": {
                 "name": "get_time_slots",
                 "description": (
@@ -1165,6 +1202,7 @@ def _outbound_scheduling_tools(
         },
         {
             "type": "function",
+            "messages": _tool_wait_messages("Booking that for you now."),
             "function": {
                 "name": "confirm_appointment",
                 "description": (
@@ -1189,6 +1227,7 @@ def _outbound_scheduling_tools(
         },
         {
             "type": "function",
+            "messages": _tool_wait_messages("Saving that note for you."),
             "function": {
                 "name": "add_note",
                 "description": (
@@ -1218,6 +1257,7 @@ def _outbound_scheduling_tools(
     if not has_dates:
         tools.append({
             "type": "function",
+            "messages": _tool_wait_messages("Let me pull up available dates."),
             "function": {
                 "name": "get_available_dates",
                 "description": "Fetch available scheduling dates with weather information.",
@@ -1232,6 +1272,7 @@ def _outbound_scheduling_tools(
     if not has_address:
         tools.append({
             "type": "function",
+            "messages": _tool_wait_messages("Let me pull up that address."),
             "function": {
                 "name": "get_installation_address",
                 "description": (
@@ -1525,7 +1566,7 @@ def _build_outbound_scheduling_config(
             "voicemailDetectionTypes": ["machine_end_beep"],
         },
         "voicemailMessage": voicemail_msg,
-        "silenceTimeoutSeconds": 30,
+        "silenceTimeoutSeconds": 45,
         "maxDurationSeconds": 300,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {
@@ -1787,6 +1828,9 @@ def _build_store_assistant_config(
             "tools": [
                 {
                     "type": "function",
+                    "messages": _tool_wait_messages(
+                        "Let me look that up for you."
+                    ),
                     "function": {
                         "name": "ask_store_bot",
                         "description": (
