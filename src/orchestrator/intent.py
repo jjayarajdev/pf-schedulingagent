@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -303,4 +304,33 @@ async def classify_intent(
         )
 
 
-__all__ = ["IntentLabel", "IntentResult", "classify_intent"]
+# ── Per-request intent context (read by tool handlers) ────────────────────
+
+
+_intent_cvar: ContextVar[IntentResult | None] = ContextVar(
+    "intent_result", default=None
+)
+
+
+class IntentContext:
+    """Per-request intent classification result.
+
+    The webhook handler calls ``IntentContext.set(result)`` after classifying
+    the user's utterance; tool handlers read via ``IntentContext.get()`` to
+    gate irreversible writes (e.g. ``confirm_appointment``).
+    """
+
+    @staticmethod
+    def set(result: IntentResult | None) -> None:
+        _intent_cvar.set(result)
+
+    @staticmethod
+    def get() -> IntentResult | None:
+        return _intent_cvar.get()
+
+    @staticmethod
+    def clear() -> None:
+        _intent_cvar.set(None)
+
+
+__all__ = ["IntentContext", "IntentLabel", "IntentResult", "classify_intent"]

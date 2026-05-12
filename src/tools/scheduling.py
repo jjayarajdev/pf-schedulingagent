@@ -1274,6 +1274,33 @@ async def get_time_slots(project_id: str, date: str) -> str:
 
 async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -> str:
     """Schedule an appointment. Only call AFTER the customer has confirmed."""
+    # ── Intent guard ─────────────────────────────────────────────────────
+    # Refuse to submit a booking when the Sonnet intent classifier reports
+    # ambiguous confirmation or a conflict with a constraint the customer
+    # stated earlier in the conversation. The agent must do an explicit
+    # read-back ("To confirm — book X at Y?") and receive an unambiguous
+    # "yes" before the PF write is permitted.
+    from orchestrator.intent import IntentContext  # local import (avoid cycles)
+
+    intent = IntentContext.get()
+    if intent is not None:
+        if not intent.authorizes_booking():
+            logger.warning(
+                "confirm_appointment blocked by intent guard: intent=%s "
+                "conf=%.2f conflict=%s — returning read-back",
+                intent.intent, intent.confidence, intent.conflicts_with_prior,
+            )
+            conflict_note = (
+                " I want to make sure this works — you mentioned a constraint "
+                "earlier that this time may not satisfy."
+                if intent.conflicts_with_prior else ""
+            )
+            return (
+                f"Before I book this — to confirm, you want me to schedule "
+                f"{date} at {time}?{conflict_note} Please say 'yes, book it' "
+                "to confirm, or 'no' if you'd like a different time."
+            )
+
     _confirm_called_in_request.set(True)
     # Guard against duplicate confirm calls in the same request — the LLM
     # sometimes calls confirm_appointment twice in a single tool-use loop.
@@ -1594,6 +1621,24 @@ async def cancel_appointment(project_id: str, reason: str = "") -> str:
         reason: The cancellation reason (required by business rules).
             If provided, a cancellation note is automatically saved.
     """
+    # ── Intent guard ─────────────────────────────────────────────────────
+    # Refuse cancellation on ambiguous affirm. The customer must explicitly
+    # ask to cancel (intent in {cancel_request, explicit_booking_confirmation
+    # following a cancel read-back}).
+    from orchestrator.intent import IntentContext  # local import (avoid cycles)
+
+    intent = IntentContext.get()
+    if intent is not None:
+        if not intent.authorizes_write():
+            logger.warning(
+                "cancel_appointment blocked by intent guard: intent=%s conf=%.2f",
+                intent.intent, intent.confidence,
+            )
+            return (
+                "Before I cancel — to confirm, you want me to cancel your appointment? "
+                "Please say 'yes, cancel it' to confirm, or 'no' to keep it."
+            )
+
     _cancel_called_in_request.set(True)
     cached = _cancel_success_result.get()
     if cached:

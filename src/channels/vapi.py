@@ -46,6 +46,7 @@ from channels.vapi_config import get_assistant_info, get_phone_for_assistant
 from config import get_secrets, get_settings
 from observability.logging import RequestContext
 from orchestrator import get_orchestrator
+from orchestrator.intent import IntentContext, classify_intent
 from orchestrator.response_utils import extract_response_text
 from tools.pii_filter import scrub_pii
 from tools.scheduling import add_note as sched_add_note
@@ -147,6 +148,25 @@ _call_project_pin: dict[str, str] = {}
 # Outbound call tool sequence tracker: call_id → set of tools called.
 # Used to enforce that address is confirmed before booking on outbound calls.
 _outbound_tools_called: dict[str, set[str]] = {}
+
+# Rolling per-call utterance history for intent classification.
+# Stored as list of {role: 'user'|'assistant', text: str}.  Only last 8 turns
+# are retained — anything older is irrelevant for classifying the current turn.
+_call_history: dict[str, list[dict]] = {}
+
+
+def _append_history(call_id: str, role: str, text: str) -> None:
+    if not call_id or not text:
+        return
+    buf = _call_history.setdefault(call_id, [])
+    buf.append({"role": role, "text": text})
+    # Keep only the most recent 8 turns
+    if len(buf) > 8:
+        del buf[: len(buf) - 8]
+
+
+def _drop_history(call_id: str) -> None:
+    _call_history.pop(call_id, None)
 
 
 def get_call_auth(call_id: str) -> dict | None:
@@ -2234,6 +2254,7 @@ async def _handle_server_event(body: dict) -> dict:
         _call_auth_cache.pop(call_id, None)
         _call_project_pin.pop(call_id, None)
         _outbound_tools_called.pop(call_id, None)
+        _drop_history(call_id)
     elif event_type == "status-update":
         status = message.get("status", "unknown")
         logger.info("Vapi status-update: call_id=%s status=%s", call_id, status)
@@ -2261,6 +2282,28 @@ async def _process_tool(
             logger.warning("Empty question in %s (call_id=%s)", tool_name, call_id)
             return _build_tool_result(_FALLBACK_MESSAGE, tool_call_id)
 
+        # ── Intent classification ────────────────────────────────────────
+        # Classify the customer's utterance with Bedrock Sonnet BEFORE the
+        # orchestrator routes to the scheduling agent. Result is stored in
+        # IntentContext so write-tool handlers (confirm_appointment, etc.)
+        # can refuse to act on ambiguous confirmations or on responses that
+        # conflict with constraints the customer stated earlier.
+        raw_utterance = question
+        history = list(_call_history.get(call_id, []))
+        intent_result = await classify_intent(raw_utterance, history)
+        IntentContext.set(intent_result)
+        logger.info(
+            "Intent classified: call_id=%s intent=%s conf=%.2f conflict=%s "
+            "constraints=%s elapsed_ms=%d",
+            call_id,
+            intent_result.intent,
+            intent_result.confidence,
+            intent_result.conflicts_with_prior,
+            intent_result.constraints,
+            intent_result.elapsed_ms,
+        )
+        _append_history(call_id, "user", raw_utterance)
+
         # Inject pinned project context so our Claude agent stays on track.
         # Once a project is identified in a call, every subsequent question
         # includes it — preventing GPT/Claude from drifting to another project.
@@ -2282,6 +2325,16 @@ async def _process_tool(
                     f"Only switch if they explicitly mention a different project "
                     f"by name or number.]\n{question}"
                 )
+
+        # Inject intent context so the scheduling agent can reason about it.
+        intent_snippet = intent_result.to_context_snippet()
+        if intent_snippet:
+            question = (
+                "[INTENT_CLASSIFIER_OUTPUT]\n"
+                f"{intent_snippet}\n"
+                "[/INTENT_CLASSIFIER_OUTPUT]\n"
+                f"{question}"
+            )
 
         logger.info(
             "Vapi ask_scheduling_bot question: call_id=%s q=%s",
@@ -2486,6 +2539,11 @@ async def _process_tool(
         )
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
+        # Persist the bot's response to per-call history (truncated) so the
+        # next intent classification has context about what the bot just said.
+        _append_history(call_id, "assistant", voice_text)
+        # Clear per-request intent state.
+        IntentContext.clear()
         return _build_tool_result(voice_text, tool_call_id)
 
     if tool_name == "ask_store_bot":
