@@ -1,0 +1,114 @@
+{
+  "_note": "Hand-predicted Sonnet 4 output for the Eloise conversation. Treat as the expected/golden output for regression testing once Bedrock IAM is available. Each prediction follows the classifier prompt rules in src/orchestrator/intent.py.",
+  "_model_id_target": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+  "predictions": [
+    {
+      "turn": 1,
+      "utterance": "I have to cancel today's appointment because my son has to go to work by 2 o'clock. He said he would only be home in the morning. We thought they understood that. And he has to be to work for 12. So we have to cancel today. Can you do that?",
+      "expected": {
+        "intent": "cancel_request",
+        "confidence": 0.95,
+        "constraints": ["son needs to be at work by 12 PM", "son only available in mornings"],
+        "explicit_words": [],
+        "conflicts_with_prior": false,
+        "reasoning": "Customer explicitly asks to cancel today's appointment and states a time constraint (son must be at work by 12 PM)."
+      }
+    },
+    {
+      "turn": 2,
+      "utterance": "He said Thursday, it would like, only at 10 o'clock in the morning if you had something like that.",
+      "expected": {
+        "intent": "reschedule_request",
+        "confidence": 0.85,
+        "constraints": ["Thursday only", "10 AM only"],
+        "explicit_words": [],
+        "conflicts_with_prior": false,
+        "reasoning": "Customer is requesting a reschedule and stating both day and time constraints for the new slot."
+      }
+    },
+    {
+      "turn": 3,
+      "utterance": "Yeah.",
+      "expected": {
+        "intent": "ambiguous_affirm",
+        "confidence": 0.85,
+        "constraints": [],
+        "explicit_words": ["yeah"],
+        "conflicts_with_prior": true,
+        "reasoning": "Single 'yeah' after bot offered a slot (12 PM May 14) that directly violates the customer's stated constraint (son at work by 12 PM). Per rules, 'yeah' alone is never explicit booking confirmation; flagging conflict with prior constraint."
+      }
+    },
+    {
+      "turn": 4,
+      "utterance": "Yep.",
+      "expected": {
+        "intent": "ambiguous_affirm",
+        "confidence": 0.85,
+        "constraints": [],
+        "explicit_words": ["yep"],
+        "conflicts_with_prior": true,
+        "reasoning": "'Yep' is ambiguous affirmation. Bot's last full offer remains 12 PM May 14 which conflicts with the customer's earlier 'by 12 PM' constraint."
+      }
+    },
+    {
+      "turn": 5,
+      "utterance": "To call you back I I can't be on the I'm at work. I'll",
+      "expected": {
+        "intent": "unclear",
+        "confidence": 0.55,
+        "constraints": ["customer cannot stay on the call - is at work"],
+        "explicit_words": [],
+        "conflicts_with_prior": false,
+        "reasoning": "Disfluent fragment about needing a callback and being at work. Not a clear intent, but extracts a meta-constraint about call duration."
+      }
+    },
+    {
+      "turn": 6,
+      "utterance": "day.",
+      "expected": {
+        "intent": "unclear",
+        "confidence": 0.20,
+        "constraints": [],
+        "explicit_words": [],
+        "conflicts_with_prior": false,
+        "reasoning": "Single word fragment, possibly partial continuation of prior utterance. Not classifiable on its own."
+      }
+    },
+    {
+      "turn": 7,
+      "utterance": "No. You",
+      "expected": {
+        "intent": "explicit_decline",
+        "confidence": 0.80,
+        "constraints": [],
+        "explicit_words": ["no"],
+        "conflicts_with_prior": false,
+        "reasoning": "Customer says 'No' followed by interrupted continuation. Clear decline of whatever the bot was proposing."
+      }
+    },
+    {
+      "turn": 8,
+      "utterance": "No.",
+      "expected": {
+        "intent": "explicit_decline",
+        "confidence": 0.90,
+        "constraints": [],
+        "explicit_words": ["no"],
+        "conflicts_with_prior": true,
+        "reasoning": "Customer says 'No' immediately after bot announced submission of 12 PM appointment that violates the stated 'before 12 PM' constraint."
+      }
+    },
+    {
+      "turn": 9,
+      "utterance": "No.",
+      "expected": {
+        "intent": "frustrated_decline",
+        "confidence": 0.90,
+        "constraints": [],
+        "explicit_words": ["no"],
+        "conflicts_with_prior": true,
+        "reasoning": "Second 'No' in rapid succession after the just-submitted booking. Repetition of 'No' twice within ~2 seconds is a frustration marker per rules."
+      }
+    }
+  ]
+}
