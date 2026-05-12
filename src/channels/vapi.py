@@ -154,6 +154,11 @@ _outbound_tools_called: dict[str, set[str]] = {}
 # are retained — anything older is irrelevant for classifying the current turn.
 _call_history: dict[str, list[dict]] = {}
 
+# Per-call intent log for the end-of-call summary section.  Each entry is a
+# slim record of one classification result.  Accumulated across all turns;
+# flushed when the call ends.
+_call_intents: dict[str, list[dict]] = {}
+
 
 def _append_history(call_id: str, role: str, text: str) -> None:
     if not call_id or not text:
@@ -167,6 +172,61 @@ def _append_history(call_id: str, role: str, text: str) -> None:
 
 def _drop_history(call_id: str) -> None:
     _call_history.pop(call_id, None)
+    _call_intents.pop(call_id, None)
+
+
+def _record_intent_for_summary(call_id: str, intent) -> None:
+    """Append a slim intent record for the end-of-call summary."""
+    if not call_id or intent is None:
+        return
+    _call_intents.setdefault(call_id, []).append({
+        "utterance": (intent.raw_text or "")[:120],
+        "intent": intent.intent,
+        "confidence": round(intent.confidence, 2),
+        "constraints": intent.constraints[:],
+        "conflict": intent.conflicts_with_prior,
+        "elapsed_ms": intent.elapsed_ms,
+    })
+
+
+def _build_intent_summary_section(call_id: str) -> str:
+    """Format the per-call intent log as a note section.
+
+    Returned text is meant to be appended to the call summary posted to PF.
+    Empty string if no intents were recorded.
+    """
+    log = _call_intents.get(call_id) or []
+    if not log:
+        return ""
+    lines = ["", "AI INTENT TIMELINE (classifier=Sonnet 4):"]
+    for i, e in enumerate(log, 1):
+        marker = ""
+        if e["conflict"]:
+            marker = " [CONFLICT WITH PRIOR CONSTRAINT]"
+        if e["intent"] in ("ambiguous_affirm", "explicit_decline", "frustrated_decline"):
+            marker += " [WRITE BLOCKED]"
+        constraint_note = (
+            f"  constraints: {e['constraints']}" if e["constraints"] else ""
+        )
+        utter = (e["utterance"] or "").replace("\n", " ")
+        lines.append(
+            f"  {i}. {e['intent']} ({e['confidence']:.2f}){marker} — "
+            f"\"{utter}\"{constraint_note}"
+        )
+    # Aggregate counts
+    from collections import Counter
+
+    counts = Counter(e["intent"] for e in log)
+    blocked = sum(
+        1 for e in log
+        if e["intent"] in ("ambiguous_affirm", "explicit_decline", "frustrated_decline")
+    )
+    conflicts = sum(1 for e in log if e["conflict"])
+    lines.append(
+        f"  -- totals: {dict(counts)} ; write-blocks={blocked} ; "
+        f"constraint-conflicts={conflicts}"
+    )
+    return "\n".join(lines)
 
 
 def get_call_auth(call_id: str) -> dict | None:
@@ -2043,6 +2103,19 @@ async def _handle_server_event(body: dict) -> dict:
             summary[:200] if summary else "",
         )
 
+        # Append the per-call intent timeline to the summary so the office
+        # sees what the classifier detected, which actions were blocked,
+        # and which constraints the customer stated.
+        intent_section = _build_intent_summary_section(call_id)
+        if intent_section:
+            summary = (summary or "").rstrip() + intent_section
+            logger.info(
+                "Intent timeline appended to summary (call_id=%s, "
+                "turns=%d)",
+                call_id,
+                len(_call_intents.get(call_id, [])),
+            )
+
         # ── Outbound call end-of-call handling ──────────────────────
         outbound = get_active_call(call_id)
         # DynamoDB fallback for multi-instance
@@ -2542,6 +2615,9 @@ async def _process_tool(
         # Persist the bot's response to per-call history (truncated) so the
         # next intent classification has context about what the bot just said.
         _append_history(call_id, "assistant", voice_text)
+        # Record the classification for the end-of-call summary.
+        if IntentContext.get() is not None:
+            _record_intent_for_summary(call_id, IntentContext.get())
         # Clear per-request intent state.
         IntentContext.clear()
         return _build_tool_result(voice_text, tool_call_id)
@@ -2649,6 +2725,27 @@ async def _handle_store_bot(
         tenant_phone=normalize_phone(store_session.get("to_phone", "")),
     )
 
+    # ── Intent classification (store flow) ───────────────────────────────
+    # Same Sonnet classifier as the customer flow. Store callers can still
+    # trigger write actions (add_note in particular), and ambiguous responses
+    # to bot offers should be treated with the same caution.
+    if question:
+        raw_utterance = question
+        history = list(_call_history.get(call_id, []))
+        intent_result = await classify_intent(raw_utterance, history)
+        IntentContext.set(intent_result)
+        logger.info(
+            "Intent classified (store): call_id=%s intent=%s conf=%.2f "
+            "conflict=%s constraints=%s elapsed_ms=%d",
+            call_id,
+            intent_result.intent,
+            intent_result.confidence,
+            intent_result.conflicts_with_prior,
+            intent_result.constraints,
+            intent_result.elapsed_ms,
+        )
+        _append_history(call_id, "user", raw_utterance)
+
     # Step 3: Route through orchestrator with store context
     # On first call after auth, override question to list projects —
     # the caller's original question was "PO is 74356" which the scheduling
@@ -2675,6 +2772,18 @@ async def _handle_store_bot(
             "[STORE CALLER — status, technician names, and notes only. No scheduling, no customer PII] "
             + question
         )
+
+    # Inject intent context if classification ran (skip on auth-only turn)
+    intent_for_store = IntentContext.get()
+    if intent_for_store is not None:
+        snippet = intent_for_store.to_context_snippet()
+        if snippet:
+            store_question = (
+                "[INTENT_CLASSIFIER_OUTPUT]\n"
+                f"{snippet}\n"
+                "[/INTENT_CLASSIFIER_OUTPUT]\n"
+                f"{store_question}"
+            )
     agent_name = ""
     start_time = time.monotonic()
     try:
@@ -2712,6 +2821,12 @@ async def _handle_store_bot(
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    # Persist bot's response to per-call history + record intent for the
+    # end-of-call summary, then clear the per-request intent context.
+    _append_history(call_id, "assistant", voice_text)
+    if IntentContext.get() is not None:
+        _record_intent_for_summary(call_id, IntentContext.get())
+    IntentContext.clear()
     return _build_tool_result(voice_text, tool_call_id)
 
 
