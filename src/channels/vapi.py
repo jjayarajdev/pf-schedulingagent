@@ -568,6 +568,13 @@ async def _handle_assistant_request(body: dict) -> dict:
     support_number = tenant_support_number  # Pre-populated from vapi-assistants table
     office_hours: list[dict] = []
     tenant_timezone = "US/Eastern"
+    # PF caller-identity (2026-05-13 API change). When PF recognizes the
+    # inbound number as a registered retailer, it returns the store info
+    # on the failure response — we pass it into the store-flow system
+    # prompt so GPT-5.2 can skip the "are you a retailer?" handshake.
+    store_name = ""
+    store_number = ""
+    store_id = ""
     if from_phone:
         try:
             creds = await get_or_authenticate(from_phone, to_phone)
@@ -590,6 +597,25 @@ async def _handle_assistant_request(body: dict) -> dict:
                 office_hours = exc.office_hours
             if exc.timezone:
                 tenant_timezone = exc.timezone
+            # Capture PF's retailer identification (caller_type=="store").
+            # Defensive: skip the common QA placeholder "Test Store"
+            # because PF returns it as a fallback for unknown numbers.
+            if exc.caller_type == "store" and exc.store_name:
+                if exc.store_name.strip().lower() not in ("test store", "default", ""):
+                    store_name = exc.store_name
+                    store_number = exc.store_number
+                    store_id = exc.store_id
+                    logger.info(
+                        "Vapi store-identified: call_id=%s store_name=%s "
+                        "store_number=%s store_id=%s",
+                        call_id, store_name, store_number, store_id,
+                    )
+                else:
+                    logger.info(
+                        "Vapi store-identification skipped (fallback name '%s'): "
+                        "call_id=%s",
+                        exc.store_name, call_id,
+                    )
         except Exception:
             logger.exception("Phone auth failed during assistant-request (call_id=%s)", call_id)
 
@@ -603,11 +629,27 @@ async def _handle_assistant_request(body: dict) -> dict:
                 "call_id=%s client=%s to_phone=***%s",
                 call_id, client_name, to_phone[-4:] if to_phone else "none",
             )
-        _store_sessions[session_key] = {"to_phone": to_phone, "authenticated": False, "support_number": support_number}
+        _store_sessions[session_key] = {
+            "to_phone": to_phone,
+            "authenticated": False,
+            "support_number": support_number,
+            # Carry pre-identified retailer info so the tool handler can
+            # use it on first turn (and we can log it in the end-of-call
+            # summary if useful).
+            "store_name": store_name,
+            "store_number": store_number,
+            "store_id": store_id,
+        }
         greeting = _generate_store_greeting(client_name)
-        logger.info("Vapi unknown caller greeting: call_id=%s client=%s office_open=%s has_transfer=%s", call_id, client_name, hours_context.get("is_open"), bool(support_number))
+        logger.info(
+            "Vapi unknown caller greeting: call_id=%s client=%s office_open=%s "
+            "has_transfer=%s store_known=%s",
+            call_id, client_name, hours_context.get("is_open"),
+            bool(support_number), bool(store_name),
+        )
         return {"assistant": _build_store_assistant_config(
             greeting, webhook_secret, client_name, support_number, hours_context,
+            store_name=store_name, store_number=store_number,
         )}
 
     # Cache auth creds for Custom LLM endpoint (keyed by call_id)
@@ -1788,6 +1830,8 @@ def _build_store_assistant_config(
     client_name: str = "ProjectsForce",
     support_number: str = "",
     hours_context: dict | None = None,
+    store_name: str = "",
+    store_number: str = "",
 ) -> dict:
     """Build the Vapi assistant config for unknown callers.
 
@@ -1798,12 +1842,20 @@ def _build_store_assistant_config(
     4. Customer (unrecognized number) — offer to transfer to office
     5. Non-project call — transfer to office
 
+    When ``store_name``/``store_number`` are provided, PF has already
+    identified the inbound number as a registered retailer via the
+    phone-call-login API.  In that case we inject the identity into the
+    system prompt so GPT-5.2 can skip the "Are you calling from a
+    retailer?" qualification step and jump straight to the PO/project
+    lookup.
+
     Uses ``ask_store_bot`` tool for retailer queries and ``transferCall``
     for office transfers when a support number is available.
     """
     name = client_name or "ProjectsForce"
     speech_name = _speech_name(name)
     has_transfer = bool(support_number)
+    is_known_retailer = bool(store_name)
     server_config: dict = {
         "url": _get_webhook_url(),
         "timeoutSeconds": 60,
@@ -1831,12 +1883,32 @@ def _build_store_assistant_config(
             "Then end the call gracefully."
         )
 
+    # PF identified the inbound number as a registered retailer.  Inject
+    # the store identity at the very top of the prompt so GPT-5.2 can
+    # skip the "Are you calling from a retailer?" handshake and treat the
+    # caller as a known store immediately.
+    if is_known_retailer:
+        retailer_preamble = (
+            f"⚠️ CALLER IDENTITY (already established by phone-number lookup):\n"
+            f"This caller is calling from {store_name}"
+            + (f" (store #{store_number})" if store_number else "")
+            + ". PF has identified them as a KNOWN RETAILER via their phone number. "
+            "You do NOT need to ask 'Are you calling from a retailer?' or "
+            "'Are you the customer?' — that is already settled. "
+            "Skip step 2 of the qualification flow and go directly to step 3 "
+            "(ask for a project number or PO number).\n\n"
+        )
+    else:
+        retailer_preamble = ""
+
     system_prompt = (
-        f"You are J, a friendly phone assistant for {speech_name} "
+        retailer_preamble
+        + f"You are J, a friendly phone assistant for {speech_name} "
         "— a home improvement scheduling service.\n\n"
-        "You do NOT know who this caller is. Do NOT assume they are a "
-        "retailer or a customer. You must qualify them first.\n\n"
-        "## QUALIFICATION FLOW\n"
+        + ("" if is_known_retailer else
+           "You do NOT know who this caller is. Do NOT assume they are a "
+           "retailer or a customer. You must qualify them first.\n\n")
+        + "## QUALIFICATION FLOW\n"
         "1. You already greeted them. Wait for them to state their need.\n"
         "2. Determine if they are a RETAILER or CUSTOMER:\n"
         "   - RETAILER: anyone calling from a company or business — "

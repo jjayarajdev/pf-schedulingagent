@@ -30,7 +30,14 @@ MAX_CACHE_SECONDS = 900  # 15 minutes
 
 
 class AuthenticationError(Exception):
-    """Raised when phone authentication fails."""
+    """Raised when phone authentication fails.
+
+    May carry caller-identification fields populated from the PF
+    ``phone-call-login`` failure response.  As of 2026-05-13 PF now
+    returns ``caller_type`` and a ``store`` object on failures where the
+    inbound number maps to a registered retailer — we surface those so the
+    Vapi assistant config can personalize the store-flow prompt.
+    """
 
     def __init__(
         self,
@@ -41,6 +48,10 @@ class AuthenticationError(Exception):
         support_number: str = "",
         office_hours: list | None = None,
         timezone: str = "",
+        caller_type: str = "",
+        store_id: str = "",
+        store_name: str = "",
+        store_number: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -49,6 +60,11 @@ class AuthenticationError(Exception):
         self.support_number = support_number
         self.office_hours = office_hours or []
         self.timezone = timezone
+        # PF's new caller-identity fields (2026-05-13 API change)
+        self.caller_type = caller_type    # "user" | "store" | ""
+        self.store_id = store_id          # numeric ID as str
+        self.store_name = store_name      # e.g. "Lowe's - Wallingford"
+        self.store_number = store_number  # retailer's internal store # as str
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -460,9 +476,28 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
 
         data = resp.json()
 
-        if "accesstoken" not in data:
+        # PF API change (2026-05-13): explicit `auth_status` + `caller_type`.
+        # Old contract: presence of `accesstoken` meant success.
+        # New contract: `auth_status == "success"` AND `accesstoken` present.
+        # Treat both as authoritative; if either fails we go down the
+        # AuthenticationError path with whatever caller-identity PF returned.
+        auth_status = (data.get("auth_status") or "").lower()
+        is_success = auth_status == "success" and "accesstoken" in data
+        is_failure = (auth_status == "failed") or "accesstoken" not in data
+
+        if is_failure and not is_success:
             error_msg = data.get("message", "No access token in response")
-            logger.info("Phone auth: no token (non-customer) for ***%s", phone[-4:])
+            store_info = data.get("store") or {}
+            caller_type = data.get("caller_type", "") or ""
+            store_id = str(store_info.get("store_id", "") or "")
+            store_name = str(store_info.get("store_name", "") or "")
+            store_number = str(store_info.get("store_number", "") or "")
+            logger.info(
+                "Phone auth: no token (non-customer) for ***%s "
+                "[caller_type=%s, store_name=%s, store_number=%s]",
+                phone[-4:], caller_type or "?",
+                store_name or "-", store_number or "-",
+            )
             raise AuthenticationError(
                 f"Authentication failed: {error_msg}",
                 client_id=data.get("client_id", ""),
@@ -470,6 +505,10 @@ async def _call_auth_api(phone: str, to_phone: str = "") -> dict:
                 support_number=data.get("support_number", ""),
                 office_hours=data.get("office_hours", []),
                 timezone=data.get("timezone", ""),
+                caller_type=caller_type,
+                store_id=store_id,
+                store_name=store_name,
+                store_number=store_number,
             )
 
         user = data.get("user", {})
