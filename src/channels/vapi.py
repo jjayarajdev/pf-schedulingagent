@@ -190,43 +190,65 @@ def _record_intent_for_summary(call_id: str, intent) -> None:
     })
 
 
-def _build_intent_summary_section(call_id: str) -> str:
-    """Format the per-call intent log as a note section.
+_NOTEWORTHY_INTENTS = {
+    "ambiguous_affirm",
+    "explicit_decline",
+    "frustrated_decline",
+}
 
-    Returned text is meant to be appended to the call summary posted to PF.
-    Empty string if no intents were recorded.
+
+def _build_intent_summary_section(call_id: str) -> str:
+    """Format the per-call intent log as a human-readable note section.
+
+    Office staff read these notes in PF 360. They don't speak Python
+    dict syntax — so the previous engineering-grade output was hidden
+    noise. New rule: **return empty string on clean calls**, and only
+    surface a short bullet list when something noteworthy happened
+    (write block, constraint conflict, frustration, or stored
+    constraints worth flagging).
+
+    Returned text is appended to the call summary posted to PF.
     """
     log = _call_intents.get(call_id) or []
     if not log:
         return ""
-    lines = ["", "AI INTENT TIMELINE (classifier=Sonnet 4):"]
-    for i, e in enumerate(log, 1):
-        marker = ""
-        if e["conflict"]:
-            marker = " [CONFLICT WITH PRIOR CONSTRAINT]"
-        if e["intent"] in ("ambiguous_affirm", "explicit_decline", "frustrated_decline"):
-            marker += " [WRITE BLOCKED]"
-        constraint_note = (
-            f"  constraints: {e['constraints']}" if e["constraints"] else ""
-        )
-        utter = (e["utterance"] or "").replace("\n", " ")
-        lines.append(
-            f"  {i}. {e['intent']} ({e['confidence']:.2f}){marker} — "
-            f"\"{utter}\"{constraint_note}"
-        )
-    # Aggregate counts
-    from collections import Counter
 
-    counts = Counter(e["intent"] for e in log)
-    blocked = sum(
-        1 for e in log
-        if e["intent"] in ("ambiguous_affirm", "explicit_decline", "frustrated_decline")
-    )
+    blocked = sum(1 for e in log if e["intent"] in _NOTEWORTHY_INTENTS)
     conflicts = sum(1 for e in log if e["conflict"])
-    lines.append(
-        f"  -- totals: {dict(counts)} ; write-blocks={blocked} ; "
-        f"constraint-conflicts={conflicts}"
-    )
+    frustrations = sum(1 for e in log if e["intent"] == "frustrated_decline")
+    # Aggregate all constraints captured during the call, de-duplicated
+    # while preserving order.
+    seen = set()
+    constraints: list[str] = []
+    for e in log:
+        for c in e["constraints"]:
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            constraints.append(c)
+
+    # Clean call → emit nothing (office staff don't need to see anything).
+    # "Clean" = no blocks, no conflicts, no frustration, and no constraints worth noting.
+    if not (blocked or conflicts or frustrations or constraints):
+        return ""
+
+    lines = ["", "AI behavior on this call:"]
+    if frustrations:
+        lines.append(f"  • Caller showed frustration ({frustrations} turn{'s' if frustrations != 1 else ''})")
+    if conflicts:
+        lines.append(
+            f"  • {conflicts} time{'s' if conflicts != 1 else ''} the AI's offer conflicted "
+            "with a constraint the caller mentioned"
+        )
+    if blocked:
+        lines.append(
+            f"  • {blocked} potential action{'s' if blocked != 1 else ''} held "
+            "for confirmation (caller's reply was ambiguous or a decline)"
+        )
+    if constraints:
+        lines.append(
+            "  • Caller mentioned: " + "; ".join(f'"{c}"' for c in constraints[:5])
+        )
     return "\n".join(lines)
 
 

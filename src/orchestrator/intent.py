@@ -34,6 +34,7 @@ IntentLabel = Literal[
     "reschedule_request",
     "cancel_request",
     "info_query",
+    "identification",
     "transfer_request",
     "schedule_request",
     "unclear",
@@ -133,6 +134,16 @@ INTENT LABELS:
     Wants information, no action: "what time is my appointment",
     "when is the installer coming", "what's my project status".
 
+- identification
+    Caller is supplying identifying info the bot asked for. This is the
+    common store-flow authentication pattern: "My PO number is 556677",
+    "Project number 240367783", "Yeah, I have a PO number, it's 556677",
+    "It's project two four zero three six seven seven eight three", or
+    simply reciting digits. The caller is NOT asking a question or
+    requesting an action — they are answering a lookup prompt. Prefer
+    this label over `unclear` whenever the utterance contains a
+    project number, PO number, or a string of digits offered as ID.
+
 - transfer_request
     "Speak to a person", "talk to a human", "agent", "representative",
     "operator".
@@ -155,6 +166,9 @@ RULES:
    actually present in the utterance.
 5. NEVER classify ambiguous "yeah" as explicit_booking_confirmation, even if
    the bot just asked "should I book this?" — that's a read-back trap.
+6. When the utterance contains a clear identifier (PO number, project number,
+   string of digits given as ID, or "I have a [PO/project] number, it's X"),
+   classify as `identification`. Do NOT use `unclear` for this case.
 
 OUTPUT FORMAT — return ONLY valid JSON, no markdown, no commentary:
 
