@@ -18,6 +18,7 @@ import time
 import uuid
 from datetime import datetime
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 import boto3
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -600,7 +601,10 @@ async def _handle_assistant_request(body: dict) -> dict:
         hours_context.get("is_open"),
     )
 
-    return {"assistant": _build_assistant_config(greeting, webhook_secret, support_number, client_name, hours_context)}
+    return {"assistant": _build_assistant_config(
+        greeting, webhook_secret, support_number, client_name, hours_context,
+        tenant_timezone=tenant_timezone,
+    )}
 
 
 def _generate_dynamic_greeting(first_name: str, client_name: str) -> str:
@@ -669,6 +673,15 @@ def _tool_wait_messages(start_msg: str = "One moment, let me check that for you.
             "type": "request-response-delayed",
             "content": "Just a bit longer, I'm pulling everything up.",
             "timingMilliseconds": 35000,
+        },
+        {
+            # Final keep-alive — covers tools that take 45-58s (we saw two of
+            # these silence-timeout on 2026-05-12 prod: tool elapsed_ms=36.7s
+            # and 38.8s both died after the 35s message because no further
+            # speech reset the silence timer.
+            "type": "request-response-delayed",
+            "content": "Almost done, hang with me one more moment.",
+            "timingMilliseconds": 48000,
         },
         {
             "type": "request-failed",
@@ -754,6 +767,7 @@ def _build_assistant_config(
     support_number: str = "",
     client_name: str = "ProjectsForce",
     hours_context: dict | None = None,
+    tenant_timezone: str = "US/Eastern",
 ) -> dict:
     """Build the full Vapi assistant config returned on ``assistant-request``.
 
@@ -767,6 +781,21 @@ def _build_assistant_config(
     }
     if server_secret:
         server_config["secret"] = server_secret
+
+    # Compute today's date in the tenant's local timezone.  The ECS task runs
+    # in UTC; using naive datetime.now() can put dates a day off near
+    # midnight (e.g. UTC says May 13 while ET says May 12 — most relevant
+    # for early-evening US calls).  More important: even with a correct
+    # datetime here, prod has shown GPT-5.2 fabricating dates from training
+    # data ("today is January 8 2026" on May 12).  We mitigate by placing
+    # the date at the TOP of the system prompt and repeating the year as a
+    # guardrail.
+    try:
+        _today = datetime.now(ZoneInfo(tenant_timezone))
+    except Exception:
+        _today = datetime.now(ZoneInfo("US/Eastern"))
+    _today_str = _today.strftime("%A, %B %d, %Y")
+    _today_year = _today.year
     return {
         "name": f"{name} Scheduling Bot"[:40],
         "voice": _VOICE_CONFIG,
@@ -778,13 +807,21 @@ def _build_assistant_config(
                 {
                     "role": "system",
                     "content": (
+                        # === Date anchor — comes FIRST so GPT-5.2 cannot ignore it ===
+                        f"⛳ TODAY IS {_today_str}. THE YEAR IS {_today_year}. "
+                        f"This is a HARD FACT — do NOT contradict it. If you ever need to "
+                        f"reference today's date or compute relative dates "
+                        f"(today, tomorrow, this week, next Thursday), "
+                        f"anchor on {_today_str} ({_today_year}). NEVER guess.\n\n"
                         f"You are J, a friendly phone assistant for {_speech_name(name)} "
                         "— a home improvement scheduling service.\n\n"
-                        f"Today's date is {datetime.now().strftime('%A, %B %d, %Y')}. "
-                        f"The current year is {datetime.now().year}. "
-                        f"All dates are in {datetime.now().year}. NEVER say 2020, 2024, or 2025 "
-                        "— those years are in the past. When repeating dates from the scheduling bot, "
-                        "use the EXACT year the bot provided. Do NOT change the year.\n\n"
+                        f"DATE RULES (highest priority):\n"
+                        f"- Today is {_today_str}.\n"
+                        f"- All dates discussed are in {_today_year}.\n"
+                        f"- NEVER say 2020, 2024, or 2025 — those years are in the past.\n"
+                        f"- NEVER guess what 'today' is. It is ALWAYS {_today_str}.\n"
+                        f"- When the scheduling bot returns a date, use the EXACT year it gave. "
+                        f"Do NOT change the year.\n\n"
                         "CRITICAL RULES:\n"
                         '1. You MUST call ask_scheduling_bot for EVERY user request — no exceptions. '
                         "You cannot answer any question about projects, scheduling, dates, times, "
@@ -813,13 +850,31 @@ def _build_assistant_config(
                         "No bullet points, no markdown. "
                         "NEVER read out project numbers or IDs — they are long and unintelligible. "
                         "Instead, identify projects by their category/type and status.\n"
-                        "9. FILLER RULES: Say 'One moment please.' ONLY when the user asks a NEW question "
-                        "that requires a tool call (e.g. 'what are my projects?', 'what dates are available?'). "
-                        "Do NOT say any filler when the user is just replying to your question "
-                        "(e.g. picking a date, saying 'yes', choosing a time slot). "
-                        "NEVER say 'Hold on', 'Wait', 'Hang on', 'Just a sec', 'Give me a moment', "
-                        "'Let me check', 'Let me pull that up', or 'One second'. "
-                        "The ONLY allowed filler is 'One moment please.' — nothing else, and only once per tool call.\n"
+                        "9. FILLER RULES — STRICT (violating this is a fireable offense):\n"
+                        "   You speak ZERO acknowledgment text before invoking a tool. "
+                        "   Vapi will automatically play 'One moment, let me check that for you.' — "
+                        "   that is the ONLY 'thinking' phrase the customer should ever hear, and "
+                        "   it comes from Vapi's tool wait-message config, NOT from you.\n"
+                        "   \n"
+                        "   WHEN YOU NEED TO CALL A TOOL: emit the tool call IMMEDIATELY. "
+                        "   Do NOT say anything beforehand. No 'okay', no 'sure', no 'let me check'.\n"
+                        "   \n"
+                        "   WHEN A TOOL RETURNS: speak the result naturally. Do NOT prefix it with "
+                        "   filler like 'Got it' / 'I see' / 'Let me see' / 'Just a sec' / "
+                        "   'One moment' / 'Hold on' / 'Give me a moment' / 'Thanks for holding'.\n"
+                        "   \n"
+                        "   BANNED PHRASES (never speak ANY of these — Vapi handles waiting for you):\n"
+                        "     'Hold on', 'Hold on a sec', 'Wait', 'Hang on', "
+                        "     'Just a sec', 'Just a moment', 'Just a second',\n"
+                        "     'Give me a moment', 'Give me a sec',\n"
+                        "     'Let me check', 'Let me pull that up', 'Let me see',\n"
+                        "     'One moment', 'One second', 'One moment please',\n"
+                        "     'Sorry, a few more seconds', 'Sorry just a moment',\n"
+                        "     'Thanks for holding', 'Bear with me'.\n"
+                        "   \n"
+                        "   If a tool is taking a while, DO NOTHING and stay silent. Vapi will "
+                        "   automatically speak the configured wait-message at 10/22/35/48s. "
+                        "   Do not add your own filler — it stacks with Vapi's and confuses the customer.\n"
                         "10. If the tool call fails or times out, say: "
                         '"Let me try that again." and retry once. '
                         "NEVER say 'I'm having trouble looking that up' or fabricate an error "
