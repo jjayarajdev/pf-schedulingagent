@@ -5,12 +5,14 @@ used by the phone channel to resolve ``to_phone`` for PF authentication.
 """
 
 import logging
+from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from auth.phone_auth import delete_cached_creds
 from channels.vapi_config import delete_assistant, list_assistants, register_assistant
+from orchestrator.intent import classify_intent
 
 logger = logging.getLogger(__name__)
 
@@ -79,3 +81,27 @@ async def flush_phone_cache(phone: str):
     if not deleted:
         raise HTTPException(status_code=400, detail="Invalid phone number or delete failed")
     return {"flushed": phone}
+
+
+class ClassifyIntentRequest(BaseModel):
+    """Request body for the intent classifier diagnostic endpoint."""
+
+    utterance: str
+    history: list[dict] = []
+
+
+@router.post(
+    "/classify-intent",
+    summary="Run the intent classifier on an utterance (diagnostic)",
+)
+async def admin_classify_intent(body: ClassifyIntentRequest):
+    """Invoke ``orchestrator.intent.classify_intent`` and return the result.
+
+    Used for batch back-testing the classifier against historical transcripts.
+    The endpoint requires no auth beyond whatever the admin router enforces;
+    it does not write to any external system — pure call to Bedrock and back.
+    """
+    if not body.utterance.strip():
+        raise HTTPException(status_code=400, detail="utterance is required")
+    result = await classify_intent(body.utterance, body.history)
+    return asdict(result)
