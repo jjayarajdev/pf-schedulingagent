@@ -640,7 +640,9 @@ async def _handle_assistant_request(body: dict) -> dict:
             "store_number": store_number,
             "store_id": store_id,
         }
-        greeting = _generate_store_greeting(client_name)
+        greeting = _generate_store_greeting(
+            client_name, store_name=store_name, store_number=store_number,
+        )
         logger.info(
             "Vapi unknown caller greeting: call_id=%s client=%s office_open=%s "
             "has_transfer=%s store_known=%s",
@@ -1832,15 +1834,39 @@ def _classify_outbound_outcome(ended_reason: str, summary: str) -> dict:
     return {"status": "completed", "ended_reason": ended_reason, "summary": summary}
 
 
-def _generate_store_greeting(client_name: str = "ProjectsForce") -> str:
-    """Build a generic greeting for unknown callers.
+def _generate_store_greeting(
+    client_name: str = "ProjectsForce",
+    store_name: str = "",
+    store_number: str = "",
+) -> str:
+    """Build a greeting for store/unknown callers.
 
-    Does NOT assume the caller is a retailer — asks how we can help first,
-    then qualifies them during the conversation.
+    When PF has pre-identified the caller as a registered retailer
+    (``store_name`` supplied), the bot acknowledges the store and jumps
+    straight to the PO/project number ask — saves a turn of qualification
+    handshake (v1.4.17, requested 2026-05-14 after the QA test call
+    showed the silent prompt-only flow from v1.4.15 didn't visibly
+    surface the recognition to the caller).
+
+    When ``store_name`` is empty (PF returned no store object, or the
+    defensive filter in ``_handle_assistant_request`` rejected a
+    placeholder like "Test Store"), falls back to the generic
+    "how can I help today?" greeting — no regression for unrecognized
+    callers.
     """
     name = client_name or "ProjectsForce"
     # TTS payload must start with a real word, not <break> — see
     # _generate_dynamic_greeting for context on the ElevenLabs warm-up artifact.
+    if store_name:
+        store_phrase = store_name
+        if store_number:
+            store_phrase += f", store {store_number}"
+        return (
+            f"Hello! I'm J from {_speech_name(name)}. "
+            '<break time="0.3s" /> '
+            f"I see you're calling from {store_phrase}. "
+            "Can I have the project or PO number to get started?"
+        )
     return (
         f"Hello! I'm J from {_speech_name(name)}. "
         '<break time="0.3s" /> '
