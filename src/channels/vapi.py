@@ -860,6 +860,15 @@ def _build_assistant_config(
         _today = datetime.now(ZoneInfo("US/Eastern"))
     _today_str = _today.strftime("%A, %B %d, %Y")
     _today_year = _today.year
+
+    # v1.4.16: pre-format the support number as comma-grouped digits for
+    # TTS.  Prod 2026-05-13 (Louise): bot read 8602699040 inconsistently
+    # across 5 attempts ("1 8 6 0 2 6 9 9 0 4 0" then "1 8 6 6 9 9 0 4 0"
+    # then various truncations) until customer gave up and stopped trying
+    # to write it down.  Without an anchored spoken form, GPT-5.2
+    # improvises and drops/adds digits.  We provide the formatted version
+    # in the system prompt + an explicit "speak EXACTLY this" rule.
+    _support_spoken = _format_phone_for_speech(support_number) if support_number else ""
     return {
         "name": f"{name} Scheduling Bot"[:40],
         "voice": _VOICE_CONFIG,
@@ -886,6 +895,22 @@ def _build_assistant_config(
                         f"- NEVER guess what 'today' is. It is ALWAYS {_today_str}.\n"
                         f"- When the scheduling bot returns a date, use the EXACT year it gave. "
                         f"Do NOT change the year.\n\n"
+                        + (
+                            (
+                                "SUPPORT NUMBER RULES (read aloud-safe):\n"
+                                f"- The support number is: {support_number}\n"
+                                f"- When reading the support number aloud, "
+                                f'SAY EXACTLY: "{_support_spoken}" — speak each '
+                                f"comma as a brief pause, group by three then "
+                                f"three then four digits.\n"
+                                f"- NEVER read the number as continuous digits "
+                                f"with no pauses; never improvise; never add or "
+                                f"drop digits. If you forget the formatted form, "
+                                f"say: 'Let me transfer you instead.' and use "
+                                f"transferCall.\n\n"
+                            )
+                            if support_number else ""
+                        ) +
                         "CRITICAL RULES:\n"
                         '1. You MUST call ask_scheduling_bot for EVERY user request — no exceptions. '
                         "You cannot answer any question about projects, scheduling, dates, times, "
@@ -1856,6 +1881,10 @@ def _build_store_assistant_config(
     speech_name = _speech_name(name)
     has_transfer = bool(support_number)
     is_known_retailer = bool(store_name)
+    # v1.4.16: pre-format the support number for speech, same as the
+    # inbound config — store callers also hear the bot read this number
+    # in the closed-office and non-project fallback paths.
+    _support_spoken = _format_phone_for_speech(support_number) if support_number else ""
     server_config: dict = {
         "url": _get_webhook_url(),
         "timeoutSeconds": 60,
@@ -1901,10 +1930,25 @@ def _build_store_assistant_config(
     else:
         retailer_preamble = ""
 
+    # v1.4.16: same support-number speech rule as the inbound flow.
+    if _support_spoken:
+        support_rules = (
+            "SUPPORT NUMBER RULES (read aloud-safe):\n"
+            f"- The support number is: {support_number}\n"
+            f'- When reading the support number aloud, SAY EXACTLY: "{_support_spoken}" — '
+            "speak each comma as a brief pause, group by three then three then four digits.\n"
+            "- NEVER read the number as continuous digits with no pauses; "
+            "never improvise; never add or drop digits. If you forget the formatted form, "
+            "say: 'Let me transfer you instead.' and use transferCall.\n\n"
+        )
+    else:
+        support_rules = ""
+
     system_prompt = (
         retailer_preamble
         + f"You are J, a friendly phone assistant for {speech_name} "
         "— a home improvement scheduling service.\n\n"
+        + support_rules
         + ("" if is_known_retailer else
            "You do NOT know who this caller is. Do NOT assume they are a "
            "retailer or a customer. You must qualify them first.\n\n")
@@ -2742,6 +2786,58 @@ async def _process_tool(
                     # Retry still has fabricated slots — strip them as last resort
                     logger.warning("Vapi retry also fabricated slots — stripping them")
                     voice_text = _strip_time_slots(voice_text)
+
+                # ── v1.4.16: post-retry action-hallucination check ───
+                # Prod 2026-05-13 (Ankita): the time-slot retry succeeded
+                # at removing fabricated slots, but the retry response itself
+                # claimed "Your appointment is booked" while no confirm was
+                # ever called.  The booking-hallucination check at line 2652
+                # only runs on the FIRST response, not on retries — leaving
+                # this gap.  Now we re-check the accepted voice_text for any
+                # write-action claim that doesn't match what was actually
+                # called, and replace with a safe transfer/clarify message.
+                try:
+                    post_claimed = await _classify_claimed_actions_async(voice_text)
+                except Exception:
+                    post_claimed = set()
+                post_uncalled = set()
+                if not was_confirm_called():
+                    post_uncalled.add("confirm")
+                if not was_cancel_called():
+                    post_uncalled.add("cancel")
+                if not was_note_added():
+                    post_uncalled.add("note")
+                if not was_address_updated():
+                    post_uncalled.add("address")
+                post_pinned = get_last_project_id() or _call_project_pin.get(call_id, "")
+                post_hallucinated = post_claimed & post_uncalled
+                # Forgive actions that already succeeded earlier in this
+                # session (same forgiveness window as the primary check).
+                for action, _key in (
+                    ("confirm", "confirm"),
+                    ("cancel", "cancel"),
+                    ("address", "address_update"),
+                ):
+                    if action in post_hallucinated and (
+                        session_action_completed(session_id, _key, post_pinned)
+                        or session_has_any_completed(session_id, _key)
+                    ):
+                        post_hallucinated.discard(action)
+
+                if post_hallucinated:
+                    logger.error(
+                        "POST-RETRY HALLUCINATION — retry response still claims "
+                        "uncalled actions %s (call_id=%s). Replacing voice_text "
+                        "to avoid misleading customer.",
+                        post_hallucinated, call_id,
+                    )
+                    # Build a recovery response — admit nothing is done and
+                    # offer transfer.  Soft language: don't blame the customer.
+                    voice_text = (
+                        "I want to make sure this gets handled correctly. "
+                        "Let me connect you with someone on our team who can "
+                        "complete your request."
+                    )
         except Exception:
             logger.exception("Orchestrator error during Vapi call (call_id=%s)", call_id)
             voice_text = _FALLBACK_MESSAGE

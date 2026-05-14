@@ -1295,10 +1295,27 @@ async def confirm_appointment(project_id: str, date: str, time: str, **kwargs) -
                 "earlier that this time may not satisfy."
                 if intent.conflicts_with_prior else ""
             )
+            # v1.4.16: un-paraphraseable refusal.  Prior wording was soft
+            # ("Before I book this — to confirm...") and Sonnet/GPT-5.2
+            # sometimes rephrased it into a success announcement.  This
+            # version begins with an explicit stop signal + a VERBATIM
+            # instruction + a banned-words list, which makes paraphrasing
+            # into "booked"/"scheduled"/etc. unusable.
             return (
-                f"Before I book this — to confirm, you want me to schedule "
-                f"{date} at {time}?{conflict_note} Please say 'yes, book it' "
-                "to confirm, or 'no' if you'd like a different time."
+                "⛔ BOOKING NOT MADE. Tool refused: customer's confirmation "
+                "was unclear.\n"
+                "\n"
+                "REQUIRED VERBATIM RESPONSE to the customer (do not paraphrase, "
+                "do not add filler, do not add any success language):\n"
+                f'"Before I book this, can you confirm — should I schedule '
+                f'{date} at {time}?{conflict_note} Please say \'yes, book it\' '
+                'to confirm, or \'no\' if you\'d like a different time."\n'
+                "\n"
+                "NEVER tell the customer the appointment is booked. Banned words "
+                "in your response: 'booked', 'scheduled', 'all set', 'confirmed', "
+                "'reserved', 'on the calendar', 'submitted', 'you\\'re set', "
+                "'we have you on'. If you use ANY of those words the customer "
+                "will be misled — the appointment is NOT booked."
             )
 
     _confirm_called_in_request.set(True)
@@ -1442,6 +1459,40 @@ async def reschedule_appointment(project_id: str) -> str:
     Uses ``cancel-reschedule`` to cancel the current appointment, then the
     standard ``slotsChatbot`` endpoint for new date/slot availability.
     """
+    # ── Intent guard (v1.4.16) ───────────────────────────────────────────
+    # reschedule_appointment calls cancel-reschedule synchronously — that's
+    # a write that loses the customer's existing slot.  Prod analysis
+    # 2026-05-13 (Todd Call 2): customer's bare "Yeah" triggered the
+    # reschedule flow, old slot was cancelled, intent guard blocked confirm,
+    # bot fabricated success.  Net: customer's appointment gone.  Adding
+    # the same intent gate that confirm/cancel use.
+    from orchestrator.intent import IntentContext  # local import (avoid cycles)
+
+    intent = IntentContext.get()
+    if intent is not None and not intent.authorizes_write():
+        logger.warning(
+            "reschedule_appointment blocked by intent guard: intent=%s conf=%.2f",
+            intent.intent, intent.confidence,
+        )
+        return (
+            "⛔ RESCHEDULE NOT STARTED. Tool refused: customer's intent was "
+            "unclear.\n"
+            "\n"
+            "REQUIRED VERBATIM RESPONSE to the customer (do not paraphrase, "
+            "do not add filler, do not add any success language):\n"
+            '"Before I reschedule, can you confirm — should I cancel your '
+            'current appointment and find a new date? Please say \'yes, '
+            'reschedule\' to proceed, or \'no\' to keep your current '
+            'appointment."\n'
+            "\n"
+            "NEVER tell the customer their appointment was rescheduled or "
+            "that you're looking for new dates. Banned words in your response: "
+            "'rescheduled', 'cancelled', 'moved', 'new dates', 'available "
+            "dates', 'pulled up', 'looking up'. If you use ANY of those words "
+            "the customer will be misled — NO change has been made to their "
+            "current appointment."
+        )
+
     _reschedule_called_in_request.set(True)
     cached = _reschedule_success_result.get()
     if cached:
@@ -1634,9 +1685,24 @@ async def cancel_appointment(project_id: str, reason: str = "") -> str:
                 "cancel_appointment blocked by intent guard: intent=%s conf=%.2f",
                 intent.intent, intent.confidence,
             )
+            # v1.4.16: un-paraphraseable refusal (see confirm_appointment guard
+            # for the rationale — Sonnet/GPT-5.2 paraphrasing turned soft
+            # read-back into a false success message on Todd Call 2).
             return (
-                "Before I cancel — to confirm, you want me to cancel your appointment? "
-                "Please say 'yes, cancel it' to confirm, or 'no' to keep it."
+                "⛔ CANCELLATION NOT MADE. Tool refused: customer's intent was "
+                "unclear.\n"
+                "\n"
+                "REQUIRED VERBATIM RESPONSE to the customer (do not paraphrase, "
+                "do not add filler, do not add any success language):\n"
+                '"Before I cancel, can you confirm — should I cancel your '
+                'appointment? Please say \'yes, cancel it\' to confirm, or '
+                '\'no\' to keep it."\n'
+                "\n"
+                "NEVER tell the customer the appointment is cancelled. Banned "
+                "words in your response: 'cancelled', 'cancelation done', "
+                "'removed', 'no longer scheduled', 'taken off the calendar', "
+                "'closed', 'done'. If you use ANY of those words the customer "
+                "will be misled — the appointment is NOT cancelled."
             )
 
     _cancel_called_in_request.set(True)
