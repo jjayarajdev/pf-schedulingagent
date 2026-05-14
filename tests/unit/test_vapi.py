@@ -754,6 +754,95 @@ class TestStoreToolCalls:
         finally:
             _store_sessions.pop("vapi-call-store-tc4", None)
 
+    @patch("channels.vapi._set_auth_context_from_phone", new_callable=AsyncMock)
+    @patch("channels.vapi.authenticate_store", new_callable=AsyncMock)
+    def test_auth_500_says_system_issue(
+        self, mock_store_auth, mock_phone_auth, client
+    ):
+        """v1.4.18: PF 5xx errors get a 'system issue on my end' response,
+        not 'project not found' — caller shouldn't keep feeding numbers."""
+        from auth.phone_auth import AuthenticationError
+        from channels.vapi import _store_sessions
+
+        mock_store_auth.side_effect = AuthenticationError(
+            "Internal Server Error", status_code=500
+        )
+        _store_sessions["vapi-call-store-500"] = {
+            "to_phone": "+18001234567", "authenticated": False,
+        }
+        try:
+            resp = client.post(
+                "/vapi/webhook",
+                json={
+                    "message": {
+                        "type": "tool-calls",
+                        "toolCalls": [{
+                            "id": "tc-500",
+                            "function": {
+                                "name": "ask_store_bot",
+                                "arguments": {
+                                    "question": "Find project",
+                                    "lookup_type": "project_number",
+                                    "lookup_value": "239617270",
+                                },
+                            },
+                        }],
+                        "call": {"id": "call-store-500"},
+                    },
+                },
+                headers=_vapi_headers(),
+            )
+            assert resp.status_code == 200
+            result = resp.json()["results"][0]["result"].lower()
+            assert "system issue" in result
+            assert "couldn't find" not in result
+        finally:
+            _store_sessions.pop("vapi-call-store-500", None)
+
+    @patch("channels.vapi._set_auth_context_from_phone", new_callable=AsyncMock)
+    @patch("channels.vapi.authenticate_store", new_callable=AsyncMock)
+    def test_auth_short_digits_asks_for_spelling(
+        self, mock_store_auth, mock_phone_auth, client
+    ):
+        """v1.4.18: short numeric lookup (<7 digits) on 4xx → ask caller to
+        read digit-by-digit instead of looping 'not found'."""
+        from auth.phone_auth import AuthenticationError
+        from channels.vapi import _store_sessions
+
+        mock_store_auth.side_effect = AuthenticationError(
+            "Project not found", status_code=400
+        )
+        _store_sessions["vapi-call-store-short"] = {
+            "to_phone": "+18001234567", "authenticated": False,
+        }
+        try:
+            resp = client.post(
+                "/vapi/webhook",
+                json={
+                    "message": {
+                        "type": "tool-calls",
+                        "toolCalls": [{
+                            "id": "tc-short",
+                            "function": {
+                                "name": "ask_store_bot",
+                                "arguments": {
+                                    "question": "Find project",
+                                    "lookup_type": "project_number",
+                                    "lookup_value": "23961",
+                                },
+                            },
+                        }],
+                        "call": {"id": "call-store-short"},
+                    },
+                },
+                headers=_vapi_headers(),
+            )
+            assert resp.status_code == 200
+            result = resp.json()["results"][0]["result"].lower()
+            assert "digit" in result or "slowly" in result
+        finally:
+            _store_sessions.pop("vapi-call-store-short", None)
+
 
 class TestStoreSessionCleanup:
     """Store session cleanup on end-of-call."""

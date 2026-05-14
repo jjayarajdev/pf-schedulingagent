@@ -827,6 +827,32 @@ def _format_phone_for_speech(phone: str) -> str:
     return ", ".join(digits)
 
 
+def _build_tenant_context_block(support_number: str = "") -> str:
+    """Build the [TENANT_CONTEXT] block injected into Sonnet's user input.
+
+    v1.4.18: stops the SchedulingAgent from hallucinating a fake support
+    number when the caller asks "what's your phone number" mid-call.
+    Prod 2026-05-13 (call 019e219d, Kathy Creedy / WTU): bot said
+    "1-800-555-0123" — Hollywood placeholder — because Sonnet had no
+    authoritative value to read.
+
+    Falls back to AuthContext if ``support_number`` not supplied.  Returns
+    an empty string when nothing is known (no false anchors).
+    """
+    if not support_number:
+        support_number = AuthContext.get_support_number()
+    if not support_number:
+        return ""
+    return (
+        "[TENANT_CONTEXT]\n"
+        f"support_number: {support_number}\n"
+        "Authoritative values for this tenant.  When the customer asks for "
+        "a phone number to reach the office, read ONLY support_number above "
+        "— never invent a number.\n"
+        "[/TENANT_CONTEXT]\n"
+    )
+
+
 def _build_assistant_config(
     first_message: str,
     server_secret: str = "",
@@ -2628,6 +2654,12 @@ async def _process_tool(
                 f"{question}"
             )
 
+        # v1.4.18: inject tenant context (support_number) so Sonnet doesn't
+        # invent a phone number when asked.  See _build_tenant_context_block.
+        tenant_block = _build_tenant_context_block()
+        if tenant_block:
+            question = tenant_block + question
+
         logger.info(
             "Vapi ask_scheduling_bot question: call_id=%s q=%s",
             call_id, question[:500],
@@ -2793,6 +2825,11 @@ async def _process_tool(
                     " Respond ONLY with the correct answer. "
                     "Do NOT apologize or explain what went wrong."
                 )
+                # v1.4.18: tenant context on retry path too — retry can still
+                # be the turn where caller asks for support number.
+                tenant_block_retry = _build_tenant_context_block()
+                if tenant_block_retry:
+                    retry_prompt = tenant_block_retry + retry_prompt
                 reset_action_flags()
                 response = await orchestrator.route_request(
                     user_input=retry_prompt,
@@ -2942,17 +2979,60 @@ async def _handle_store_bot(
             creds = await authenticate_store(tenant_phone, lookup_type, lookup_value)
         except AuthenticationError as exc:
             logger.warning(
-                "Store auth failed: call_id=%s lookup=%s:%s error=%s",
-                call_id, lookup_type, lookup_value, exc,
+                "Store auth failed: call_id=%s lookup=%s:%s status=%s error=%s",
+                call_id, lookup_type, lookup_value, exc.status_code, exc,
             )
             support = store_session.get("support_number", "")
-            msg = (
-                "I couldn't find an account with that information. "
-                "Could you double-check and try again?"
+
+            # v1.4.18 item 2: distinguish PF server errors (5xx) from real
+            # "project not found" (4xx).  Prod 2026-05-13 (call 019e233a,
+            # Lowe's rep): /authentication/store-login returned 500 on 3 of 5
+            # legitimate-looking lookups.  Telling the caller "couldn't find
+            # your project" makes them feed more numbers — which all also
+            # fail, eroding trust.  On 5xx, say it's our problem.
+            is_server_error = exc.status_code >= 500
+            digits_only = "".join(ch for ch in lookup_value if ch.isdigit())
+
+            # v1.4.18 item 3: STT often drops digits.  Same call: caller said
+            # 239617270 (9 digits) → STT returned 2396177 (7 digits) on retry.
+            # When the value is suspiciously short AND the lookup wasn't a
+            # PF server crash, ask the caller to read it digit-by-digit.
+            # Require at least 1 digit — zero-digit values are non-numeric
+            # garbage (e.g. ASR returning text), not "short numbers".
+            looks_short = 0 < len(digits_only) < 7 and not is_server_error
+
+            previous_value = store_session.get("last_lookup_value", "")
+            previous_digits = "".join(ch for ch in previous_value if ch.isdigit())
+            shorter_than_previous = (
+                bool(previous_digits)
+                and len(digits_only) < len(previous_digits)
+                and not is_server_error
             )
-            if support:
+
+            if is_server_error:
+                msg = (
+                    "I'm hitting a system issue on my end — give me a moment "
+                    "and try that number again, please."
+                )
+            elif looks_short or shorter_than_previous:
+                msg = (
+                    "That sounded like a short number — could you read it back "
+                    "slowly, one digit at a time?"
+                )
+            else:
+                msg = (
+                    "I couldn't find a project with that number. "
+                    "Could you double-check and try again — or share the "
+                    "other number (project number or PO number) if you have it?"
+                )
+
+            # Track this attempt for the next-failure comparison.
+            store_session["last_lookup_value"] = lookup_value
+            _store_sessions[session_key] = store_session
+
+            if support and not is_server_error:
                 msg += (
-                    f" Or if you'd prefer, I can transfer you to our support team "
+                    f" If you'd prefer, I can transfer you to our support team "
                     f"— or give you the number: {support}."
                 )
             return _build_tool_result(msg, tool_call_id)
@@ -3055,6 +3135,13 @@ async def _handle_store_bot(
                 "[/INTENT_CLASSIFIER_OUTPUT]\n"
                 f"{store_question}"
             )
+
+    # v1.4.18: tenant context — store sessions cache support_number directly,
+    # so prefer that over AuthContext (Auth set may not have run on this turn).
+    store_support = store_session.get("support_number", "")
+    tenant_block_store = _build_tenant_context_block(store_support)
+    if tenant_block_store:
+        store_question = tenant_block_store + store_question
     agent_name = ""
     start_time = time.monotonic()
     try:
